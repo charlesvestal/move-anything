@@ -39,7 +39,6 @@ const lppPadToMovePadMap = new Map([
     [71, 84], [72, 85], [73, 86], [74, 87], [75, 88], [76, 89], [77, 90], [78, 91],
     [61, 76], [62, 77], [63, 78], [64, 79], [65, 80], [66, 81], [67, 82], [68, 83],
     [51, 68], [52, 69], [53, 70], [54, 71], [55, 72], [56, 73], [57, 74], [58, 75],
-
     [101, 16], [102, 18], [103, 20], [104, 22], [105, 24], [106, 26], [107, 28], [108, 30],
 
 ])
@@ -47,12 +46,17 @@ const lppPadToMovePadMap = new Map([
 const moveToLppPadMap = new Map([...lppPadToMovePadMap.entries()].map((a) => [a[1], a[0]]));
 
 
-const light_grey = 124;
+const light_grey = 0x7c;
 const green = 0x7e;
 const red = 0x7f;
+const blue = 0x5f;
+const white = 0xfa;
+const pink = 0x6d;
+const cyan = 0x5d;
 
 const lppColorToMoveColorMap = new Map([
-    [0x15, green], [0x17, light_grey], [0x1, light_grey], [0x05, red]
+    [0x15, green], [0x17, light_grey], [0x1, light_grey], [0x05, red], [0x03, white], [0x4e, blue],
+    [0x47, pink], [0x13, cyan]
 ]);
 
 const moveColorToLppColorMap = new Map([...lppColorToMoveColorMap.entries()].map((a) => [a[1], a[0]]));
@@ -84,7 +88,11 @@ globalThis.onMidiMessageExternal = function (data) {
     let moveVelocity = lppColorToMoveColorMap.get(lppVelocity) ?? lppVelocity;
 
     if (moveNoteNumber) {
+        console.log(`Got note on value : ${value}`);
         move_midi_internal_send([0 << 4 | (maskedValue / 16), maskedValue, moveNoteNumber, moveVelocity]);
+        if (value === 0x92) {
+            move_midi_internal_send([0 << 4 | (value / 16), 0x9a, moveNoteNumber, light_grey]);
+        }
         return;
     }
 
@@ -202,7 +210,9 @@ function initLPP() {
 
 globalThis.init = function () {
     console.log("Move control surface script staring...");
-    console.log("Calling exit...");
     initLPP();
-    exit();
+    // console.log("Calling exit...");
+    // exit();
 }
+
+globalThis.tick = function() {};
