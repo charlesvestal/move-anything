@@ -26,10 +26,11 @@ const moveControlToLppNoteMap = new Map([
     [86, 10],
     [60, 50],
     [58, 3],
-    [118, 98]
+    [118, 98],
     // [78, 99]
+    // here to allow Novation Logo LED msg to pass
+    [99, 99]
 ]);
-
 
 const lppNoteToMoveControlMap = new Map([...moveControlToLppNoteMap.entries()].map((a) => [a[1], a[0]]));
 
@@ -38,45 +39,56 @@ const lppPadToMovePadMap = new Map([
     [71, 84], [72, 85], [73, 86], [74, 87], [75, 88], [76, 89], [77, 90], [78, 91],
     [61, 76], [62, 77], [63, 78], [64, 79], [65, 80], [66, 81], [67, 82], [68, 83],
     [51, 68], [52, 69], [53, 70], [54, 71], [55, 72], [56, 73], [57, 74], [58, 75],
-    [101, 16], [102, 18], [103, 20], [104, 22], [105, 24], [106, 26], [107, 28], [108, 30],
-
+    [101, 16], [102, 18], [103, 20], [104, 22], [105, 24], [106, 26], [107, 28], [108, 30]
 ])
 
 const moveToLppPadMap = new Map([...lppPadToMovePadMap.entries()].map((a) => [a[1], a[0]]));
 
 const light_grey = 0x7c;
 const green = 0x7e;
+const navy = 0x7d;
+const sky = 0x5f;
 const red = 0x7f;
 const blue = 0x5f;
-const white = 0xfa;
+const azure = 0x63;
+const white = 0x7a;
 const pink = 0x6d;
-const cyan = 0x5d;
+const aqua = 0x5a;
 const black = 0x00;
+const lemonade = 0x6b;
+const lime = 0x20;
+const fern = 0x55;
+
+const moveLOGO = 99;
 
 const moveMENU = 50;
 const moveBACK = 51;
+const moveCAP = 52;
 const moveSHIFT = 49;
 const moveWHEEL = 3;
 const movePLAY = 85;
 const moveREC = 86;
 const moveLOOP = 58;
 const moveMUTE = 88;
+const moveUNDO = 56;
 const moveTRACK1 = 16;
 
 const lppColorToMoveColorMap = new Map([
-    [0x15, green], [0x17, light_grey], [0x1, light_grey], [0x05, red], [0x03, white], [0x4e, blue],
-    [0x47, pink], [0x13, cyan]
+    [0x15, green], [0x17, lime], [0x1, light_grey], [0x05, red], [0x03, white], [0x4e, blue],
+    [0x47, pink], [0x13, aqua], [0x47, lemonade], [0x27, blue], [0x2b, azure], [0x16, fern]
 ]);
 
 const moveColorToLppColorMap = new Map([...lppColorToMoveColorMap.entries()].map((a) => [a[1], a[0]]));
 
 const lppColorToMoveMonoMap = new Map([
-    [0x05, 0x7f], [0x78, 0x7f], [0x01, 0x10]
+    [0x05, 0x7f], [0x78, 0x7f], [0x01, 0x10], [0x07, 0x0f]
 ]);
 
 const initDone = 1000;
 const stepDelay = 20;
 let shiftHeld = false;
+let liveMode = false;
+let isPlaying = false;
 let initStep = 0;
 let timeStart = new Date();
 
@@ -106,20 +118,43 @@ globalThis.onMidiMessageExternal = function (data) {
     let moveNoteNumber = lppPadToMovePadMap.get(lppNoteNumber);
     let moveVelocity = lppColorToMoveColorMap.get(lppVelocity) ?? lppVelocity;
 
-
     if (moveNoteNumber) {
         console.log(`Got note on value : ${value}`);
-        move_midi_internal_send([0 << 4 | (maskedValue / 16), maskedValue, moveNoteNumber, moveVelocity]);
-        if (value === 0x92) {
-            move_midi_internal_send([0 << 4 | (value / 16), 0x9a, moveNoteNumber, light_grey]);
+        if (value === 0x91 && moveVelocity != 0) {
+            move_midi_internal_send([0 << 4 | (value / 16), 0x9f, moveNoteNumber, moveVelocity]);
+        } else {
+            move_midi_internal_send([0 << 4 | (maskedValue / 16), maskedValue, moveNoteNumber, moveVelocity]);
+            if (value === 0x92 && moveVelocity != 0) {
+                move_midi_internal_send([0 << 4 | (value / 16), 0x9a, moveNoteNumber, light_grey]);
+            }
         }
         return;
     }
 
     let moveControlNumber = lppNoteToMoveControlMap.get(lppNoteNumber);
 
+    // test for LIVE mode message
+    if (moveControlNumber === moveLOGO) {
+        if (moveVelocity > 0) {
+            liveMode = true;
+        } else {
+            liveMode = false;
+        }
+        updatePLAYLed ();
+    }
+    // test for PLAY state
+    if (moveControlNumber === movePLAY) {
+        if (moveVelocity === green) {
+            isPlaying = true;
+        } else {
+            isPlaying = false;
+        }
+        updatePLAYLed ();
+        return;
+    }
+
     // hack for white LED controls
-    if (moveControlNumber === moveLOOP || moveControlNumber === moveMUTE) {
+    if (moveControlNumber === moveLOOP || moveControlNumber === moveMUTE || moveControlNumber === moveUNDO) {
         moveVelocity = lppColorToMoveMonoMap.get(lppVelocity) ?? lppVelocity;
     }
 
@@ -128,7 +163,7 @@ globalThis.onMidiMessageExternal = function (data) {
 
         move_midi_internal_send([0 << 4 | 0xb, 0xB0, moveControlNumber, moveVelocity]);
         if (value === 0x91) {
-            move_midi_internal_send([0 << 4 | 0xb, 0xbd, moveControlNumber, black]);
+            move_midi_internal_send([0 << 4 | 0xb, 0xbe, moveControlNumber, black]);
         }
         return;
     }
@@ -170,9 +205,7 @@ globalThis.onMidiMessageInternal = function (data) {
             moveVelocity = 127;
         }
 
-
         let lppVelocity = moveVelocity; //moveVelocityToLppVelocityMap.get(data[2]) ?? moveVelocity;
-
 
         console.log(`Sending Move note ${moveNoteNumber} velocity: ${moveVelocity} to LPP pad ${lppNote} velocity: ${moveVelocity}`);
         move_midi_external_send([2 << 4 | (data[0] / 0xF), data[0], lppNote, moveVelocity]);
@@ -252,8 +285,15 @@ function initLPP() {
     move_midi_external_send(LPPInitSysex);
 }
 
+function updatePLAYLed () {
+    if (liveMode === false && isPlaying === false) {move_midi_internal_send([0 << 4 | 0xb, 0xB0, movePLAY, light_grey]);};
+    if (liveMode === false && isPlaying === true) {move_midi_internal_send([0 << 4 | 0xb, 0xB0, movePLAY, green]);};
+    if (liveMode === true && isPlaying === false) {move_midi_internal_send([0 << 4 | 0xb, 0xB0, movePLAY, sky]);};
+    if (liveMode === true && isPlaying === true) {move_midi_internal_send([0 << 4 | 0xb, 0xB0, movePLAY, navy]);};
+}
+
 function initMove(step) {
-    // go to NOTE view and then back to SONG to initialise PADS. 
+    // go to SEQ view and then back to SONG to initialise PADS. 
     // ensure SHIFT is not set as pressed
     // toggle MUTE->SOLO to setup track lights under bottom row of matching PADS
     // set PLAY and REC dim LEDS
@@ -267,8 +307,8 @@ function initMove(step) {
         switch (step) {
             case 2: move_midi_internal_send([0 << 4 | 0xb, 0xB0, movePLAY, light_grey]); break;
             case 3: move_midi_internal_send([0 << 4 | 0xb, 0xB0, moveREC, light_grey]); break;
-            case 4: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveMENU), 100]); break;
-            case 5: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveMENU), 0]); break;
+            case 4: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveCAP), 100]); break;
+            case 5: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveCAP), 0]); break;
             case 6: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveBACK), 100]); break;
             case 7: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveBACK), 0]); break;
             case 8: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveSHIFT), 100]); break;

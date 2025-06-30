@@ -565,7 +565,7 @@ int main(int argc, char *argv[])
     }
 
     // Clear mapped memory
-    printf("Clearing nmapped memory\n");
+    printf("Clearing mmapped memory\n");
     memset(mapped_memory, 0, 4096);
 
     int padIndex = 0;
