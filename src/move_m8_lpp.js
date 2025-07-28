@@ -1,6 +1,5 @@
-// import { aftertouchToModwheel } from "./aftertouch_to_modwheel.mjs";
+import { aftertouchToModwheel } from "./aftertouch_to_modwheel.mjs";
 import { handleMoveKnobs } from "./move_virtual_knobs.mjs";
-import { clamp } from "./math_helpers.mjs";
 
 // https://github.com/Ableton/push-interface/blob/main/doc/AbletonPush2MIDIDisplayInterface.asc#setting-led-colors
 
@@ -179,8 +178,9 @@ globalThis.onMidiMessageInternal = function (data) {
     let isAt = data[0] === 0xa0;
 
     if (isAt) {
-        // ignore aftertouch for now
-        return;
+        if (aftertouchToModwheel(data)) {
+            return;
+        }
     }
 
     console.log(`onMidiMessageInternal ${data[0].toString(16)} ${data[1].toString(16)} ${data[2].toString(16)}`);
@@ -256,10 +256,6 @@ globalThis.onMidiMessageInternal = function (data) {
         }
         return;
     }
-
-    // if (aftertouchToModwheel(data)) {
-    //     return;
-    // }
 
     console.log(`Unmapped Move message: ${data}`);
 

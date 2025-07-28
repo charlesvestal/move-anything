@@ -38,6 +38,13 @@ globalThis.onMidiMessageExternal = function (data) {
 globalThis.onMidiMessageInternal = function (data) {
     console.log(`onMidiMessageInternal ${data[0].toString(16)} ${data[1].toString(16)} ${data[2].toString(16)}`);
 
+    let isNote = data[0] === 0x80 || data[0] === 0x90;
+
+    let ignoreCapacitiveTouch = isNote && data[1] < 10;
+
+    if (ignoreCapacitiveTouch) {
+        return;
+    }
 
     if (handleMoveKnobs(data)) {
         return;
@@ -68,15 +75,15 @@ globalThis.onMidiMessageInternal = function (data) {
 globalThis.init = function () {
 }
 
-let counter = 0;
-let index = 0;
-globalThis.tick = function(deltaTime) {
+// let counter = 0;
+// let index = 0;
+// globalThis.tick = function(deltaTime) {
 
-    if (counter++ < 8) {
-        return;
-    }
+//     if (counter++ < 8) {
+//         return;
+//     }
 
-    counter = 0;
-    move_midi_internal_send([0 << 4 | 0x9, 0x90, (index % 32) + 68, index % 128]);
-    index++;
-}
+//     counter = 0;
+//     move_midi_internal_send([0 << 4 | 0x9, 0x90, (index % 32) + 68, index % 128]);
+//     index++;
+// }
