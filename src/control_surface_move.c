@@ -679,11 +679,14 @@ int main(int argc, char *argv[])
             unsigned char midi_1 = *(byte + 2);
             unsigned char midi_2 = *(byte + 3);
 
+            
             if (byte[1] + byte[2] + byte[3] == 0)
             {
                 continue;
             }
-
+            
+            printf("%x %x %x %x\n", byte[0], byte[1], byte[2], byte[3]);
+            
             if (cable == 2)
             {
                 callGlobalFunction(&ctx, &JSonMidiMessageExternal, &byte[1]);

@@ -9,7 +9,7 @@ export function aftertouchToModwheel(data, channel = 3) {
         `Sending Move aftertouch value ${value} as CC 1 on channel ${channel}`
     );
 
-    move_midi_external_send([(2 << 4) | 0xb, (0xb << 4) | channel, 1, value]);
+    move_midi_external_send([(2 << 4) | 0xb, 0xb0 | channel, 1, value]);
 
     return true;
 }

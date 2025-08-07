@@ -1,7 +1,7 @@
 #!/bin/bash
-killall MoveLauncher
-killall Move
-echo "Waiting 2 seconds for Move binaries to exit..."
-sleep 2
-./control_surface_move move_m8_lpp.js > /dev/null 
-/opt/move/MoveLauncher >/dev/null &
+killall MoveLauncher MoveMessageDisplay Move
+echo "Waiting 1 second for Move binaries to exit..."
+sleep 0.5
+echo "Launching!"
+/data/UserData/control_surface_move/control_surface_move /data/UserData/control_surface_move/move_m8_lpp.js
+/opt/move/MoveLauncher

@@ -1,7 +1,7 @@
 import {clamp} from "./math_helpers.mjs"
 let knobs = [0,0,0,0,0,0,0,0,0];
 
-export function handleMoveKnobs(data) {
+export function handleMoveKnobs(data, channel = 3) {
 
     if (!(data[0] === 0xb0)) {
         return false;
@@ -32,7 +32,9 @@ export function handleMoveKnobs(data) {
         knobs[knob] = clamp(knobs[knob], 0, 127);
 
         console.log(`Sending CC ${moveControlNumber} value: ${knobs[knob]}`);
-        move_midi_external_send([2 << 4 | 0xb, 0xB3, moveControlNumber, knobs[knob]]);
+        move_midi_external_send([2 << 4 | 0xb, 0xb0 | channel, moveControlNumber, knobs[knob]]);
+        
+        move_midi_internal_send([0 << 4 | 0xb, 0xb0 | 0,          moveControlNumber, knobs[knob]]);
         return true;
     }
 

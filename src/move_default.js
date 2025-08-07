@@ -35,6 +35,7 @@ globalThis.onMidiMessageExternal = function (data) {
     move_midi_internal_send([0 << 4 | (data[0] / 16), data[0], data[1], data[2]]);
 }
 
+let value = 0;
 globalThis.onMidiMessageInternal = function (data) {
     console.log(`onMidiMessageInternal ${data[0].toString(16)} ${data[1].toString(16)} ${data[2].toString(16)}`);
 
@@ -55,6 +56,26 @@ globalThis.onMidiMessageInternal = function (data) {
     }
 
     move_midi_external_send([2 << 4 | (data[0] / 16), data[0], data[1], data[2]]);
+
+    if (isNote) {
+        move_midi_internal_send([0 << 4 | (data[0] / 16), data[0], data[1], 23]);
+        return;
+    }
+
+    let isCC = data[0] === 0xb0;
+    if (isCC) {
+        let ccNumber = data[1];
+        if (ccNumber === 14) {
+            value += (data[2] === 1 ? 1 : -1);
+            console.log(value);
+        }
+
+
+        // let controlColor = data[2] === 127 ? 23 : 0;
+        let controlColor = 23;
+        move_midi_internal_send([0 << 4 | (data[0] / 16), data[0], data[1], controlColor]);
+
+    }
 }
 
 /*
@@ -69,21 +90,18 @@ globalThis.onMidiMessageInternal = function (data) {
 
 // Example: [F0 00 21 1D 01 01 03 7D 00 00 00 00 7F 01 7E 00 F7] = set entry 125 to 0/0/255 and 126
 
-
+// CC 16-31 icons
+// 40-43 track selectors
+// 71 - 78 knob LEDs
 
 
 globalThis.init = function () {
 }
 
-// let counter = 0;
-// let index = 0;
 // globalThis.tick = function(deltaTime) {
 
-//     if (counter++ < 8) {
-//         return;
-//     }
+    
+        // move_midi_internal_send([0 << 4 | 0xb, 0xb0, value % 128, Math.round(Math.random() * 127)]);
+        // return;
 
-//     counter = 0;
-//     move_midi_internal_send([0 << 4 | 0x9, 0x90, (index % 32) + 68, index % 128]);
-//     index++;
 // }
