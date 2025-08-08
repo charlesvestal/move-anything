@@ -11,9 +11,9 @@ set -x
 filename=control_surface_move.tar.gz
 hostname=move.local
 username=ableton
-ssh_ableton="ssh $username@$hostname"
+ssh_ableton="ssh -n $username@$hostname"
 
-ssh_root="ssh root@$hostname"
+ssh_root="ssh -n root@$hostname"
 
 echo "Downloading build..."
 curl -LO "https://github.com/bobbydigitales/control_surface_move/raw/main/$filename"
