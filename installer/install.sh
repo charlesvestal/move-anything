@@ -31,8 +31,6 @@ fi
 
 # $ssh_ableton rm -fr ./control_surface_move
 scp  -o ConnectTimeout=1 $filename ableton@move.local:.
-# rob@nasbox 'file ./control_surface_move.tar.gz'
-# $ssh_ableton ls ./control_surface_move.tar.gz
 $ssh_ableton "tar -xvf ./$filename"
 
 
