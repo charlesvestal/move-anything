@@ -6,7 +6,7 @@ cat << 'EOM'
 |_|  |_|\___/ \_/ \___|  \____\___/|_| |_|\__|_|  \___/|_| |____/ \__,_|_|  |_|  \__,_|\___\___|
 
 EOM
-# set -xk
+set -x
 
 filename=control_surface_move.tar.gz
 hostname=move.local
