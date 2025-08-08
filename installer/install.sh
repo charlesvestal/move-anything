@@ -19,7 +19,7 @@ echo "Downloading build..."
 curl -LO "https://github.com/bobbydigitales/control_surface_move/raw/main/$filename"
 echo "Build MD5: `md5sum $filename`"
 
-echo "Connecting using to $ssh_ableton..."
+echo "Connecting via ssh to $ssh_ableton..."
 if ! $ssh_ableton -o ConnectTimeout=1 ls &> /dev/null
 then
     echo
