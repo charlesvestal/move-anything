@@ -103,11 +103,47 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
     return result;
 }
 
+void launchChildAndKillThisProcess(char *pBinPath, char*pBinName, char* pArgs)
+{
+    int pid = fork();
+
+    if (pid < 0)
+    {
+        printf("Fork failed\n");
+        exit(1);
+    }
+    else if (pid == 0)
+    {
+        // Child process
+        setsid();
+        // Perform detached task
+        printf("Child process running in the background...\n");
+
+        printf("Args: %s\n", pArgs);
+
+        // Close all file descriptors, otherwise /dev/ablspi0.0 is held open
+        // and the control surface code can't open it.
+        printf("Closing file descriptors...\n");
+        int fdlimit = (int)sysconf(_SC_OPEN_MAX);
+        for (int i = STDERR_FILENO + 1; i < fdlimit; i++)
+        {
+            close(i);
+        }
+
+        // Let's a go!
+        int ret = execl(pBinPath, pBinName, pArgs, (char *)0);
+    }
+    else
+    {
+        // parent
+        kill(getpid(), SIGINT);
+    }
+}
+
 int (*real_ioctl)(int, unsigned long, char *) = NULL;
 
 int shiftHeld = 0;
 int volumeTouched = 0;
-int launchControlSurface = 0;
 int wheelTouched = 0;
 void midi_monitor()
 {
@@ -163,14 +199,12 @@ void midi_monitor()
             int leftArrow = 62;
             if (midi_1 == leftArrow)
             {
-                printf("Left arrow\n");
-
                 if (midi_2 == 0x7f)
                 {
                     if (shiftHeld)
                     {
-                        printf("Change page -1...\n");
-                        system("/data/UserData/extra_web/changePageRelative.sh -1");
+                        printf("/data/UserData/control_surface_move/changePageRelative.sh -1\n");
+                        launchChildAndKillThisProcess("/data/UserData/control_surface_move/changePageRelative.sh", "changePageRelative.sh", "-1");
                     }
                 }
             }
@@ -182,8 +216,8 @@ void midi_monitor()
                 {
                     if (shiftHeld)
                     {
-                        printf("Change page +1...\n");
-                        system("/data/UserData/extra_web/changePageRelative.sh 1");
+                        printf("/data/UserData/control_surface_move/changePageRelative.sh 1\n");
+                        launchChildAndKillThisProcess("/data/UserData/control_surface_move/changePageRelative.sh", "changePageRelative.sh", "1");
                     }
                 }
             }
@@ -215,56 +249,19 @@ void midi_monitor()
 
         if (shiftHeld && volumeTouched && wheelTouched)
         {
-            // if (shiftHeld && volumeTouched) {
             printf("Launching control surface!\n");
-            // system("nohup /data/UserData/control_surface_move/start_control_surface_move.sh");
-            printf("pid: %d\n", getpid());
+            // printf("pid: %d\n", getpid());
 
-            int pid = fork();
-
-            if (pid < 0)
-            {
-                printf("Fork failed\n");
-                exit(1);
-            }
-            else if (pid == 0)
-            {
-                // Child process
-                setsid();
-                // Perform detached task
-                printf("Child process running in the background...\n");
-                // int ret = execl ("/bin/ls", "ls", "-1", (char *)0);
-
-                // Close all file descriptors
-                printf("Closing file descriptors...\n");
-                int fdlimit = (int)sysconf(_SC_OPEN_MAX);
-                for (int i = STDERR_FILENO + 1; i < fdlimit; i++)
-                {
-                    close(i);
-                }
-
-                int ret = execl("/data/UserData/control_surface_move/start_control_surface_move.sh", (char *)0);
-            }
-            else
-            {
-                // parent
-                kill(getpid(), SIGINT);
-            }
+            launchChildAndKillThisProcess("/data/UserData/control_surface_move/start_control_surface_move.sh", "start_control_surface_move.sh", "");
         }
 
-        // b0 31 7f
-        // 90 08 7f
-
-        printf("cable: %x,\tcode index number:%x,\tmidi_0:%x,\tmidi_1:%x,\tmidi_2:%x\n", cable, code_index_number, midi_0, midi_1, midi_2);
+        printf("control_surface_move: cable: %x,\tcode index number:%x,\tmidi_0:%x,\tmidi_1:%x,\tmidi_2:%x\n", cable, code_index_number, midi_0, midi_1, midi_2);
     }
 }
 
-unsigned long ioctlCounter = 0;
+// unsigned long ioctlCounter = 0;
 int ioctl(int fd, unsigned long request, char *argp)
 {
-
-    // printf(">>>>>>>>>>>>>>>>>>> hooked IOCTL %d %d %d %p\n", ioctlCounter++, fd, request, argp);
-    // Initialize the real_ioctl function pointer if it's not already set
     if (!real_ioctl)
     {
         real_ioctl = dlsym(RTLD_NEXT, "ioctl");
@@ -278,6 +275,7 @@ int ioctl(int fd, unsigned long request, char *argp)
     // print_mem();
     // write_mem();
 
+    // Shoudl probably just change this to use the control_surface_move code and quickjs for flexibility
     midi_monitor();
 
     int result = real_ioctl(fd, request, argp);
