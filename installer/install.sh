@@ -77,7 +77,7 @@ if yes_or_no "Install 'Pages of Sets'?"; then
     
     $ssh_ableton "/data/UserData/control_surface_move/changePage.sh 0 skipLaunch"
     
-    $ssh_ableton "cp -r ~/UserLibrary_base/Sets/* ~/UserLibrary_0/Sets/"
+    $ssh_ableton "cp -a ~/UserLibrary_base/Sets/* ~/UserLibrary_0/Sets/"
 
     
   else
