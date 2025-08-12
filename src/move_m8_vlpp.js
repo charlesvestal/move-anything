@@ -21,18 +21,20 @@ import { handleMoveKnobs } from "./move_virtual_knobs.mjs";
 // ];
 
 const lppNoteMap = [
-    [90, 91, 92, 93, 94, 95, 96, 97, 98, 99],
-    [80, 81, 82, 83, 84, 85, 86, 87, 88, 89],
-    [70, 71, 72, 73, 74, 75, 76, 77, 78, 79],
-    [60, 61, 62, 63, 64, 65, 66, 67, 68, 69],
-    [50, 51, 52, 53, 54, 55, 56, 57, 58, 59],
-    [40, 41, 42, 43, 44, 45, 46, 47, 48, 49],
-    [30, 31, 32, 33, 34, 35, 36, 37, 38, 39],
-    [20, 21, 22, 23, 24, 25, 26, 27, 28, 29],
-    [10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    [101, 102, 103, 104, 105, 106, 107, 108],
-    [1, 2, 3, 4, 5, 6, 7, 8],
+    90, 91, 92, 93, 94, 95, 96, 97, 98, 99,
+    80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
+    70, 71, 72, 73, 74, 75, 76, 77, 78, 79,
+    60, 61, 62, 63, 64, 65, 66, 67, 68, 69,
+    50, 51, 52, 53, 54, 55, 56, 57, 58, 59,
+    40, 41, 42, 43, 44, 45, 46, 47, 48, 49,
+    30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
+    20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+    10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+    101, 102, 103, 104, 105, 106, 107, 108,
+    1, 2, 3, 4, 5, 6, 7, 8
 ];
+
+const lppNoteValueMap = new Map([...lppNoteMap.map((a)=>[a, [0,0,0]])]);
 
 const moveControlToLppNoteMap = new Map([
     [55, 80],
@@ -62,7 +64,7 @@ const moveControlToLppNoteMap = new Map([
 
 const lppNoteToMoveControlMap = new Map([...moveControlToLppNoteMap.entries()].map((a) => [a[1], a[0]]));
 
-const lppPadToMovePadMap = new Map([
+const lppPadToMovePadMapTop = new Map([
     [81, 92], [82, 93], [83, 94], [84, 95], [85, 96], [86, 97], [87, 98], [88, 99],
     [71, 84], [72, 85], [73, 86], [74, 87], [75, 88], [76, 89], [77, 90], [78, 91],
     [61, 76], [62, 77], [63, 78], [64, 79], [65, 80], [66, 81], [67, 82], [68, 83],
@@ -70,7 +72,20 @@ const lppPadToMovePadMap = new Map([
     [101, 16], [102, 18], [103, 20], [104, 22], [105, 24], [106, 26], [107, 28], [108, 30]
 ])
 
-const moveToLppPadMap = new Map([...lppPadToMovePadMap.entries()].map((a) => [a[1], a[0]]));
+const moveToLppPadMapTop = new Map([...lppPadToMovePadMapTop.entries()].map((a) => [a[1], a[0]]));
+
+
+const lppPadToMovePadMapBottom = new Map([
+    [41, 92], [42, 93], [43, 94], [44, 95], [45, 96], [46, 97], [47, 98], [48, 99],
+    [31, 84], [32, 85], [33, 86], [34, 87], [35, 88], [36, 89], [37, 90], [38, 91],
+    [21, 76], [22, 77], [23, 78], [24, 79], [25, 80], [26, 81], [27, 82], [28, 83],
+    [11, 68], [12, 69], [13, 70], [14, 71], [15, 72], [16, 73], [17, 74], [18, 75],
+    [101, 16], [102, 18], [103, 20], [104, 22], [105, 24], [106, 26], [107, 28], [108, 30]
+])
+
+const moveToLppPadMapBottom = new Map([...lppPadToMovePadMapBottom.entries()].map((a) => [a[1], a[0]]));
+
+let showingTop = false;
 
 const light_grey = 0x7c;
 const green = 0x7e;
@@ -120,6 +135,22 @@ let isPlaying = false;
 let initStep = 0;
 let timeStart = new Date();
 
+function updateMovePadsToMatchLpp() {
+    let activeMoveToLppPadMap = showingTop ? moveToLppPadMapTop : moveToLppPadMapBottom;
+
+    console.log(activeMoveToLppPadMap);
+
+    for (let [movePad, lppPad] of activeMoveToLppPadMap.entries()) {
+        let data = lppNoteValueMap.get(lppPad);
+
+        console.log(lppPad, data);
+        
+        globalThis.onMidiMessageExternal(data);
+    }
+
+}
+
+
 globalThis.onMidiMessageExternal = function (data) {
     if (data[0] == 0xf8) {
         // midi clock, ignoring...
@@ -128,22 +159,28 @@ globalThis.onMidiMessageExternal = function (data) {
 
     console.log(`onMidiMessageExternal ${data[0].toString(16)} ${data[1].toString(16)} ${data[2].toString(16)}`);
 
+    
     let value = data[0];
     let maskedValue = (value & 0xf0);
-
+    
     let noteOn = maskedValue === 0x90;
     let noteOff = maskedValue === 0x80;
-
+    
     // console.log(value, maskedValue, noteOn, noteOff);
-
+    
     if (!(noteOn || noteOff)) {
         console.log(`Got message from M8 that is not a note: ${data}`);
     }
-
+    
     let lppNoteNumber = data[1];
     let lppVelocity = data[2];
+    
+    lppNoteValueMap.set(lppNoteNumber, [...data]);
+    console.log([...lppNoteValueMap.entries()]);
 
-    let moveNoteNumber = lppPadToMovePadMap.get(lppNoteNumber);
+    let activeLppToMovePadMap = showingTop ? lppPadToMovePadMapTop : lppPadToMovePadMapBottom;
+
+    let moveNoteNumber = activeLppToMovePadMap.get(lppNoteNumber);
     let moveVelocity = lppColorToMoveColorMap.get(lppVelocity) ?? lppVelocity;
 
     if (moveNoteNumber) {
@@ -218,9 +255,12 @@ globalThis.onMidiMessageInternal = function (data) {
         return;
     }
 
+    let activeMoveToLppPadMap = showingTop ? moveToLppPadMapTop : moveToLppPadMapBottom;
+
+
     if (isNote) {
         let moveNoteNumber = data[1];
-        let lppNote = moveToLppPadMap.get(moveNoteNumber);
+        let lppNote = activeMoveToLppPadMap.get(moveNoteNumber);
 
         if (!lppNote) {
             console.log(`Move: unmapped note [${moveNoteNumber}]`);
@@ -252,6 +292,13 @@ globalThis.onMidiMessageInternal = function (data) {
         if (shiftHeld == true && moveControlNumber === moveWHEEL) {
             console.log("Shift+Wheel - exit");
             exit();
+            return;
+        }
+
+        let toggleTopBottom = moveControlNumber === moveWHEEL && data[2] === 0x7f;
+        if (toggleTopBottom) {
+            showingTop = !showingTop;
+            updateMovePadsToMatchLpp();
             return;
         }
 
@@ -346,10 +393,10 @@ function initMove(step) {
             case 11: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveMUTE), 0]); break;
             case 12: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveLOOP), 100]); break;
             case 13: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveLOOP), 0]); break;
-            case 14: move_midi_external_send([2 << 4 | 0x9, 0x90, moveToLppPadMap.get(moveTRACK1), 127]); break;
-            case 15: move_midi_external_send([2 << 4 | 0x9, 0x90, moveToLppPadMap.get(moveTRACK1), 0]); break;
-            case 16: move_midi_external_send([2 << 4 | 0x9, 0x90, moveToLppPadMap.get(moveTRACK1), 127]); break;
-            case 17: move_midi_external_send([2 << 4 | 0x9, 0x90, moveToLppPadMap.get(moveTRACK1), 0]); return initDone;
+            case 14: move_midi_external_send([2 << 4 | 0x9, 0x90, moveToLppPadMapTop.get(moveTRACK1), 127]); break;
+            case 15: move_midi_external_send([2 << 4 | 0x9, 0x90, moveToLppPadMapTop.get(moveTRACK1), 0]); break;
+            case 16: move_midi_external_send([2 << 4 | 0x9, 0x90, moveToLppPadMapTop.get(moveTRACK1), 127]); break;
+            case 17: move_midi_external_send([2 << 4 | 0x9, 0x90, moveToLppPadMapTop.get(moveTRACK1), 0]); return initDone;
         }
         return step + 1;
     } else {
