@@ -12,7 +12,7 @@ EOM
 
 function yes_or_no {
     while true; do
-        read -p "$* [y/N]: " yn
+        read -p "$* [y/N]: " yn < /dev/tty
 
         case $yn in
             [Yy]*) return 0  ;;
@@ -35,7 +35,7 @@ ssh_ableton="ssh -o LogLevel=QUIET -n $username@$hostname"
 
 ssh_root="ssh -o LogLevel=QUIET -n root@$hostname"
 
-echo "Downloading build..."
+echo "Downloading build...$url$filename"
 curl -LO "$url$filename"
 echo "Build MD5: `md5sum $filename`"
 
