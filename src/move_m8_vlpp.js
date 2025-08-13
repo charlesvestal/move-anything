@@ -185,12 +185,14 @@ globalThis.onMidiMessageExternal = function (data) {
         for (let [padNumber, midi] of lppNoteValueMap.entries()) {
             padString += `${padNumber}(${midi})\t`;
             padCount++;
-            if (padCount % 8 === 0) {
+            if (padCount % 10 === 0) {
                 console.log(padString);
                 padCount = 0;
                 padString = "";
             }
         }
+
+         console.log(padString);
     }
 
     let activeLppToMovePadMap = showingTop ? lppPadToMovePadMapTop : lppPadToMovePadMapBottom;
