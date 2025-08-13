@@ -20,7 +20,7 @@ import { handleMoveKnobs } from "./move_virtual_knobs.mjs";
 //     "ARM", "MUT", "SOL", "VOL", "PAN", "SND", "DEV", "STO"
 // ];
 
-const lppNoteMap = [
+const lppNotes = [
     90, 91, 92, 93, 94, 95, 96, 97, 98, 99,
     80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
     70, 71, 72, 73, 74, 75, 76, 77, 78, 79,
@@ -34,7 +34,7 @@ const lppNoteMap = [
     1, 2, 3, 4, 5, 6, 7, 8
 ];
 
-const lppNoteValueMap = new Map([...lppNoteMap.map((a)=>[a, [0,0,0]])]);
+const lppNoteValueMap = new Map([...lppNotes.map((a)=>[a, [0,0,0]])]);
 
 const moveControlToLppNoteMap = new Map([
     [55, 80],
@@ -85,7 +85,7 @@ const lppPadToMovePadMapBottom = new Map([
 
 const moveToLppPadMapBottom = new Map([...lppPadToMovePadMapBottom.entries()].map((a) => [a[1], a[0]]));
 
-let showingTop = false;
+let showingTop = true;
 
 const light_grey = 0x7c;
 const green = 0x7e;
@@ -135,6 +135,8 @@ let isPlaying = false;
 let initStep = 0;
 let timeStart = new Date();
 
+let lppDebugSuperlog = true;
+
 function updateMovePadsToMatchLpp() {
     let activeMoveToLppPadMap = showingTop ? moveToLppPadMapTop : moveToLppPadMapBottom;
 
@@ -176,7 +178,20 @@ globalThis.onMidiMessageExternal = function (data) {
     let lppVelocity = data[2];
     
     lppNoteValueMap.set(lppNoteNumber, [...data]);
-    console.log([...lppNoteValueMap.entries()]);
+
+    if (lppDebugSuperlog) {
+        let padCount = 0;
+        let padString = "";
+        for (let [padNumber, midi] of lppNoteValueMap.entries()) {
+            padString += `${padNumber}(${midi})\t`;
+            padCount++;
+            if (padCount % 8 === 0) {
+                console.log(padString);
+                padCount = 0;
+                padString = "";
+            }
+        }
+    }
 
     let activeLppToMovePadMap = showingTop ? lppPadToMovePadMapTop : lppPadToMovePadMapBottom;
 
