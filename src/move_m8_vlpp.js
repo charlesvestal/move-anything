@@ -88,6 +88,7 @@ const moveToLppPadMapBottom = new Map([...lppPadToMovePadMapBottom.entries()].ma
 let showingTop = true;
 
 const light_grey = 0x7c;
+const dim_grey = 0x10;
 const green = 0x7e;
 const navy = 0x7d;
 const sky = 0x5f;
@@ -115,6 +116,7 @@ const moveLOOP = 58;
 const moveMUTE = 88;
 const moveUNDO = 56;
 const moveTRACK1 = 16;
+const moveSAMPLE = 118;
 
 const lppColorToMoveColorMap = new Map([
     [0x15, green], [0x17, lime], [0x1, light_grey], [0x05, red], [0x03, white], [0x4e, blue],
@@ -132,6 +134,7 @@ const stepDelay = 20;
 let shiftHeld = false;
 let liveMode = false;
 let isPlaying = false;
+let currentView = moveBACK;
 let initStep = 0;
 let timeStart = new Date();
 
@@ -305,6 +308,20 @@ globalThis.onMidiMessageInternal = function (data) {
 
         let lppNote = moveControlToLppNoteMap.get(moveControlNumber);
 
+        // store current VIEW
+        if (moveControlNumber === moveBACK || moveControlNumber === moveMENU || moveControlNumber === moveCAP) {
+            currentView = moveControlNumber;
+        }
+
+        // pulse VIEW if showing botttom
+        move_midi_internal_send([0 << 4 | 0xb, 0xB0, moveBACK, dim_grey]);
+        move_midi_internal_send([0 << 4 | 0xb, 0xB0, moveMENU, dim_grey]);
+        move_midi_internal_send([0 << 4 | 0xb, 0xB0, moveCAP, dim_grey]);
+        move_midi_internal_send([0 << 4 | 0xb, 0xB0, currentView, light_grey]);
+        if (!showingTop) {
+            move_midi_internal_send([0 << 4 | 0xb, 0xBA, currentView, black]);
+        }
+
         // if Shift is held, exit if Wheel is pressed
         if (shiftHeld == true && moveControlNumber === moveWHEEL) {
             console.log("Shift+Wheel - exit");
@@ -400,20 +417,22 @@ function initMove(step) {
         switch (step) {
             case 2: move_midi_internal_send([0 << 4 | 0xb, 0xB0, movePLAY, light_grey]); break;
             case 3: move_midi_internal_send([0 << 4 | 0xb, 0xB0, moveREC, light_grey]); break;
-            case 4: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveCAP), 100]); break;
-            case 5: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveCAP), 0]); break;
-            case 6: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveBACK), 100]); break;
-            case 7: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveBACK), 0]); break;
-            case 8: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveSHIFT), 100]); break;
-            case 9: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveSHIFT), 0]); break;
-            case 10: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveMUTE), 100]); break;
-            case 11: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveMUTE), 0]); break;
-            case 12: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveLOOP), 100]); break;
-            case 13: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveLOOP), 0]); break;
-            case 14: move_midi_external_send([2 << 4 | 0x9, 0x90, moveToLppPadMapTop.get(moveTRACK1), 127]); break;
-            case 15: move_midi_external_send([2 << 4 | 0x9, 0x90, moveToLppPadMapTop.get(moveTRACK1), 0]); break;
+            case 4: move_midi_internal_send([0 << 4 | 0xb, 0xB0, moveMENU, dim_grey]); break;
+            case 5: move_midi_internal_send([0 << 4 | 0xb, 0xB0, moveCAP, dim_grey]); break;
+            case 6: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveCAP), 100]); break;
+            case 7: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveCAP), 0]); break;
+            case 8: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveBACK), 100]); break;
+            case 9: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveBACK), 0]); break;
+            case 10: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveSHIFT), 100]); break;
+            case 11: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveSHIFT), 0]); break;
+            case 12: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveMUTE), 100]); break;
+            case 13: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveMUTE), 0]); break;
+            case 14: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveLOOP), 100]); break;
+            case 15: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveLOOP), 0]); break;
             case 16: move_midi_external_send([2 << 4 | 0x9, 0x90, moveToLppPadMapTop.get(moveTRACK1), 127]); break;
-            case 17: move_midi_external_send([2 << 4 | 0x9, 0x90, moveToLppPadMapTop.get(moveTRACK1), 0]); return initDone;
+            case 17: move_midi_external_send([2 << 4 | 0x9, 0x90, moveToLppPadMapTop.get(moveTRACK1), 0]); break;
+            case 18: move_midi_external_send([2 << 4 | 0x9, 0x90, moveToLppPadMapTop.get(moveTRACK1), 127]); break;
+            case 19: move_midi_external_send([2 << 4 | 0x9, 0x90, moveToLppPadMapTop.get(moveTRACK1), 0]); return initDone;
         }
         return step + 1;
     } else {
