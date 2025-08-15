@@ -1,3 +1,7 @@
+Move Control Surface
+====================
+
+
 What is this?
 =============
 1. An emulation of the Launch Pad Pro on the Ableton Move to be used with the Dirtywave M8. The Move is a USB host for the M8 and can charge it. All 9 knobs are mappable on the M8 while in LPP mode. Poly aftertouch is sent as CC1 and is also mappabe on M8.
