@@ -15,4 +15,4 @@ ssh root@move.local cp /data/UserData/control_surface_move/Move.sh /opt/move/Mov
 
 # cp /data/UserData/control_surface_move/Move.sh /opt/move/Move
 # /etc/suid-debug
-ssh ableton@move.local "nohup ~/control_surface_move/control_surface_move ~/control_surface_move/move_default.js 1>/dev/null 2>/dev/null &"
+# ssh ableton@move.local "nohup ~/control_surface_move/control_surface_move ~/control_surface_move/move_default.js 1>/dev/null 2>/dev/null &"

@@ -138,7 +138,7 @@ let currentView = moveBACK;
 let initStep = 0;
 let timeStart = new Date();
 
-let lppDebugSuperlog = true;
+let lppDebugSuperlog = false;
 
 function updateMovePadsToMatchLpp() {
     let activeMoveToLppPadMap = showingTop ? moveToLppPadMapTop : moveToLppPadMapBottom;
@@ -155,10 +155,26 @@ function updateMovePadsToMatchLpp() {
 
 }
 
+function arraysAreEqual(array1, array2) {
+    if (array1.length !== array2.length) {
+        return false;
+    }
+
+    for (let i=0; i<array1.length; i++) {
+        if (array1[i] !== array2[i]) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+let sysexBuffer = [];
+let m8InitiSysex = [0xf0, 0x7e, 0x7f, 0x06, 0x01, 0xf7];
 
 globalThis.onMidiMessageExternal = function (data) {
     if (data[0] == 0xf8) {
-        // midi clock, ignoring...
+        // midi clock. Ignoring...
         return;
     }
 
@@ -171,7 +187,41 @@ globalThis.onMidiMessageExternal = function (data) {
     let noteOn = maskedValue === 0x90;
     let noteOff = maskedValue === 0x80;
     
+    
+    // Better to do this in the C layer, but this is fine for now...
+    let sysexStart = value === 0xF0;
+    let sysexEnd = data[2] === 0xF7;
+    if (sysexStart) {
+        //[ "f0", "7e", "7f", "6", "1", "f7" ]
+        sysexBuffer = [];
+        sysexBuffer.push(...data);
+        console.log("sysex start", sysexBuffer);
+        return;
+    }
+
+    if (sysexBuffer.length && !sysexEnd) {
+        sysexBuffer.push(...data);
+        console.log("sysex continue", sysexBuffer);
+        return;
+    }
+
+    if (sysexEnd) {
+        sysexBuffer.push(...data);
+        console.log("sysex end", sysexBuffer.map((byte)=>byte.toString(16)));
+
+        console.log(arraysAreEqual(sysexBuffer, m8InitiSysex));
+
+        if (arraysAreEqual(sysexBuffer, m8InitiSysex)) {
+            initLPP();
+        }
+        sysexBuffer = [];
+        return;
+    }
+
+
+    
     // console.log(value, maskedValue, noteOn, noteOff);
+
     
     if (!(noteOn || noteOff)) {
         console.log(`Got message from M8 that is not a note: ${data}`);
@@ -289,7 +339,7 @@ globalThis.onMidiMessageInternal = function (data) {
 
         let moveVelocity = data[2] * 2;
 
-        moveVelocity = moveVelocity * 2;
+        // moveVelocity = moveVelocity * 2;
         if (moveVelocity > 127) {
             moveVelocity = 127;
         }
@@ -393,6 +443,7 @@ function initLPP() {
     // Trigger LPP mode on the M8
     console.log("Sending M8 LPP init");
     move_midi_external_send(LPPInitSysex);
+    showingTop = true;
 }
 
 function updatePLAYLed() {
@@ -402,53 +453,53 @@ function updatePLAYLed() {
     if (liveMode === true && isPlaying === true) { move_midi_internal_send([0 << 4 | 0xb, 0xB0, movePLAY, navy]); };
 }
 
-function initMove(step) {
-    // go to SEQ view and then back to SONG to initialise PADS. 
-    // ensure SHIFT is not set as pressed
-    // toggle MUTE->SOLO to setup track lights under bottom row of matching PADS
-    // set PLAY and REC dim LEDS
-    // add any additional steps with increased case #, ensuring last case has return initDone
-    // steps are taken at stepDelay intervals - cases do not need to be consective, just multiplies of stepDelay as required
+// function initMove(step) {
+//     // go to SEQ view and then back to SONG to initialise PADS. 
+//     // ensure SHIFT is not set as pressed
+//     // toggle MUTE->SOLO to setup track lights under bottom row of matching PADS
+//     // set PLAY and REC dim LEDS
+//     // add any additional steps with increased case #, ensuring last case has return initDone
+//     // steps are taken at stepDelay intervals - cases do not need to be consective, just multiplies of stepDelay as required
 
-    let timeStamp = new Date();
-    let duration = timeStamp.getTime() - timeStart.getTime();
+//     let timeStamp = new Date();
+//     let duration = timeStamp.getTime() - timeStart.getTime();
 
-    if (duration > step * stepDelay && duration < (step + 1) * stepDelay) {
-        switch (step) {
-            case 2: move_midi_internal_send([0 << 4 | 0xb, 0xB0, movePLAY, light_grey]); break;
-            case 3: move_midi_internal_send([0 << 4 | 0xb, 0xB0, moveREC, light_grey]); break;
-            case 4: move_midi_internal_send([0 << 4 | 0xb, 0xB0, moveMENU, dim_grey]); break;
-            case 5: move_midi_internal_send([0 << 4 | 0xb, 0xB0, moveCAP, dim_grey]); break;
-            case 6: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveCAP), 100]); break;
-            case 7: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveCAP), 0]); break;
-            case 8: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveBACK), 100]); break;
-            case 9: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveBACK), 0]); break;
-            case 10: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveSHIFT), 100]); break;
-            case 11: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveSHIFT), 0]); break;
-            case 12: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveMUTE), 100]); break;
-            case 13: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveMUTE), 0]); break;
-            case 14: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveLOOP), 100]); break;
-            case 15: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveLOOP), 0]); break;
-            case 16: move_midi_external_send([2 << 4 | 0x9, 0x90, moveToLppPadMapTop.get(moveTRACK1), 127]); break;
-            case 17: move_midi_external_send([2 << 4 | 0x9, 0x90, moveToLppPadMapTop.get(moveTRACK1), 0]); break;
-            case 18: move_midi_external_send([2 << 4 | 0x9, 0x90, moveToLppPadMapTop.get(moveTRACK1), 127]); break;
-            case 19: move_midi_external_send([2 << 4 | 0x9, 0x90, moveToLppPadMapTop.get(moveTRACK1), 0]); return initDone;
-        }
-        return step + 1;
-    } else {
-        return step;
-    }
-}
+//     if (duration > step * stepDelay && duration < (step + 1) * stepDelay) {
+//         switch (step) {
+//             case 2: move_midi_internal_send([0 << 4 | 0xb, 0xB0, movePLAY, light_grey]); break;
+//             case 3: move_midi_internal_send([0 << 4 | 0xb, 0xB0, moveREC, light_grey]); break;
+//             case 4: move_midi_internal_send([0 << 4 | 0xb, 0xB0, moveMENU, dim_grey]); break;
+//             case 5: move_midi_internal_send([0 << 4 | 0xb, 0xB0, moveCAP, dim_grey]); break;
+//             case 6: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveCAP), 100]); break;
+//             case 7: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveCAP), 0]); break;
+//             case 8: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveBACK), 100]); break;
+//             case 9: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveBACK), 0]); break;
+//             case 10: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveSHIFT), 100]); break;
+//             case 11: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveSHIFT), 0]); break;
+//             case 12: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveMUTE), 100]); break;
+//             case 13: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveMUTE), 0]); break;
+//             case 14: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveLOOP), 100]); break;
+//             case 15: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveLOOP), 0]); break;
+//             case 16: move_midi_external_send([2 << 4 | 0x9, 0x90, moveToLppPadMapTop.get(moveTRACK1), 127]); break;
+//             case 17: move_midi_external_send([2 << 4 | 0x9, 0x90, moveToLppPadMapTop.get(moveTRACK1), 0]); break;
+//             case 18: move_midi_external_send([2 << 4 | 0x9, 0x90, moveToLppPadMapTop.get(moveTRACK1), 127]); break;
+//             case 19: move_midi_external_send([2 << 4 | 0x9, 0x90, moveToLppPadMapTop.get(moveTRACK1), 0]); return initDone;
+//         }
+//         return step + 1;
+//     } else {
+//         return step;
+//     }
+// }
 
 globalThis.init = function () {
     console.log("Move control surface script staring...");
-    initLPP();
+    // initLPP();
     // console.log("Calling exit...");
     // exit();
 }
 
-globalThis.tick = function () {
-    if (initStep != initDone) {
-        initStep = initMove(initStep);
-    }
-};
+// globalThis.tick = function () {
+//     if (initStep != initDone) {
+//         initStep = initMove(initStep);
+//     }
+// };
