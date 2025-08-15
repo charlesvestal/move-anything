@@ -12,7 +12,7 @@ What is this?
 
 4. A framework to capture keypresses while the Move's original software is running and to launch custom software, and to return to the Move software once finished.
 
-5. As a bonus, there's an additional option to install "pages of sets" that give syou unlimited pages of sets on the Ableton Move
+5. As a bonus, there's an additional option to install "pages of sets" that gives you unlimited pages of sets on the Ableton Move.
 
 Installation (macos, Linux)
 ===========================
