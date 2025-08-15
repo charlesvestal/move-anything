@@ -12,6 +12,7 @@ What is this?
 
 4. A framework to capture keypresses while the Move's original software is running and to launch custom software, and to return to the Move software once finished.
 
+5. As a bonus, there's an additional option to install "pages of sets" that give syou unlimited pages of sets on the Ableton Move
 
 Installation (macos, Linux)
 ===========================
@@ -37,8 +38,8 @@ Installation Windows
 ====================
 If you're on Windows, you can get bash by installing Git Bash, can you get that by installing Git for Windows): https://git-scm.com/downloads/win. Once you have that, launch Bash and then run the install script as above!
    
-Usage
-=====
+Usage of the M8 Launchpad Pro emulation
+=======================================
 1. Once installed, to launch the m8 integration, hold shift then touch the volume knob and the jog wheel. Toggle Launch Pad Pro control surface mode on the M8 and the Move should come show you the session mode.
 
 2. To see the bottom half of the Launch Pad Pro, click the wheel, the mode button you're on will flash to show you'e on the bottom half.
@@ -52,6 +53,17 @@ Usage
 Mapping from Launch Pad Pro to Move
 ===================================
 <img width="3300" height="2295" alt="image" src="https://github.com/user-attachments/assets/8d94519d-0b6b-41f5-b40c-21c2b95e113f" />
+
+Usage of the "pages of sets"
+
+Usage of "Pages of Sets"
+========================
+_**Note that when you change pages your live session is killed and restarted with the new page**_
+
+1. To change pages hold shift and press the left or right arrow.
+2. If a page doesn't exist, it will be created.
+3. Samples, Track presets, Recordings and Effects presets are shared between all pages.
+2. http://move.local will show the Sets from the current page.
 
 After installing a new Move build
 =================================
