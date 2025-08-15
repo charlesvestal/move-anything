@@ -54,8 +54,6 @@ Mapping from Launch Pad Pro to Move
 ===================================
 <img width="3300" height="2295" alt="image" src="https://github.com/user-attachments/assets/8d94519d-0b6b-41f5-b40c-21c2b95e113f" />
 
-Usage of the "pages of sets"
-
 Usage of "Pages of Sets"
 ========================
 _**Note that when you change pages your live session is killed and restarted with the new page**_
