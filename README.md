@@ -6,13 +6,11 @@ What is this?
 =============
 1. An emulation of the Launch Pad Pro on the Ableton Move to be used with the Dirtywave M8. The Move is a USB host for the M8 and can charge it. All 9 knobs are mappable on the M8 while in LPP mode. Poly aftertouch is sent as CC1 and is also mappabe on M8.
 
-2. A a general control surface with mappable CC's for all 9 knobs and aftertouch as CC1.
+2. A framework to develop control surface scripts in Javascript. This supports tansforming MIDI in arbitrary ways both coming from the pads, knobs and controls, and also transforming and retransmitting external midi.
 
-3. A framework to develop control surface scripts in Javascript. This supports tansforming MIDI in arbitrary ways both coming from the pads, knobs and controls, and also transforming and retransmitting external midi.
+3. A framework to capture keypresses while the Move's original software is running and to launch custom software, and to return to the Move software once finished.
 
-4. A framework to capture keypresses while the Move's original software is running and to launch custom software, and to return to the Move software once finished.
-
-5. As a bonus, there's an additional option to install "pages of sets" that gives you unlimited pages of sets on the Ableton Move.
+4. As a bonus, there's an additional option to install "pages of sets" that gives you unlimited pages of sets on the Ableton Move.
 
 Installation (macos, Linux)
 ===========================
