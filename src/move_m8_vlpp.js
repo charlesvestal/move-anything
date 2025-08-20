@@ -147,6 +147,8 @@ const moveUNDO = 56;
 const moveTRACK1 = 16;
 const moveSAMPLE = 118;
 
+const moveWHEELTouch = 9;
+
 const lppColorToMoveColorMap = new Map([
     [0x15, green], [0x17, lime], [0x1, light_grey], [0x05, red], [0x03, white], [0x4e, blue],
     [0x47, pink], [0x13, aqua], [0x47, lemonade], [0x27, blue], [0x2b, azure], [0x16, fern]
@@ -361,6 +363,19 @@ globalThis.onMidiMessageInternal = function (data) {
 
     if (isNote) {
         let moveNoteNumber = data[1];
+
+        if (moveNoteNumber === moveWHEELTouch && data[2] == 127) {
+            showingTop = !showingTop;
+            updateMovePadsToMatchLpp();
+            return;
+        }
+
+        if (moveNoteNumber === moveWHEELTouch && data[2] == 0) {
+            showingTop = !showingTop;
+            updateMovePadsToMatchLpp();
+            return;
+        }
+
         let lppNote = activeMoveToLppPadMap.get(moveNoteNumber);
 
         if (!lppNote) {
