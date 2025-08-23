@@ -36,16 +36,16 @@ const lppNotes = [
 
 const lppNoteValueMap = new Map([...lppNotes.map((a)=>[a, [0,0,0]])]);
 
-const moveControlToLppNoteMap = new Map([
+const moveControlToLppNoteMapTop = new Map([
     [55, 80],
     [54, 70],
     [62, 91],
     [63, 92],
     [85, 20],
-    [43, 89],
-    [42, 79],
-    [41, 69],
-    [40, 59],
+    [43, 89], // move track 1 -> LPP track 1
+    [42, 79], // move track 2 -> LPP track 2
+    [41, 69], // move track 3 -> LPP track 3
+    [40, 59], // move track 4 -> LPP track 4
     [50, 94],
     [49, 90],
     [119, 60],
@@ -62,7 +62,36 @@ const moveControlToLppNoteMap = new Map([
     [99, 99]
 ]);
 
-const lppNoteToMoveControlMap = new Map([...moveControlToLppNoteMap.entries()].map((a) => [a[1], a[0]]));
+const lppNoteToMoveControlMapTop = new Map([...moveControlToLppNoteMapTop.entries()].map((a) => [a[1], a[0]]));
+
+const moveControlToLppNoteMapBottom = new Map([
+    [55, 80],
+    [54, 70],
+    [62, 91],
+    [63, 92],
+    [85, 20],
+    [43, 49], // move track 1 -> LPP track 5
+    [42, 39], // move track 2 -> LPP track 6
+    [41, 29], // move track 3 -> LPP track 7
+    [40, 19], // move track 4 -> LPP track 8
+    [50, 94],
+    [49, 90],
+    [119, 60],
+    [51, 93],
+    [52, 97],
+    [88, 2],
+    [56, 1],
+    [86, 10],
+    [60, 50],
+    [58, 3],
+    [118, 98],
+    // [78, 99]
+    // here to allow Novation Logo LED msg to pass
+    [99, 99]
+]);
+
+const lppNoteToMoveControlMapBottom = new Map([...moveControlToLppNoteMapBottom.entries()].map((a) => [a[1], a[0]]));
+
 
 const lppPadToMovePadMapTop = new Map([
     [81, 92], [82, 93], [83, 94], [84, 95], [85, 96], [86, 97], [87, 98], [88, 99],
@@ -117,6 +146,8 @@ const moveMUTE = 88;
 const moveUNDO = 56;
 const moveTRACK1 = 16;
 const moveSAMPLE = 118;
+
+const moveWHEELTouch = 9;
 
 const lppColorToMoveColorMap = new Map([
     [0x15, green], [0x17, lime], [0x1, light_grey], [0x05, red], [0x03, white], [0x4e, blue],
@@ -266,7 +297,9 @@ globalThis.onMidiMessageExternal = function (data) {
         return;
     }
 
-    let moveControlNumber = lppNoteToMoveControlMap.get(lppNoteNumber);
+    let activeLppToMoveControlMap = showingTop ? lppNoteToMoveControlMapTop : lppNoteToMoveControlMapBottom;
+
+    let moveControlNumber = activeLppToMoveControlMap.get(lppNoteNumber);
 
     // test for LIVE mode message
     if (moveControlNumber === moveLOGO) {
@@ -330,6 +363,19 @@ globalThis.onMidiMessageInternal = function (data) {
 
     if (isNote) {
         let moveNoteNumber = data[1];
+
+        if (moveNoteNumber === moveWHEELTouch && data[2] == 127) {
+            showingTop = !showingTop;
+            updateMovePadsToMatchLpp();
+            return;
+        }
+
+        if (moveNoteNumber === moveWHEELTouch && data[2] == 0) {
+            showingTop = !showingTop;
+            updateMovePadsToMatchLpp();
+            return;
+        }
+
         let lppNote = activeMoveToLppPadMap.get(moveNoteNumber);
 
         if (!lppNote) {
@@ -356,7 +402,9 @@ globalThis.onMidiMessageInternal = function (data) {
         console.log("control message");
         let moveControlNumber = data[1];
 
-        let lppNote = moveControlToLppNoteMap.get(moveControlNumber);
+        let activeMoveControlToLppNoteMap = showingTop ? moveControlToLppNoteMapTop : moveControlToLppNoteMapBottom;
+
+        let lppNote = activeMoveControlToLppNoteMap.get(moveControlNumber);
 
         // store current VIEW
         if (moveControlNumber === moveBACK || moveControlNumber === moveMENU || moveControlNumber === moveCAP) {
@@ -453,53 +501,9 @@ function updatePLAYLed() {
     if (liveMode === true && isPlaying === true) { move_midi_internal_send([0 << 4 | 0xb, 0xB0, movePLAY, navy]); };
 }
 
-// function initMove(step) {
-//     // go to SEQ view and then back to SONG to initialise PADS. 
-//     // ensure SHIFT is not set as pressed
-//     // toggle MUTE->SOLO to setup track lights under bottom row of matching PADS
-//     // set PLAY and REC dim LEDS
-//     // add any additional steps with increased case #, ensuring last case has return initDone
-//     // steps are taken at stepDelay intervals - cases do not need to be consective, just multiplies of stepDelay as required
-
-//     let timeStamp = new Date();
-//     let duration = timeStamp.getTime() - timeStart.getTime();
-
-//     if (duration > step * stepDelay && duration < (step + 1) * stepDelay) {
-//         switch (step) {
-//             case 2: move_midi_internal_send([0 << 4 | 0xb, 0xB0, movePLAY, light_grey]); break;
-//             case 3: move_midi_internal_send([0 << 4 | 0xb, 0xB0, moveREC, light_grey]); break;
-//             case 4: move_midi_internal_send([0 << 4 | 0xb, 0xB0, moveMENU, dim_grey]); break;
-//             case 5: move_midi_internal_send([0 << 4 | 0xb, 0xB0, moveCAP, dim_grey]); break;
-//             case 6: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveCAP), 100]); break;
-//             case 7: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveCAP), 0]); break;
-//             case 8: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveBACK), 100]); break;
-//             case 9: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveBACK), 0]); break;
-//             case 10: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveSHIFT), 100]); break;
-//             case 11: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveSHIFT), 0]); break;
-//             case 12: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveMUTE), 100]); break;
-//             case 13: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveMUTE), 0]); break;
-//             case 14: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveLOOP), 100]); break;
-//             case 15: move_midi_external_send([2 << 4 | 0x9, 0x90, moveControlToLppNoteMap.get(moveLOOP), 0]); break;
-//             case 16: move_midi_external_send([2 << 4 | 0x9, 0x90, moveToLppPadMapTop.get(moveTRACK1), 127]); break;
-//             case 17: move_midi_external_send([2 << 4 | 0x9, 0x90, moveToLppPadMapTop.get(moveTRACK1), 0]); break;
-//             case 18: move_midi_external_send([2 << 4 | 0x9, 0x90, moveToLppPadMapTop.get(moveTRACK1), 127]); break;
-//             case 19: move_midi_external_send([2 << 4 | 0x9, 0x90, moveToLppPadMapTop.get(moveTRACK1), 0]); return initDone;
-//         }
-//         return step + 1;
-//     } else {
-//         return step;
-//     }
-// }
-
 globalThis.init = function () {
     console.log("Move control surface script staring...");
-    // initLPP();
-    // console.log("Calling exit...");
-    // exit();
 }
 
 // globalThis.tick = function () {
-//     if (initStep != initDone) {
-//         initStep = initMove(initStep);
-//     }
 // };
