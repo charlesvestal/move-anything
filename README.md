@@ -1,9 +1,38 @@
+# <ins>Move Anything (previously Move Control Surface)</ins>
+
+## What is this project?
+Move Anything is a framework that lets you write your own code for the Ableton Move. It gives you access to:
+* The pads (including polyphonic aftertouch values) and knobs (including capacitive touch)
+* Display as a 128x64 1 bit framebuffer (it's just balck and white);
+* Audio from the line-in and mic
+* Audio out through the speakers and line out
+* MIDI in/out via the USB-A port. You can also connect multiple USB-MIDI devices to the USB-A port using a hub and receive and send MIDI to all of them.
+* Move Anything is non-destructive and lives alongside the regular Move software. You can quickly launch Move Anything using a key combination from the regular Move software, and quickly return to the regular Move software when you're done.
+
+## Here are some examples of things people have made so far (DM me to be included here!)
+* TODO: Add all the cool stuff that's been made so far.
+
+## How do I actually create a script?
+* Scripts are writting in modern Javascript (es2023). This makes it super fast and safe to try out new ideas and get things working quickly!
+* The underlying core is written in C and can be reused for your own projects.
+* TODO: Example Hello World script showing how to use all the features.
+
+<br>
+<br>
+<br>
+<br>
+<br>
+<br>
+
+
+
+## Old Description follows 👇 👇 👇 👇 👇 👇 👇 👇 👇 
+
+
 Move Control Surface
 ====================
 
-
-What is this?
-=============
+## What is this?
 1. An emulation of the Launch Pad Pro on the Ableton Move to be used with the Dirtywave M8. The Move is a USB host for the M8 and can charge it. All 9 knobs are mappable on the M8 while in LPP mode. Poly aftertouch is sent as CC1 and is also mappabe on M8.
 
 2. A framework to develop control surface scripts in Javascript. This supports tansforming MIDI in arbitrary ways both coming from the pads, knobs and controls, and also transforming and retransmitting external midi.
@@ -12,9 +41,7 @@ What is this?
 
 4. As a bonus, there's an additional option to install "pages of sets" that gives you unlimited pages of sets on the Ableton Move.
 
-Installation (macos, Linux)
-===========================
-
+## Installation (macos, Linux)
 1. Back up all your sets. I haven't lost any data, but I also make no guarantees that you won't!
 
 2. Set up SSH on your move by adding an SSH key to http://move.local/development/ssh.
@@ -32,12 +59,10 @@ And it'll download the latest build and install it on your Move.
 5. The installer will ask you if you want to install "pages of sets" which is an optional bonus feature that gives you unlimited pages of sets on the move by holding shift and pressing the left or right buttons. The default is to not install. You can install later by running the installer again. _**In the current build, it will rearrange your sets and change their colors! You have been warned!**_ (I will try and fix this though)
 
 
-Installation Windows
-====================
+## Installation Windows
 If you're on Windows, you can get bash by installing Git Bash, can you get that by installing Git for Windows): https://git-scm.com/downloads/win. Once you have that, launch Bash and then run the install script as above!
    
-Usage of the M8 Launchpad Pro emulation
-=======================================
+## Usage of the M8 Launchpad Pro emulation
 1. Once installed, to launch the m8 integration, hold shift then touch the volume knob and the jog wheel. Toggle Launch Pad Pro control surface mode on the M8 and the Move should come show you the session mode.
 
 2. To see the bottom half of the Launch Pad Pro, click the wheel, the mode button you're on will flash to show you'e on the bottom half.
@@ -48,12 +73,10 @@ Usage of the M8 Launchpad Pro emulation
 
 5. To exit M8 control surface mode and go back to Move, hold shift and click the jog wheel in.
 
-Mapping from Launch Pad Pro to Move
-===================================
+## Mapping from Launch Pad Pro to Move
 <img width="3300" height="2295" alt="image" src="https://github.com/user-attachments/assets/8d94519d-0b6b-41f5-b40c-21c2b95e113f" />
 
-Usage of "Pages of Sets"
-========================
+## Usage of "Pages of Sets"
 _**Note that when you change pages your live session is killed and restarted with the new page**_
 
 1. To change pages hold shift and press the left or right arrow.
@@ -61,11 +84,9 @@ _**Note that when you change pages your live session is killed and restarted wit
 3. Samples, Track presets, Recordings and Effects presets are shared between all pages.
 2. http://move.local will show the Sets from the current page.
 
-After installing a new Move build
-=================================
+## After installing a new Move build
 **After an update to a new Move build, you will need to re-run the install script.**
 
-Troubleshooting
-===============
+## Troubleshooting
 If it's not working, you can get help in our Discord server: https://discord.gg/gePd9annTJ
 
