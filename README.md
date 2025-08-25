@@ -2,7 +2,7 @@
 
 ## What is this project?
 Move Anything is a framework that lets you write your own code for the Ableton Move. It gives you access to:
-* The pads (including polyphonic aftertouch values) and knobs (including capacitive touch)
+* The pads (including polyphonic aftertouch values), knobs (including capacitive touch) and all buttons. Including setting the color of all of them.
 * Display as a 128x64 1 bit framebuffer (it's just balck and white);
 * Audio from the line-in and mic
 * Audio out through the speakers and line out
