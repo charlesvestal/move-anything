@@ -81,7 +81,8 @@ If you're on Windows, you can get bash by installing Git Bash, can you get that 
 5. To exit M8 control surface mode and go back to Move, hold shift and click the jog wheel in.
 
 ## Mapping from Launch Pad Pro to Move
-<img width="3300" height="2295" alt="image" src="https://github.com/user-attachments/assets/8d94519d-0b6b-41f5-b40c-21c2b95e113f" />
+<img width="5664" height="2788" alt="move_LPP_instructions_v2" src="https://github.com/user-attachments/assets/27d0cf29-35be-4c64-9fc2-52d3f33686dd" />
+
 
 ## Usage of "Pages of Sets"
 _**Note that when you change pages your live session is killed and restarted with the new page**_
