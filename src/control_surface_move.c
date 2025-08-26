@@ -7,12 +7,33 @@
 #include <string.h>
 #include <time.h>
 #include <sys/ioctl.h>
+#include <stdint.h>
 
 #include "quickjs.h"
 #include "quickjs-libc.h"
 
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
 int global_fd = -1;
 int global_exit_flag = 0;
+
+typedef struct FontChar {
+  unsigned char* data;
+  int width;
+  int height;
+} FontChar;
+
+typedef struct Font {
+  int charSpacing;
+  FontChar charData[128];
+} Font;
+
+Font* font = NULL;
+
+unsigned char screen_buffer[128*64];
+int screen_dirty = 0;
+int frame = 0;
 
 struct SPI_Memory
 {
@@ -36,6 +57,195 @@ struct USB_MIDI_Packet
     unsigned char midi_1;
     unsigned char midi_2;
 };
+
+void dirty_screen() {
+  if(screen_dirty == 0) {
+    screen_dirty = 1;
+  }
+}
+
+void clear_screen() {
+  memset(screen_buffer, 0, 128*64);
+  dirty_screen();
+}
+
+void set_pixel(int x, int y, int value) {
+  if(x >= 0 && x < 128 && y >= 0 && y < 64) {
+    screen_buffer[y*128+x] = value != 0 ? 1 : 0;
+    dirty_screen();
+  }
+}
+
+int get_pixel(int x, int y) {
+  return screen_buffer[y*128+x] > 0 ? 1 : 0;
+}
+
+void draw_rect(int x, int y, int w, int h, int value) {
+  if(w == 0 || h == 0) {
+    return;
+  }
+
+  for(int yi = y; yi < y+h; yi++) {
+    set_pixel(x, yi, value);
+    set_pixel(x+w-1, yi, value);
+  }
+
+  for(int xi = x; xi < x+w; xi++) {
+    set_pixel(xi, y, value);
+    set_pixel(xi, y+h-1, value);
+  }
+}
+
+void fill_rect(int x, int y, int w, int h, int value) {
+  if(w == 0 || h == 0) {
+    return;
+  }
+
+  for(int yi = y; yi < y+h; yi++) {
+    for(int xi = x; xi < x+w; xi++) {
+      set_pixel(xi, yi, value);
+    }
+  }
+}
+
+Font* load_font(char* filename, int charSpacing) {
+  int width, height, comp;
+
+  char charListFilename[100];
+  sprintf(charListFilename, "%s.dat", filename);
+
+  FILE* charListFP = fopen(charListFilename, "r");
+  if(charListFP == NULL) {
+    printf("ERROR loading font charList from: %s\n", charListFilename);
+    return NULL;
+  }
+
+  char charList[256];
+  fgets(charList, 256, charListFP);
+  fclose(charListFP);
+
+  int numChars = strlen(charList);
+
+  uint32_t* data = (uint32_t*)stbi_load(filename, &width, &height, &comp, 4);
+  if(data == NULL) {
+    printf("ERROR loading font: %s\n", filename);
+    return NULL;
+  }
+
+  Font* font = malloc(sizeof(Font));
+
+  font->charSpacing = charSpacing;
+
+  comp = 4;
+  int x = 0;
+  int y = 0;
+
+  uint32_t borderColor = data[0];
+  uint32_t emptyColor = data[(height-1) * width];
+
+  //printf("borderColor: 0x%08x\n", borderColor);
+  //printf("emptyColor: 0x%08x\n", emptyColor);
+
+  x = 0;
+
+  for(int i = 0; i < numChars; i++) {
+    FontChar fc;
+    fc.width = 0;
+    fc.height = 0;
+
+    // find the first non-borderColor pixel on the top row
+    while(data[x] == borderColor) {
+      x++;
+    }
+
+    // calculate size of glyph
+    // grow down until we hit borderColor
+    int bx = x;
+    int by = y;
+    for(int by = 0; by < height; by++) {
+        uint32_t color = data[by * width + x];
+        //printf("[%d/%d] scanning y %d color: 0x%08x\n", i, numChars, by, color);
+        if(color == borderColor) {
+          fc.height = by;
+          //printf("[%d/%d] found border color at Y=%d height = %d\n", i, numChars, by, fc.height);
+          break;
+        }
+    }
+    for(int bx = x; bx < width; bx++) {
+        uint32_t color = data[bx];
+        //printf("[%d/%d] scanning x %d color: 0x%08x\n", i, numChars, bx, color);
+        if(color == borderColor) {
+          fc.width = bx - x;
+          //printf("[%d/%d] found border color at X=%d width = %d\n", i, numChars, bx, fc.width);
+          break;
+        }
+    }
+
+    if(fc.width == 0 || fc.height == 0) {
+      printf("ERROR [%d/%d] loading char '%c' has zero dimension: %d x %d from %d,%d\n", i, numChars, charList[i], fc.width, fc.height, x, y);
+      break;
+    }
+
+    // grow right until we hit borderColor
+    fc.data = malloc(fc.width * fc.height);
+
+    int setPixels = 0;
+
+    for(int yi = 0; yi < fc.height; yi++) {
+      for(int xi = 0; xi < fc.width; xi++) {
+        // test if the pixel alpha is 0
+        uint32_t color = data[(y + yi) * width + (x + xi)];
+        int set = (color != borderColor && color != emptyColor);
+        if(set) {
+          setPixels++;
+        }
+        fc.data[yi * fc.width + xi] = set;
+      }
+    }
+
+    font->charData[(int)charList[i]] = fc;
+
+    printf("[%d/%d] loaded char '%c' from font at %d,%d, %dx%d, set pixels: %d\n", i, numChars, charList[i], x, y, fc.width, fc.height, setPixels);
+
+    x += fc.width+1;
+    if(x >= width) {
+      printf("hit width of file, ending, loaded %d/%d glyphs\n", i+1, numChars);
+      break;
+    }
+  }
+  return font;
+}
+
+int glyph(Font* font, char c, int sx, int sy, int color) {
+  FontChar fc = font->charData[c];
+  if(fc.data == NULL) {
+    printf("ERROR cannot print char '%c' not in font\n", c);
+    return sx + font->charSpacing;
+  }
+
+  for(int y = 0; y < fc.height; y++) {
+    for(int x = 0; x < fc.width; x++) {
+      if(fc.data[y * fc.width + x]) {
+        set_pixel(sx + x, sy + y, color);
+      }
+    }
+  }
+  return sx + fc.width;
+}
+
+void print(int sx, int sy, const char* string, int color) {
+  int x = sx;
+  int y = sy;
+
+  if(font == NULL) {
+    font = load_font("font.png", 2);
+  }
+
+  for(int i = 0; i < strlen(string); i++) {
+    x = glyph(font, string[i], x, y, color);
+    x += font->charSpacing;
+  }
+}
 
 int queueMidiSend(int cable, unsigned char *buffer, int length)
 {
@@ -250,6 +460,140 @@ static int eval_file(JSContext *ctx, const char *filename, int module)
     return ret;
 }
 
+static JSValue js_set_pixel(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  if(argc < 2 || argc > 3) {
+    JS_ThrowTypeError(ctx, "set_pixel() expects 2 or 3 arguments, got %d", argc);
+    return JS_EXCEPTION;
+  }
+
+  int x,y,color;
+  if(JS_ToInt32(ctx, &x, argv[0])) {
+    JS_ThrowTypeError(ctx, "set_pixel() invalid arg for `x`");
+    return JS_EXCEPTION;
+  }
+  if(JS_ToInt32(ctx, &y, argv[1])) {
+    JS_ThrowTypeError(ctx, "set_pixel() invalid arg for `y`");
+    return JS_EXCEPTION;
+  }
+  if(argc == 3) {
+    if(JS_ToInt32(ctx, &color, argv[2])) {
+      JS_ThrowTypeError(ctx, "set_pixel() invalid arg for `color`");
+      return JS_EXCEPTION;
+    }
+  } else {
+    color = 1;
+  }
+  set_pixel(x,y,color);
+}
+
+static JSValue js_draw_rect(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  if(argc < 4 || argc > 5) {
+    JS_ThrowTypeError(ctx, "draw_rect() expects 4 or 5 arguments, got %d", argc);
+    return JS_EXCEPTION;
+  }
+
+  int x,y,w,h,color;
+  if(JS_ToInt32(ctx, &x, argv[0])) {
+    JS_ThrowTypeError(ctx, "draw_rect: invalid arg for `x`");
+    return JS_EXCEPTION;
+  }
+  if(JS_ToInt32(ctx, &y, argv[1])) {
+    JS_ThrowTypeError(ctx, "draw_rect: invalid arg for `y`");
+    return JS_EXCEPTION;
+  }
+  if(JS_ToInt32(ctx, &w, argv[2])) {
+    JS_ThrowTypeError(ctx, "draw_rect: invalid arg for `w`");
+    return JS_EXCEPTION;
+  }
+  if(JS_ToInt32(ctx, &h, argv[3])) {
+    JS_ThrowTypeError(ctx, "draw_rect: invalid arg for `h`");
+    return JS_EXCEPTION;
+  }
+  if(argc == 5) {
+    if(JS_ToInt32(ctx, &color, argv[4])) {
+      JS_ThrowTypeError(ctx, "draw_rect: invalid arg for `color`");
+      return JS_EXCEPTION;
+    }
+  } else {
+    color = 1;
+  }
+  draw_rect(x,y,w,h,color);
+}
+
+static JSValue js_fill_rect(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  if(argc < 4 || argc > 5) {
+    JS_ThrowTypeError(ctx, "fill_rect() expects 4 or 5 arguments, got %d", argc);
+    return JS_EXCEPTION;
+  }
+
+  int x,y,w,h,color;
+  if(JS_ToInt32(ctx, &x, argv[0])) {
+    JS_ThrowTypeError(ctx, "fill_rect: invalid arg for `x`");
+    return JS_EXCEPTION;
+  }
+  if(JS_ToInt32(ctx, &y, argv[1])) {
+    JS_ThrowTypeError(ctx, "fill_rect: invalid arg for `y`");
+    return JS_EXCEPTION;
+  }
+  if(JS_ToInt32(ctx, &w, argv[2])) {
+    JS_ThrowTypeError(ctx, "fill_rect: invalid arg for `w`");
+    return JS_EXCEPTION;
+  }
+  if(JS_ToInt32(ctx, &h, argv[3])) {
+    JS_ThrowTypeError(ctx, "fill_rect: invalid arg for `h`");
+    return JS_EXCEPTION;
+  }
+  if(argc == 5) {
+    if(JS_ToInt32(ctx, &color, argv[4])) {
+      JS_ThrowTypeError(ctx, "fill_rect: invalid arg for `color`");
+      return JS_EXCEPTION;
+    }
+  } else {
+    color = 1;
+  }
+  fill_rect(x,y,w,h,color);
+}
+
+static JSValue js_clear_screen(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  if(argc > 0) {
+    JS_ThrowTypeError(ctx, "clear_screen() expects 0 arguments, got %d", argc);
+    return JS_EXCEPTION;
+  }
+  clear_screen();
+}
+
+static JSValue js_print(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  if(argc < 3) {
+    JS_ThrowTypeError(ctx, "print(x,y,string,color) expects 3,4 arguments, got %d", argc);
+    return JS_EXCEPTION;
+  }
+
+  int x,y,color;
+  if(JS_ToInt32(ctx, &x, argv[0])) {
+    JS_ThrowTypeError(ctx, "print: invalid arg for `x`");
+    return JS_EXCEPTION;
+  }
+  if(JS_ToInt32(ctx, &y, argv[1])) {
+    JS_ThrowTypeError(ctx, "print: invalid arg for `y`");
+    return JS_EXCEPTION;
+  }
+
+  JSValue string_val = JS_ToString(ctx, argv[2]);
+  const char* string = JS_ToCString(ctx, string_val);
+
+  color = 1;
+
+  if(JS_ToInt32(ctx, &color, argv[3])) {
+    JS_ThrowTypeError(ctx, "print: invalid arg for `color`");
+    return JS_EXCEPTION;
+  }
+
+  print(x, y, string, color);
+
+  JS_FreeValue(ctx, string_val);
+  JS_FreeCString(ctx, string);
+}
+
 // static JSValue js_sum_bytes(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
 
 #define js_move_midi_external_send_buffer_size 4096
@@ -288,7 +632,7 @@ static JSValue js_move_midi_send(int cable, JSContext *ctx, JSValueConst this_va
     JS_ToUint32(ctx, &len, length_val);
     JS_FreeValue(ctx, length_val);
 
-    printf("[");
+    //printf("[");
     JSValue entry;
     for (int i = 0; i < len; i++)
     {
@@ -313,11 +657,11 @@ static JSValue js_move_midi_send(int cable, JSContext *ctx, JSValueConst this_va
         }
 
         // total_sum += byte_val;
-        printf("%d(%x)", byte_val, byte_val);
-        if (i != len - 1)
+        //printf("%d(%x)", byte_val, byte_val);
+        /*if (i != len - 1)
         {
             printf(", ");
-        }
+        }*/
 
         js_move_midi_send_buffer[send_buffer_index] = byte_val;
         send_buffer_index++;
@@ -331,7 +675,7 @@ static JSValue js_move_midi_send(int cable, JSContext *ctx, JSValueConst this_va
         JS_FreeValue(ctx, val);
     }
 
-    printf("]\n");
+    //printf("]\n");
 
     // flushMidi();
     queueMidiSend(cable, (unsigned char *)js_move_midi_send_buffer, send_buffer_index);
@@ -393,6 +737,21 @@ void init_javascript(JSRuntime **prt, JSContext **pctx)
     JSValue move_midi_internal_send_func = JS_NewCFunction(ctx, js_move_midi_internal_send, "move_midi_internal_send", 1);
     JS_SetPropertyStr(ctx, global_obj, "move_midi_internal_send", move_midi_internal_send_func);
 
+    JSValue set_pixel_func = JS_NewCFunction(ctx, js_set_pixel, "set_pixel", 1);
+    JS_SetPropertyStr(ctx, global_obj, "set_pixel", set_pixel_func);
+
+    JSValue draw_rect_func = JS_NewCFunction(ctx, js_draw_rect, "draw_rect", 1);
+    JS_SetPropertyStr(ctx, global_obj, "draw_rect", draw_rect_func);
+
+    JSValue fill_rect_func = JS_NewCFunction(ctx, js_fill_rect, "fill_rect", 1);
+    JS_SetPropertyStr(ctx, global_obj, "fill_rect", fill_rect_func);
+
+    JSValue clear_screen_func = JS_NewCFunction(ctx, js_clear_screen, "clear_screen", 0);
+    JS_SetPropertyStr(ctx, global_obj, "clear_screen", clear_screen_func);
+
+    JSValue print_func = JS_NewCFunction(ctx, js_print, "print", 1);
+    JS_SetPropertyStr(ctx, global_obj, "print", print_func);
+
     JSValue exit_func = JS_NewCFunction(ctx, js_exit, "exit", 0);
     JS_SetPropertyStr(ctx, global_obj, "exit", exit_func);
 
@@ -435,7 +794,7 @@ int getGlobalFunction(JSContext **pctx, const char *func_name, JSValue *retFunc)
     return 1;
 }
 
-void callGlobalFunction(JSContext **pctx, JSValue *pfunc, unsigned char *data)
+int callGlobalFunction(JSContext **pctx, JSValue *pfunc, unsigned char *data)
 {
     JSContext *ctx = *pctx;
 
@@ -477,6 +836,7 @@ void callGlobalFunction(JSContext **pctx, JSValue *pfunc, unsigned char *data)
 
     JS_FreeValue(ctx, ret);
 
+    return JS_IsException(ret);
 }
 
 void deinit_javascript(JSRuntime **prt, JSContext **pctx)
@@ -491,6 +851,40 @@ void deinit_javascript(JSRuntime **prt, JSContext **pctx)
     js_std_free_handlers(rt);
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
+}
+
+char packed_buffer[1024];
+
+void push_screen(int sync) {
+  // maybe this first 80=1 is necessary?
+  if(sync == 0) {
+    memset(mapped_memory+84, 0, 172);
+    return;
+  } else if(sync == 1) {
+    int i = 0;
+    for(int y = 0; y < 64/8; y++) {
+      for(int x = 0; x < 128; x++) {
+        int index = (y * 128 * 8) + x;
+        unsigned char packed = 0;
+        for(int j = 0; j<8; j++) {
+          int packIndex = index + j * 128;
+          packed |= screen_buffer[packIndex] << j;
+        }
+        packed_buffer[i] = packed;
+        i++;
+      }
+    }
+  }
+
+  {
+    int slice = sync - 1;
+    mapped_memory[80] = slice+1;
+    int sliceStart = 172 * slice;
+    int sliceBytes = slice == 5 ? 164 : 172;
+    for(int i = 0; i < sliceBytes; i++) {
+      mapped_memory[84+i] = packed_buffer[sliceStart+i];
+    }
+  }
 }
 
 int main(int argc, char *argv[])
@@ -644,13 +1038,17 @@ int main(int argc, char *argv[])
     int jsTickIsDefined = getGlobalFunction(&ctx, "tick", &JSTick);
 
     printf("JS:calling init\n");
-    callGlobalFunction(&ctx, &JSinit, 0);
+    if(callGlobalFunction(&ctx, &JSinit, 0)) {
+      printf("JS:init failed\n");
+    }
 
     while (!global_exit_flag)
     {
         if (jsTickIsDefined)
         {
-            callGlobalFunction(&ctx, &JSTick, 0);
+            if(callGlobalFunction(&ctx, &JSTick, 0)) {
+              printf("JS:tick failed\n");
+            }
         }
 
         ioctl_result = ioctl(fd, _IOC(_IOC_NONE, 0, 0xa, 0), 0x300);
@@ -665,6 +1063,7 @@ int main(int argc, char *argv[])
         int out_index = 0;
 
         memset(((struct SPI_Memory *)mapped_memory)->outgoing_midi, 0, 256);
+
         for (int i = startByte; i < endByte; i += 4)
         {
             if ((unsigned int)mapped_memory[i] == 0)
@@ -685,17 +1084,31 @@ int main(int argc, char *argv[])
                 continue;
             }
             
-            printf("%x %x %x %x\n", byte[0], byte[1], byte[2], byte[3]);
+            //printf("%x %x %x %x\n", byte[0], byte[1], byte[2], byte[3]);
             
             if (cable == 2)
             {
-                callGlobalFunction(&ctx, &JSonMidiMessageExternal, &byte[1]);
+                if(callGlobalFunction(&ctx, &JSonMidiMessageExternal, &byte[1])) {
+                  printf("JS:onMidiMessageExternal failed\n");
+                }
             }
 
             if (cable == 0)
             {
-                callGlobalFunction(&ctx, &JSonMidiMessageInternal, &byte[1]);
+                if(callGlobalFunction(&ctx, &JSonMidiMessageInternal, &byte[1])) {
+                  printf("JS:onMidiMessageInternal failed\n");
+                }
             }
+
+        }
+
+        if(screen_dirty >= 1) {
+          push_screen(screen_dirty-1);
+          if(screen_dirty == 7) {
+            screen_dirty = 0;
+          } else {
+            screen_dirty++;
+          }
         }
     }
 
