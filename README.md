@@ -19,6 +19,10 @@ Move Anything is a framework that lets you write your own code for the Ableton M
 ## Here are some examples of things people have made so far (DM me to be included here!)
 * TODO: Add all the cool stuff that's been made so far.
 
+## Stupid stuff I did based on the knowledge gained on this project
+[![IMAGE ALT TEXT HERE](https://img.youtube.com/vi/ZuNeumcc7-s/0.jpg)](https://www.youtube.com/watch?v=ZuNeumcc7-s)
+
+
 ## How do I actually create a script?
 * Scripts are writting in modern Javascript (es2023). This makes it super fast and safe to try out new ideas and get things working quickly!
 * The underlying core is written in C and can be reused for your own projects.
