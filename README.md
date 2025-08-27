@@ -16,6 +16,9 @@ Move Anything is a framework that lets you write your own code for the Ableton M
 * MIDI in/out via the USB-A port. You can also connect multiple USB-MIDI devices to the USB-A port using a hub and receive and send MIDI to all of them.
 * Move Anything is non-destructive and lives alongside the regular Move software. You can quickly launch Move Anything using a key combination from the regular Move software, and quickly return to the regular Move software when you're done.
 
+## Contributors
+@talktogreg, @impbox, @deets, @bobbyd
+
 ## Here are some examples of things people have made so far (DM me to be included here!)
 * TODO: Add all the cool stuff that's been made so far.
 
