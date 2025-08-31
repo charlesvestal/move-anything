@@ -19,11 +19,18 @@ Move Anything is a framework that lets you write your own code for the Ableton M
 ## Contributors
 @talktogreg, @impbox, @deets, @bobbyd
 
+## Community
+Join us on Discord: https://discord.gg/Zn33eRvTyK
+
 ## Here are some examples of things people have made so far (DM me to be included here!)
 * TODO: Add all the cool stuff that's been made so far.
 
+* Messing about with the M8 Launch Pad Pro Emulation and mapped knobs
+[![M8 LPP Emulation Jam Session](https://img.youtube.com/vi/YHt6c-Pq5Bc/0.jpg)](https://www.youtube.com/watch?v=YHt6c-Pq5Bc)
+
+
 ## Stupid stuff I did based on the knowledge gained on this project
-[![IMAGE ALT TEXT HERE](https://img.youtube.com/vi/ZuNeumcc7-s/0.jpg)](https://www.youtube.com/watch?v=ZuNeumcc7-s)
+[![DOOM on MOVE](https://img.youtube.com/vi/ZuNeumcc7-s/0.jpg)](https://www.youtube.com/watch?v=ZuNeumcc7-s)
 
 
 ## How do I actually create a script?
