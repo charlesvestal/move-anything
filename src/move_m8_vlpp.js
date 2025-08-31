@@ -167,6 +167,7 @@ let liveMode = false;
 let isPlaying = false;
 let currentView = moveBACK;
 let initStep = 0;
+let wheelClicked = false;
 let timeStart = new Date();
 
 let lppDebugSuperlog = false;
@@ -183,7 +184,17 @@ function updateMovePadsToMatchLpp() {
         
         globalThis.onMidiMessageExternal(data);
     }
+}
 
+function updateMoveViewPulse(){
+    // pulse VIEW if showing botttom - reset other views to dim_grey
+    move_midi_internal_send([0 << 4 | 0xb, 0xB0, moveBACK, dim_grey]);
+    move_midi_internal_send([0 << 4 | 0xb, 0xB0, moveMENU, dim_grey]);
+    move_midi_internal_send([0 << 4 | 0xb, 0xB0, moveCAP, dim_grey]);
+    move_midi_internal_send([0 << 4 | 0xb, 0xB0, currentView, light_grey]);
+    if (!showingTop) {
+        move_midi_internal_send([0 << 4 | 0xb, 0xBA, currentView, black]);
+    }
 }
 
 function arraysAreEqual(array1, array2) {
@@ -367,12 +378,18 @@ globalThis.onMidiMessageInternal = function (data) {
         if (moveNoteNumber === moveWHEELTouch && data[2] == 127) {
             showingTop = !showingTop;
             updateMovePadsToMatchLpp();
+            updateMoveViewPulse();
             return;
         }
 
         if (moveNoteNumber === moveWHEELTouch && data[2] == 0) {
-            showingTop = !showingTop;
-            updateMovePadsToMatchLpp();
+            // don't toggleback if Wheel clicked
+            if (!wheelClicked) {
+                showingTop = !showingTop;
+                updateMovePadsToMatchLpp();
+                updateMoveViewPulse();
+            }
+            wheelClicked = false;
             return;
         }
 
@@ -409,15 +426,7 @@ globalThis.onMidiMessageInternal = function (data) {
         // store current VIEW
         if (moveControlNumber === moveBACK || moveControlNumber === moveMENU || moveControlNumber === moveCAP) {
             currentView = moveControlNumber;
-        }
-
-        // pulse VIEW if showing botttom
-        move_midi_internal_send([0 << 4 | 0xb, 0xB0, moveBACK, dim_grey]);
-        move_midi_internal_send([0 << 4 | 0xb, 0xB0, moveMENU, dim_grey]);
-        move_midi_internal_send([0 << 4 | 0xb, 0xB0, moveCAP, dim_grey]);
-        move_midi_internal_send([0 << 4 | 0xb, 0xB0, currentView, light_grey]);
-        if (!showingTop) {
-            move_midi_internal_send([0 << 4 | 0xb, 0xBA, currentView, black]);
+            updateMoveViewPulse();
         }
 
         // if Shift is held, exit if Wheel is pressed
@@ -429,8 +438,9 @@ globalThis.onMidiMessageInternal = function (data) {
 
         let toggleTopBottom = moveControlNumber === moveWHEEL && data[2] === 0x7f;
         if (toggleTopBottom) {
-            showingTop = !showingTop;
-            updateMovePadsToMatchLpp();
+            wheelClicked = true;
+//            showingTop = !showingTop;
+//            updateMovePadsToMatchLpp();
             return;
         }
 
