@@ -77,31 +77,28 @@ curl -L https://raw.githubusercontent.com/bobbydigitales/control_surface_move/ma
 
 And it'll download the latest build and install it on your Move. 
 
-5. The installer will ask you if you want to install "pages of sets" which is an optional bonus feature that gives you unlimited pages of sets on the move by holding shift and pressing the left or right buttons. The default is to not install. You can install later by running the installer again. _**In the current build, it will rearrange your sets and change their colors! You have been warned!**_ (I will try and fix this though)
-
+5. The installer will ask you if you want to install "pages of sets" which is an optional bonus feature that gives you unlimited pages of sets on the move by holding shift(...) and pressing the left or right buttons. The default is to not install. You can install later by running the installer again. _**In the current build, it will rearrange your sets and change their colors! You have been warned!**_ (I will try and fix this though)
 
 ## Installation Windows
 If you're on Windows, you can get bash by installing Git Bash, can you get that by installing Git for Windows): https://git-scm.com/downloads/win. Once you have that, launch Bash and then run the install script as above!
-   
+
 ## Usage of the M8 Launchpad Pro emulation
-1. Once installed, to launch the m8 integration, hold shift then touch the volume knob and the jog wheel. Toggle Launch Pad Pro control surface mode on the M8 and the Move should come show you the session mode.
+<img width="5664" height="2788" alt="move_LPP_instructions_v2" src="https://github.com/user-attachments/assets/27d0cf29-35be-4c64-9fc2-52d3f33686dd" />
+
+1. Once installed, to launch the m8 integration, hold shift(...) then touch the volume knob and the jog wheel. Toggle Launch Pad Pro control surface mode on the M8 and the Move should come show you the session mode.
 
 2. To see the bottom half of the Launch Pad Pro, click the wheel, the mode button you're on will flash to show you'e on the bottom half.
 
-3. To launch Beat Repeat mode, hold shift, press session (the arrow pointing left on the left of the move), then click the wheel to show the bottom half of the Move.
+3. To launch Beat Repeat mode, hold shift(...), press session (the arrow pointing left on the left of the move), then click the wheel to show the bottom half of the Move.
 
 4. All 9 knobs send MIDI CC's on channel 4. Poly aftertouch is mapped to CC1 on channel 4.
 
-5. To exit M8 control surface mode and go back to Move, hold shift and click the jog wheel in.
-
-## Mapping from Launch Pad Pro to Move
-<img width="5664" height="2788" alt="move_LPP_instructions_v2" src="https://github.com/user-attachments/assets/27d0cf29-35be-4c64-9fc2-52d3f33686dd" />
-
+5. To exit M8 control surface mode and go back to Move, hold shift(...) and click the jog wheel in.
 
 ## Usage of "Pages of Sets"
 _**Note that when you change pages your live session is killed and restarted with the new page**_
 
-1. To change pages hold shift and press the left or right arrow.
+1. To change pages hold shift(...) and press the left or right arrow.
 2. If a page doesn't exist, it will be created.
 3. Samples, Track presets, Recordings and Effects presets are shared between all pages.
 2. http://move.local will show the Sets from the current page.
