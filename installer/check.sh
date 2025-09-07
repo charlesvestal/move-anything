@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # set -x
 ssh_quiet="ssh -o LogLevel=QUIET ableton@move.local"
 $ssh_quiet ls /opt/move/MoveOriginal
