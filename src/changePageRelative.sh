@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 echo ">>>>>>>>>>>>>>>>>>>>>>>>Change Page Relative by $0 $1 $2"
 delta=$1
 current_page=$(echo `ls -la /data/UserData/UserLibrary` | grep -o '[0-9]*$')
