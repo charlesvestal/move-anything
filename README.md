@@ -109,3 +109,37 @@ _**Note that when you change pages your live session is killed and restarted wit
 ## Troubleshooting
 If it's not working, you can get help in our Discord server: https://discord.gg/gePd9annTJ
 
+## Building Linux Binaries from macOS
+The Move runs aarch64 Linux, so binaries compiled natively on macOS (Mach-O) will not execute on the device. The simplest approach is to build the artifacts inside an ARM64 Debian container.
+
+1. **Install Docker Desktop** (4.24+) or OrbStack. Both can launch images with `--platform=linux/arm64` on Apple silicon.
+
+2. **Build the ARM64 toolchain image** shipped with this repo:
+   ```bash
+   docker build \
+     --platform=linux/arm64 \
+     -t move-anything-arm64 \
+     -f docker/Dockerfile.arm64 docker
+   ```
+
+3. **Enter the container with the repo mounted**:
+   ```bash
+   docker run --rm -it \
+     --platform=linux/arm64 \
+     -v "$(pwd)":/workspace \
+     -w /workspace \
+     move-anything-arm64
+   ```
+
+4. **Inside the container, rebuild everything for ARM64 Linux**:
+   ```bash
+   make -C libs/quickjs/quickjs-2025-04-26 libquickjs.a
+   ./clean.sh
+   ./build.sh
+   ./package.sh
+   exit
+   ```
+
+5. Back on macOS, run `./copy_to_move.sh` to deploy the freshly produced ELF binaries to the Move over SSH.
+
+> OrbStack users can substitute `orb run --arch arm64 ...` for the docker commands—the steps are identical once you have an ARM64 Debian shell.
