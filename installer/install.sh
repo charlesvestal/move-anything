@@ -55,15 +55,15 @@ $ssh_ableton "tar -xvf ./$filename"
 
 $ssh_ableton "killall MoveLauncher Move MoveOriginal"
 
-$ssh_root cp -aL /data/UserData/control_surface_move/control_surface_move_shim.so /usr/lib/
-$ssh_root chmod u+s /usr/lib/control_surface_move_shim.so
+$ssh_root 'command cp -aL /data/UserData/control_surface_move/control_surface_move_shim.so /usr/lib/'
+$ssh_root 'command chmod u+s /usr/lib/control_surface_move_shim.so'
 if $ssh_root "test ! -f /opt/move/MoveOriginal"; then
-  $ssh_root mv /opt/move/Move /opt/move/MoveOriginal
-  $ssh_ableton cp /opt/move/MoveOriginal ~/
+  $ssh_root 'command mv /opt/move/Move /opt/move/MoveOriginal'
+  $ssh_ableton "command cp /opt/move/MoveOriginal ~/"
 fi
 
-$ssh_root chmod +x /data/UserData/control_surface_move/Move.sh
-$ssh_root cp /data/UserData/control_surface_move/Move.sh /opt/move/Move
+$ssh_root 'command chmod +x /data/UserData/control_surface_move/Move.sh'
+$ssh_root 'command cp /data/UserData/control_surface_move/Move.sh /opt/move/Move
 
 $ssh_root md5sum /opt/move/Move
 $ssh_root md5sum /opt/move/MoveOriginal
@@ -87,7 +87,7 @@ else
     echo "Not installing Pages of Sets"
 fi
 
-echo "Restating Move binary with shim installed..."
+echo "Restarting Move binary with shim installed..."
 
 
 $ssh_ableton "nohup /opt/move/MoveLauncher 2>/dev/null 1>/dev/null &" &
