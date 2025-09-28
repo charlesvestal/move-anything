@@ -74,7 +74,6 @@ remove_shim() {
 
 cleanup_installation_dirs() {
     log "Removing Move Anything directories..."
-    ${SSH} "${ROOT_USER}@${HOST}" 'rm -rf /data/UserData/control_surface_move'
     ${SSH} "${ABLETON_USER}@${HOST}" 'rm -rf ~/control_surface_move ~/control_surface_move.tar.gz'
 }
 
