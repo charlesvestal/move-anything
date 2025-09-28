@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 killall MoveLauncher MoveMessageDisplay Move
 echo "Waiting 1 second for Move binaries to exit..."
 sleep 0.5

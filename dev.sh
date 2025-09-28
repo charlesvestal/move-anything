@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -x
 ssh ableton@move.local killall MoveLauncher Move MoveOriginal MoveMessageDisplay
 ./clean.sh
