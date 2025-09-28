@@ -1,0 +1,5 @@
+/build
+/dist
+control_surface_move.tar.gz
+installer/control_surface_move.tar.gz
+.DS_Store
