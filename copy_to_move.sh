@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -x
 echo "Killing control_surface_move process on Move..."
 ssh ableton@move.local killall control_surface_move
