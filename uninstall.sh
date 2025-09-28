@@ -79,11 +79,13 @@ cleanup_installation_dirs() {
 
 restore_user_library() {
     log "Restoring UserLibrary symlink..."
-    ${SSH} "${ABLETON_USER}@${HOST}" 'if [ -d ~/UserLibrary_base ] && [ ! -d ~/UserLibrary ]; then
-        mv ~/UserLibrary_base ~/UserLibrary
-    fi
-    if [ -L ~/UserLibrary ]; then
+    ${SSH} "${ABLETON_USER}@${HOST}" 'if [ -L ~/UserLibrary ]; then
         rm ~/UserLibrary
+    fi
+
+    if [ -d ~/UserLibrary_base ]; then
+        mv ~/UserLibrary_base ~/UserLibrary
+    else
         mkdir -p ~/UserLibrary
     fi'
 }
