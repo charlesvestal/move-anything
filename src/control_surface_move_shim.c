@@ -5,6 +5,7 @@
 #include <dlfcn.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <time.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <unistd.h>
@@ -145,6 +146,16 @@ int (*real_ioctl)(int, unsigned long, char *) = NULL;
 int shiftHeld = 0;
 int volumeTouched = 0;
 int wheelTouched = 0;
+int launchInProgress = 0;
+struct timespec volumeTouchedTs = {0};
+struct timespec wheelTouchedTs = {0};
+
+static long diff_ms(struct timespec *a, struct timespec *b)
+{
+    long sec = a->tv_sec - b->tv_sec;
+    long nsec = a->tv_nsec - b->tv_nsec;
+    return sec * 1000 + nsec / 1000000;
+}
 void midi_monitor()
 {
     int startByte = 2048;
@@ -223,36 +234,42 @@ void midi_monitor()
             }
         }
 
-        if (midi_0 == 0x90 && midi_1 == 0x08)
+        if ((midi_0 == 0x90 || midi_0 == 0x80) && midi_1 == 0x08)
         {
-            if (midi_2 == 0x7f)
+            if (midi_0 == 0x90 && midi_2 == 0x7f)
             {
                 volumeTouched = 1;
+                clock_gettime(CLOCK_MONOTONIC, &volumeTouchedTs);
             }
-            else
+            else if (midi_0 == 0x80 || midi_2 == 0x00)
             {
                 volumeTouched = 0;
             }
         }
 
-        if (midi_0 == 0x90 && midi_1 == 0x09)
+        if ((midi_0 == 0x90 || midi_0 == 0x80) && midi_1 == 0x09)
         {
-            if (midi_2 == 0x7f)
+            if (midi_0 == 0x90 && midi_2 == 0x7f)
             {
                 wheelTouched = 1;
+                clock_gettime(CLOCK_MONOTONIC, &wheelTouchedTs);
             }
-            else
+            else if (midi_0 == 0x80 || midi_2 == 0x00)
             {
                 wheelTouched = 0;
             }
         }
 
-        if (shiftHeld && volumeTouched && wheelTouched)
+        if (!launchInProgress && volumeTouched && wheelTouched)
         {
-            printf("Launching control surface!\n");
-            // printf("pid: %d\n", getpid());
-
-            launchChildAndKillThisProcess("/data/UserData/control_surface_move/start_control_surface_move.sh", "start_control_surface_move.sh", "");
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if (diff_ms(&now, &volumeTouchedTs) > 200 && diff_ms(&now, &wheelTouchedTs) > 200)
+            {
+                launchInProgress = 1;
+                printf("Toggling control surface!\n");
+                launchChildAndKillThisProcess("/data/UserData/control_surface_move/start_control_surface_move.sh", "start_control_surface_move.sh", "");
+            }
         }
 
         printf("control_surface_move: cable: %x,\tcode index number:%x,\tmidi_0:%x,\tmidi_1:%x,\tmidi_2:%x\n", cable, code_index_number, midi_0, midi_1, midi_2);

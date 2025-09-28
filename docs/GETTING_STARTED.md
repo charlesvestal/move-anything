@@ -51,6 +51,11 @@ Copy the bundle and shim to the device:
 This stops the stock Move binaries, uploads the artifacts to `/data/UserData/control_surface_move/`, and restores the SUID shim so the runtime can access the SPI mailbox.
 
 ## 5. Launch the Script
+### Hardware toggle
+- Hold the volume encoder and press the main encoder once. The shim detects this combo and launches the Hello World script.
+- Use the same gesture again while the script is running to exit and relaunch the stock Move UI.
+
+### Manual launch (optional)
 Ensure the factory processes are stopped (the helper script does this for you):
 ```bash
 ssh ableton@move.local "killall MoveLauncher Move MoveOriginal MoveMessageDisplay"
