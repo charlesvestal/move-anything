@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -x
 rm -fr ./dist/
 mkdir -p ./dist/control_surface_move/

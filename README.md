@@ -36,6 +36,9 @@ Join us on Discord: https://discord.gg/Zn33eRvTyK
 ## How do I actually create a script?
 * Scripts are writting in modern Javascript (es2023). This makes it super fast and safe to try out new ideas and get things working quickly!
 * The underlying core is written in C and can be reused for your own projects.
+* Here's the default script: https://github.com/bobbydigitales/move-anything/blob/main/src/move_default.js
+* Run with `./control_surface_move move_default.js`
+
 * TODO: Example Hello World script showing how to use all the features.
 
 <br>
