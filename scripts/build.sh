@@ -61,6 +61,7 @@ echo "Building host..."
 "${CROSS_PREFIX}gcc" -g -O3 \
     src/move_anything.c \
     src/host/module_manager.c \
+    src/host/midi_send.c \
     src/host/settings.c \
     -o build/move-anything \
     -Isrc -Isrc/lib \
