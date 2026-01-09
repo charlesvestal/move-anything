@@ -22,6 +22,7 @@
 
 #include "host/module_manager.h"
 #include "host/settings.h"
+#include "host/midi_send.h"
 
 int global_fd = -1;
 int global_exit_flag = 0;
@@ -1313,7 +1314,7 @@ static JSValue js_host_module_get_param(JSContext *ctx, JSValueConst this_val,
     return JS_NewString(ctx, buf);
 }
 
-/* host_module_send_midi([status, data1, data2], source) */
+/* host_module_send_midi([status, ...], source) */
 static JSValue js_host_module_send_midi(JSContext *ctx, JSValueConst this_val,
                                         int argc, JSValueConst *argv) {
     if (argc < 1 || !g_module_manager_initialized) {
@@ -1331,12 +1332,16 @@ static JSValue js_host_module_send_midi(JSContext *ctx, JSValueConst this_val,
         return JS_UNDEFINED;
     }
     JS_FreeValue(ctx, len_val);
-    if (len < 3) {
+    if (len < 1) {
         return JS_UNDEFINED;
     }
 
-    uint8_t msg[3];
-    for (uint32_t i = 0; i < 3; i++) {
+    if (len > 512) {
+        len = 512;
+    }
+
+    uint8_t msg[512];
+    for (uint32_t i = 0; i < len; i++) {
         JSValue v = JS_GetPropertyUint32(ctx, argv[0], i);
         int32_t val = 0;
         JS_ToInt32(ctx, &val, v);
@@ -1363,7 +1368,7 @@ static JSValue js_host_module_send_midi(JSContext *ctx, JSValueConst this_val,
         }
     }
 
-    mm_on_midi(&g_module_manager, msg, 3, source);
+    host_module_send_midi_bytes(&g_module_manager, msg, (int)len, source);
     return JS_UNDEFINED;
 }
 
