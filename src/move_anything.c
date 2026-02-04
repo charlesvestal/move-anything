@@ -58,6 +58,11 @@ int g_reload_menu_ui = 0;
 char g_menu_script_path[256] = "";
 int g_silence_blocks = 0;
 
+/* Module crash handling */
+#define MAX_CONSECUTIVE_CRASHES 3
+int g_js_crash_count = 0;  /* Consecutive JS tick/init failures */
+char g_crashed_module_id[64] = "";  /* ID of module that crashed */
+
 /* Default modules directory */
 #define DEFAULT_MODULES_DIR "/data/UserData/move-anything/modules"
 
@@ -1274,6 +1279,9 @@ static int eval_file_safe(JSContext *ctx, const char *filename, int module)
             JSValue result = JS_Call(ctx, init_func, global, 0, NULL);
             if (JS_IsException(result)) {
                 js_std_dump_error(ctx);
+                printf("Module init() failed - will trigger crash handling\n");
+                g_js_crash_count = MAX_CONSECUTIVE_CRASHES;  /* Trigger immediate crash handling */
+                ret = -1;
             }
             JS_FreeValue(ctx, result);
         }
@@ -1557,6 +1565,83 @@ static JSValue js_host_rescan_modules(JSContext *ctx, JSValueConst this_val,
 
     int count = mm_scan_modules(&g_module_manager, DEFAULT_MODULES_DIR);
     return JS_NewInt32(ctx, count);
+}
+
+/* host_get_disabled_modules() -> array of module IDs */
+static JSValue js_host_get_disabled_modules(JSContext *ctx, JSValueConst this_val,
+                                            int argc, JSValueConst *argv) {
+    JSValue arr = JS_NewArray(ctx);
+    if (!g_module_manager_initialized) {
+        return arr;
+    }
+
+    int count = mm_get_disabled_count(&g_module_manager);
+    for (int i = 0; i < count; i++) {
+        const char *id = mm_get_disabled_module(&g_module_manager, i);
+        if (id) {
+            JS_SetPropertyUint32(ctx, arr, i, JS_NewString(ctx, id));
+        }
+    }
+    return arr;
+}
+
+/* host_disable_module(id) -> bool (success) */
+static JSValue js_host_disable_module(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv) {
+    if (argc < 1 || !g_module_manager_initialized) {
+        return JS_FALSE;
+    }
+
+    const char *id = JS_ToCString(ctx, argv[0]);
+    if (!id) return JS_FALSE;
+
+    int result = mm_disable_module(&g_module_manager, id);
+    JS_FreeCString(ctx, id);
+
+    return result == 0 ? JS_TRUE : JS_FALSE;
+}
+
+/* host_enable_module(id) -> bool (success) */
+static JSValue js_host_enable_module(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv) {
+    if (argc < 1 || !g_module_manager_initialized) {
+        return JS_FALSE;
+    }
+
+    const char *id = JS_ToCString(ctx, argv[0]);
+    if (!id) return JS_FALSE;
+
+    int result = mm_enable_module(&g_module_manager, id);
+    JS_FreeCString(ctx, id);
+
+    /* Rescan modules so the re-enabled module appears in the list */
+    if (result == 0) {
+        mm_scan_modules(&g_module_manager, DEFAULT_MODULES_DIR);
+    }
+
+    return result == 0 ? JS_TRUE : JS_FALSE;
+}
+
+/* host_get_last_crashed_module() -> string or null */
+static JSValue js_host_get_last_crashed_module(JSContext *ctx, JSValueConst this_val,
+                                               int argc, JSValueConst *argv) {
+    if (g_crashed_module_id[0] == '\0') {
+        return JS_NULL;
+    }
+    return JS_NewString(ctx, g_crashed_module_id);
+}
+
+/* host_trigger_safe_mode() -> bool (success) */
+static JSValue js_host_trigger_safe_mode(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv) {
+    /* Create safe-mode trigger file */
+    FILE *f = fopen("/data/UserData/move-anything/safe-mode", "w");
+    if (!f) {
+        return JS_FALSE;
+    }
+    fprintf(f, "triggered\n");
+    fclose(f);
+    return JS_TRUE;
 }
 
 /* host_get_volume() -> int (0-100) */
@@ -2162,6 +2247,22 @@ void init_javascript(JSRuntime **prt, JSContext **pctx)
     JSValue host_rescan_modules_func = JS_NewCFunction(ctx, js_host_rescan_modules, "host_rescan_modules", 0);
     JS_SetPropertyStr(ctx, global_obj, "host_rescan_modules", host_rescan_modules_func);
 
+    /* Module disable list functions */
+    JSValue host_get_disabled_modules_func = JS_NewCFunction(ctx, js_host_get_disabled_modules, "host_get_disabled_modules", 0);
+    JS_SetPropertyStr(ctx, global_obj, "host_get_disabled_modules", host_get_disabled_modules_func);
+
+    JSValue host_disable_module_func = JS_NewCFunction(ctx, js_host_disable_module, "host_disable_module", 1);
+    JS_SetPropertyStr(ctx, global_obj, "host_disable_module", host_disable_module_func);
+
+    JSValue host_enable_module_func = JS_NewCFunction(ctx, js_host_enable_module, "host_enable_module", 1);
+    JS_SetPropertyStr(ctx, global_obj, "host_enable_module", host_enable_module_func);
+
+    JSValue host_get_last_crashed_module_func = JS_NewCFunction(ctx, js_host_get_last_crashed_module, "host_get_last_crashed_module", 0);
+    JS_SetPropertyStr(ctx, global_obj, "host_get_last_crashed_module", host_get_last_crashed_module_func);
+
+    JSValue host_trigger_safe_mode_func = JS_NewCFunction(ctx, js_host_trigger_safe_mode, "host_trigger_safe_mode", 0);
+    JS_SetPropertyStr(ctx, global_obj, "host_trigger_safe_mode", host_trigger_safe_mode_func);
+
     JSValue host_get_volume_func = JS_NewCFunction(ctx, js_host_get_volume, "host_get_volume", 0);
     JS_SetPropertyStr(ctx, global_obj, "host_get_volume", host_get_volume_func);
 
@@ -2577,6 +2678,24 @@ int main(int argc, char *argv[])
         {
             if(callGlobalFunction(&ctx, &JSTick, 0)) {
               printf("JS:tick failed\n");
+              g_js_crash_count++;
+
+              /* Check if we've hit the crash threshold */
+              if (g_js_crash_count >= MAX_CONSECUTIVE_CRASHES && mm_is_module_loaded(&g_module_manager)) {
+                  const module_info_t *info = mm_get_current_module(&g_module_manager);
+                  if (info) {
+                      strncpy(g_crashed_module_id, info->id, sizeof(g_crashed_module_id) - 1);
+                      printf("Module '%s' crashed %d times, disabling and returning to menu\n",
+                             info->id, g_js_crash_count);
+                      /* Auto-disable the crashed module */
+                      mm_disable_module(&g_module_manager, info->id);
+                  }
+                  g_reload_menu_ui = 1;
+                  g_js_crash_count = 0;
+              }
+            } else {
+              /* Reset crash count on successful tick */
+              g_js_crash_count = 0;
             }
         }
 

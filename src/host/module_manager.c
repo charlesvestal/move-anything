@@ -203,6 +203,9 @@ void mm_init(module_manager_t *mm, uint8_t *mapped_memory,
     mm->host_api.log = host_log;
     mm->host_api.midi_send_internal = midi_send_internal;
     mm->host_api.midi_send_external = midi_send_external;
+
+    /* Load disabled modules list */
+    mm_load_disabled_list(mm);
 }
 
 /* Helper to scan a single directory for modules */
@@ -229,6 +232,11 @@ static int scan_directory(module_manager_t *mm, const char *dir_path) {
         if (stat(json_path, &st) != 0) continue;
 
         if (parse_module_json(module_path, &mm->modules[mm->module_count]) == 0) {
+            /* Check if module is disabled */
+            if (mm_is_module_disabled(mm, mm->modules[mm->module_count].id)) {
+                printf("mm: skipping disabled module '%s'\n", mm->modules[mm->module_count].id);
+                continue;
+            }
             mm->module_count++;
             found++;
         }
@@ -523,4 +531,125 @@ void mm_destroy(module_manager_t *mm) {
     mm_unload_module(mm);
     memset(mm, 0, sizeof(*mm));
     mm->current_module_index = -1;
+}
+
+/* ========== Disabled modules management ========== */
+
+void mm_load_disabled_list(module_manager_t *mm) {
+    mm->disabled_count = 0;
+
+    FILE *f = fopen(DISABLED_MODULES_FILE, "r");
+    if (!f) {
+        printf("mm: no disabled modules file\n");
+        return;
+    }
+
+    /* Read simple JSON array: ["module1", "module2"] */
+    char buf[2048];
+    size_t len = fread(buf, 1, sizeof(buf) - 1, f);
+    buf[len] = '\0';
+    fclose(f);
+
+    /* Simple parsing: find strings between quotes */
+    const char *p = buf;
+    while ((p = strchr(p, '"')) != NULL && mm->disabled_count < MAX_DISABLED_MODULES) {
+        p++; /* skip opening quote */
+        const char *end = strchr(p, '"');
+        if (!end) break;
+
+        int id_len = end - p;
+        if (id_len > 0 && id_len < MAX_MODULE_ID_LEN) {
+            strncpy(mm->disabled_modules[mm->disabled_count], p, id_len);
+            mm->disabled_modules[mm->disabled_count][id_len] = '\0';
+            printf("mm: module '%s' is disabled\n", mm->disabled_modules[mm->disabled_count]);
+            mm->disabled_count++;
+        }
+        p = end + 1;
+    }
+
+    printf("mm: loaded %d disabled modules\n", mm->disabled_count);
+}
+
+void mm_save_disabled_list(module_manager_t *mm) {
+    FILE *f = fopen(DISABLED_MODULES_FILE, "w");
+    if (!f) {
+        printf("mm: failed to write disabled modules file\n");
+        return;
+    }
+
+    fprintf(f, "[");
+    for (int i = 0; i < mm->disabled_count; i++) {
+        if (i > 0) fprintf(f, ", ");
+        fprintf(f, "\"%s\"", mm->disabled_modules[i]);
+    }
+    fprintf(f, "]\n");
+    fclose(f);
+
+    printf("mm: saved %d disabled modules\n", mm->disabled_count);
+}
+
+int mm_is_module_disabled(module_manager_t *mm, const char *module_id) {
+    for (int i = 0; i < mm->disabled_count; i++) {
+        if (strcmp(mm->disabled_modules[i], module_id) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int mm_disable_module(module_manager_t *mm, const char *module_id) {
+    /* Check if already disabled */
+    if (mm_is_module_disabled(mm, module_id)) {
+        return 0;
+    }
+
+    /* Check capacity */
+    if (mm->disabled_count >= MAX_DISABLED_MODULES) {
+        printf("mm: disabled list full, cannot disable '%s'\n", module_id);
+        return -1;
+    }
+
+    /* Add to list */
+    strncpy(mm->disabled_modules[mm->disabled_count], module_id, MAX_MODULE_ID_LEN - 1);
+    mm->disabled_modules[mm->disabled_count][MAX_MODULE_ID_LEN - 1] = '\0';
+    mm->disabled_count++;
+
+    /* Persist to disk */
+    mm_save_disabled_list(mm);
+
+    printf("mm: disabled module '%s'\n", module_id);
+    return 0;
+}
+
+int mm_enable_module(module_manager_t *mm, const char *module_id) {
+    /* Find and remove from list */
+    for (int i = 0; i < mm->disabled_count; i++) {
+        if (strcmp(mm->disabled_modules[i], module_id) == 0) {
+            /* Shift remaining entries */
+            for (int j = i; j < mm->disabled_count - 1; j++) {
+                strcpy(mm->disabled_modules[j], mm->disabled_modules[j + 1]);
+            }
+            mm->disabled_count--;
+
+            /* Persist to disk */
+            mm_save_disabled_list(mm);
+
+            printf("mm: enabled module '%s'\n", module_id);
+            return 0;
+        }
+    }
+
+    /* Not found (already enabled) */
+    return 0;
+}
+
+int mm_get_disabled_count(module_manager_t *mm) {
+    return mm->disabled_count;
+}
+
+const char* mm_get_disabled_module(module_manager_t *mm, int index) {
+    if (index < 0 || index >= mm->disabled_count) {
+        return NULL;
+    }
+    return mm->disabled_modules[index];
 }

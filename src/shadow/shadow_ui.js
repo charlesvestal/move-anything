@@ -352,19 +352,37 @@ const MASTER_FX_SETTINGS_ITEMS_BASE = [
     { key: "master_volume", label: "Volume", type: "float", min: 0, max: 1, step: 0.05 },
     { key: "save", label: "[Save]", type: "action" },
     { key: "save_as", label: "[Save As]", type: "action" },
-    { key: "delete", label: "[Delete]", type: "action" }
+    { key: "delete", label: "[Delete]", type: "action" },
+    { key: "safe_mode", label: "[Safe Mode]", type: "action" },
+    { key: "clear_disabled", label: "[Clear Disabled]", type: "action" }
 ];
 
 /* Get dynamic settings items based on whether preset is loaded */
 function getMasterFxSettingsItems() {
-    if (currentMasterPresetName) {
-        /* Existing preset: show all items */
-        return MASTER_FX_SETTINGS_ITEMS_BASE;
+    let items = MASTER_FX_SETTINGS_ITEMS_BASE;
+
+    if (!currentMasterPresetName) {
+        /* New/unsaved: hide Save As and Delete */
+        items = items.filter(item =>
+            item.key !== "save_as" && item.key !== "delete"
+        );
     }
-    /* New/unsaved: hide Save As and Delete */
-    return MASTER_FX_SETTINGS_ITEMS_BASE.filter(item =>
-        item.key !== "save_as" && item.key !== "delete"
-    );
+
+    /* Hide Clear Disabled if no modules are disabled */
+    const disabledCount = host_get_disabled_modules().length;
+    if (disabledCount === 0) {
+        items = items.filter(item => item.key !== "clear_disabled");
+    } else {
+        /* Update label to show count */
+        items = items.map(item => {
+            if (item.key === "clear_disabled") {
+                return { ...item, label: `[Clear ${disabledCount} Disabled]` };
+            }
+            return item;
+        });
+    }
+
+    return items;
 }
 
 let selectedMasterFxSetting = 0;
@@ -2065,6 +2083,20 @@ function handleMasterFxSettingsAction(key) {
         /* Delete - confirm */
         masterConfirmingDelete = true;
         masterConfirmIndex = 0;
+        needsRedraw = true;
+    } else if (key === "safe_mode") {
+        /* Trigger safe mode for next boot */
+        host_trigger_safe_mode();
+        console.log("Safe mode enabled - next boot will use stock Move");
+        /* Could show a confirmation toast here */
+        needsRedraw = true;
+    } else if (key === "clear_disabled") {
+        /* Re-enable all disabled modules */
+        const disabled = host_get_disabled_modules();
+        for (const id of disabled) {
+            host_enable_module(id);
+        }
+        console.log(`Re-enabled ${disabled.length} modules`);
         needsRedraw = true;
     }
 }

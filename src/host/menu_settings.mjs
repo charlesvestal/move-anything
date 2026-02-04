@@ -2,7 +2,7 @@
  * Settings screen using shared menu components.
  */
 
-import { createValue, createEnum, createToggle, createBack, createSubmenu, createInfo } from '/data/UserData/move-anything/shared/menu_items.mjs';
+import { createValue, createEnum, createToggle, createBack, createSubmenu, createInfo, createAction } from '/data/UserData/move-anything/shared/menu_items.mjs';
 import { createMenuState, handleMenuInput } from '/data/UserData/move-anything/shared/menu_nav.mjs';
 import { createMenuStack } from '/data/UserData/move-anything/shared/menu_stack.mjs';
 import { drawStackMenu } from '/data/UserData/move-anything/shared/menu_render.mjs';
@@ -53,6 +53,52 @@ function getAboutItems() {
 
     items.push(createBack());
     return items;
+}
+
+/**
+ * Build Disabled Modules submenu items
+ */
+function getDisabledModulesItems() {
+    const items = [];
+
+    /* Get disabled modules */
+    const disabledIds = host_get_disabled_modules();
+
+    if (disabledIds && disabledIds.length > 0) {
+        for (const id of disabledIds) {
+            items.push(createAction(`Re-enable: ${id}`, () => {
+                host_enable_module(id);
+                host_rescan_modules();
+            }));
+        }
+    } else {
+        items.push(createInfo('No disabled', 'modules'));
+    }
+
+    /* Check if there was a recent crash */
+    const lastCrashed = host_get_last_crashed_module();
+    if (lastCrashed) {
+        items.push(createInfo('Last crash', lastCrashed));
+    }
+
+    items.push(createBack());
+    return items;
+}
+
+/**
+ * Build Safety submenu items
+ */
+function getSafetyItems() {
+    return [
+        createInfo('Safe Mode', 'next boot'),
+        createAction('Enable Safe Mode', () => {
+            host_trigger_safe_mode();
+            console.log('Safe mode enabled for next boot');
+            /* The safe mode file is now created; next boot will use stock Move */
+        }),
+        createSubmenu('Disabled Modules', getDisabledModulesItems),
+        createBack()
+    ];
 }
 
 /* Settings menu state */
@@ -135,6 +181,7 @@ function getSettingsItems() {
             step: 5,
             fineStep: 1
         }),
+        createSubmenu('Safety', getSafetyItems),
         createSubmenu('About', getAboutItems),
         createBack()
     ];
