@@ -192,9 +192,9 @@ fi
 $ssh_root "if [ -f /etc/ld.so.preload ] && grep -q 'move-anything-shim.so' /etc/ld.so.preload; then ts=\$(date +%Y%m%d-%H%M%S); cp /etc/ld.so.preload /etc/ld.so.preload.bak-move-anything-\$ts; grep -v 'move-anything-shim.so' /etc/ld.so.preload > /tmp/ld.so.preload.new || true; if [ -s /tmp/ld.so.preload.new ]; then cat /tmp/ld.so.preload.new > /etc/ld.so.preload; else rm -f /etc/ld.so.preload; fi; rm -f /tmp/ld.so.preload.new; fi"
 
 # Use root to stop running Move processes cleanly, then force if needed.
-$ssh_root "for name in MoveMessageDisplay MoveLauncher Move MoveOriginal move-anything shadow_ui; do pids=\$(pidof \$name 2>/dev/null || true); if [ -n \"\$pids\" ]; then kill \$pids || true; fi; done"
+$ssh_root "for name in MoveMessageDisplay MoveLauncher Move MoveOriginal move-anything shadow_ui uac2_daemon; do pids=\$(pidof \$name 2>/dev/null || true); if [ -n \"\$pids\" ]; then kill \$pids || true; fi; done"
 $ssh_root "sleep 0.5"
-$ssh_root "for name in MoveMessageDisplay MoveLauncher Move MoveOriginal move-anything shadow_ui; do pids=\$(pidof \$name 2>/dev/null || true); if [ -n \"\$pids\" ]; then kill -9 \$pids || true; fi; done"
+$ssh_root "for name in MoveMessageDisplay MoveLauncher Move MoveOriginal move-anything shadow_ui uac2_daemon; do pids=\$(pidof \$name 2>/dev/null || true); if [ -n \"\$pids\" ]; then kill -9 \$pids || true; fi; done"
 $ssh_root "sleep 0.2"
 # Free the SPI device if anything still holds it (prevents \"communication error\")
 $ssh_root "pids=\$(fuser /dev/ablspi0.0 2>/dev/null || true); if [ -n \"\$pids\" ]; then kill -9 \$pids || true; fi"
@@ -219,6 +219,20 @@ $ssh_root cp /data/UserData/move-anything/shim-entrypoint.sh /opt/move/Move
 $ssh_root md5sum /opt/move/Move
 $ssh_root md5sum /opt/move/MoveOriginal
 $ssh_root md5sum /usr/lib/move-anything-shim.so
+
+# Deploy USB audio daemon if present
+if $ssh_ableton "test -d /data/UserData/move-anything/usb_audio"; then
+    echo "USB audio daemon deployed to /data/UserData/move-anything/usb_audio/"
+    $ssh_root "chmod +x /data/UserData/move-anything/usb_audio/uac2_daemon 2>/dev/null || true"
+    $ssh_root "chmod +x /data/UserData/move-anything/usb_audio/setup_gadget.sh 2>/dev/null || true"
+    $ssh_root "chmod +x /data/UserData/move-anything/usb_audio/setup_gadget_test.sh 2>/dev/null || true"
+    $ssh_root "chmod +x /data/UserData/move-anything/usb_audio/uac2_test 2>/dev/null || true"
+    $ssh_root "chmod +x /data/UserData/move-anything/usb_audio/stop_daemon.sh 2>/dev/null || true"
+
+    # Run gadget setup now (as root) so USB audio is available immediately
+    echo "Setting up USB audio gadget..."
+    $ssh_root "/data/UserData/move-anything/usb_audio/setup_gadget.sh" 2>&1 || echo "USB audio gadget setup failed (non-fatal)"
+fi
 
 # Optional: Install modules from the Module Store (before restart so they're available immediately)
 echo
@@ -321,7 +335,7 @@ echo
 echo "Restarting Move binary with shim installed..."
 
 # Kill any running Move processes to ensure fresh load of updated modules
-$ssh_root "for name in MoveOriginal Move shadow_ui move-anything; do pids=\$(pidof \$name 2>/dev/null || true); if [ -n \"\$pids\" ]; then kill -9 \$pids 2>/dev/null || true; fi; done"
+$ssh_root "for name in MoveOriginal Move shadow_ui move-anything uac2_daemon; do pids=\$(pidof \$name 2>/dev/null || true); if [ -n \"\$pids\" ]; then kill -9 \$pids 2>/dev/null || true; fi; done"
 $ssh_ableton "sleep 1"
 
 $ssh_ableton "test -x /opt/move/Move" || fail "Missing /opt/move/Move"
