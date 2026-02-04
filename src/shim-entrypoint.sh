@@ -6,4 +6,4 @@ if [ -x "$AUDIO_STREAM" ]; then
     "$AUDIO_STREAM" -d >/tmp/audio_stream.log 2>&1 || true
 fi
 
-LD_PRELOAD=move-anything-shim.so /opt/move/MoveOriginal
+exec env LD_PRELOAD=move-anything-shim.so /opt/move/MoveOriginal
