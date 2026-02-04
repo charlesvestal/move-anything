@@ -12,6 +12,10 @@
 #define MAX_MODULE_ID_LEN 64
 #define MAX_MODULE_NAME_LEN 128
 #define MAX_PATH_LEN 512
+#define MAX_DISABLED_MODULES 32
+
+/* Path to disabled modules list */
+#define DISABLED_MODULES_FILE "/data/UserData/move-anything/disabled_modules.json"
 
 /* Module metadata parsed from module.json */
 typedef struct module_info {
@@ -60,6 +64,10 @@ typedef struct module_manager {
 
     /* Host-level volume (0-100, default 100) */
     int host_volume;
+
+    /* Disabled modules list */
+    char disabled_modules[MAX_DISABLED_MODULES][MAX_MODULE_ID_LEN];
+    int disabled_count;
 
 } module_manager_t;
 
@@ -126,5 +134,14 @@ int mm_module_wants_raw_ui(module_manager_t *mm);
 
 /* Cleanup */
 void mm_destroy(module_manager_t *mm);
+
+/* Disabled modules management */
+void mm_load_disabled_list(module_manager_t *mm);
+void mm_save_disabled_list(module_manager_t *mm);
+int mm_is_module_disabled(module_manager_t *mm, const char *module_id);
+int mm_disable_module(module_manager_t *mm, const char *module_id);
+int mm_enable_module(module_manager_t *mm, const char *module_id);
+int mm_get_disabled_count(module_manager_t *mm);
+const char* mm_get_disabled_module(module_manager_t *mm, int index);
 
 #endif /* MODULE_MANAGER_H */
