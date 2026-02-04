@@ -26,6 +26,7 @@
 #define SHM_SHADOW_UI       "/move-shadow-ui"       /* Shadow UI state */
 #define SHM_SHADOW_PARAM    "/move-shadow-param"    /* Shadow param requests */
 #define SHM_SHADOW_MIDI_OUT "/move-shadow-midi-out" /* MIDI output from shadow UI */
+#define SHM_SHADOW_MULTICHANNEL "/move-shadow-multichannel" /* Per-slot audio ring buffer */
 
 /* ============================================================================
  * Buffer Sizes
@@ -37,6 +38,10 @@
 #define SHADOW_UI_BUFFER_SIZE     512
 #define SHADOW_PARAM_BUFFER_SIZE  65664  /* Large buffer for complex ui_hierarchy */
 #define SHADOW_MIDI_OUT_BUFFER_SIZE 512  /* MIDI out buffer from shadow UI (128 packets) */
+
+/* Multichannel USB audio ring buffer sizing */
+#define MULTICHANNEL_NUM_CHANNELS  10   /* 4 slots × 2ch + master mix 2ch */
+#define MULTICHANNEL_RING_BLOCKS   16   /* ~46ms buffer at 128 frames/block */
 
 /* ============================================================================
  * Slot Configuration
@@ -128,6 +133,36 @@ typedef struct shadow_midi_out_t {
     volatile uint8_t reserved[2];
     uint8_t buffer[SHADOW_MIDI_OUT_BUFFER_SIZE];  /* USB-MIDI packets (4 bytes each) */
 } shadow_midi_out_t;
+
+/*
+ * Multichannel audio ring buffer for USB audio streaming.
+ * Shim writes per-slot (pre-volume) audio + master mix into ring buffer.
+ * UAC2 daemon reads and streams to host as 10-channel USB audio.
+ *
+ * Channel interleaving per frame:
+ *   [S1L, S1R, S2L, S2R, S3L, S3R, S4L, S4R, MasterL, MasterR]
+ *
+ * Ring buffer: MULTICHANNEL_RING_BLOCKS blocks, each 128 frames × 10 channels.
+ * Total data size: 16 × 128 × 10 × 2 = 40960 bytes.
+ */
+typedef struct multichannel_shm_t {
+    volatile uint32_t write_seq;        /* Incremented by shim after each block write */
+    volatile uint32_t read_seq;         /* Updated by daemon after each block read */
+    uint32_t sample_rate;               /* 44100 */
+    uint32_t channels;                  /* 10 */
+    uint32_t frames_per_block;          /* 128 */
+    uint32_t ring_blocks;               /* 16 */
+    uint8_t reserved[32];
+    int16_t ring[];                     /* Flexible array: ring_blocks × frames_per_block × channels */
+} multichannel_shm_t;
+
+/* Total shared memory size for multichannel buffer */
+/* 128 must match FRAMES_PER_BLOCK in move_anything_shim.c */
+#define MULTICHANNEL_FRAMES_PER_BLOCK 128
+#define MULTICHANNEL_RING_DATA_SIZE \
+    (MULTICHANNEL_RING_BLOCKS * MULTICHANNEL_FRAMES_PER_BLOCK * MULTICHANNEL_NUM_CHANNELS * sizeof(int16_t))
+#define MULTICHANNEL_SHM_SIZE \
+    (sizeof(multichannel_shm_t) + MULTICHANNEL_RING_DATA_SIZE)
 
 /* Compile-time size checks */
 typedef char shadow_control_size_check[(sizeof(shadow_control_t) == CONTROL_BUFFER_SIZE) ? 1 : -1];

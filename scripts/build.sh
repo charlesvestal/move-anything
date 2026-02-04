@@ -134,6 +134,29 @@ mkdir -p ./build/modules/midi_fx/arp/
     -o build/modules/midi_fx/arp/dsp.so \
     -Isrc
 
+echo "Building USB Audio daemon..."
+
+# Build UAC2 FunctionFS daemon
+mkdir -p ./build/usb_audio/
+"${CROSS_PREFIX}gcc" -g -O2 \
+    src/usb_audio/uac2_daemon.c \
+    -o build/usb_audio/uac2_daemon \
+    -Isrc \
+    -lrt -lm -lpthread
+
+# Build UAC2 test program (for Phase 0 validation)
+"${CROSS_PREFIX}gcc" -g -O2 \
+    src/usb_audio/uac2_test.c \
+    -o build/usb_audio/uac2_test \
+    -Isrc \
+    -lrt -lm
+
+# Copy scripts
+cp src/usb_audio/setup_gadget.sh build/usb_audio/
+cp src/usb_audio/setup_gadget_test.sh build/usb_audio/
+cp src/usb_audio/stop_daemon.sh build/usb_audio/
+chmod +x build/usb_audio/setup_gadget.sh build/usb_audio/setup_gadget_test.sh build/usb_audio/stop_daemon.sh
+
 echo "Building Sound Generator plugins..."
 
 # Build Line In sound generator

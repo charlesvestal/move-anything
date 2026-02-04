@@ -758,6 +758,11 @@ static int shadow_startup_modwheel_countdown = 0;
 static int16_t shadow_deferred_dsp_buffer[FRAMES_PER_BLOCK * 2];
 static int shadow_deferred_dsp_valid = 0;
 
+/* Multichannel audio ring buffer for USB audio streaming (used by render function below,
+ * initialized in init_shadow_shm() further down) */
+static int shm_multichannel_fd = -1;
+static multichannel_shm_t *shadow_multichannel_shm = NULL;
+
 /* ==========================================================================
  * Shadow Capture Rules - Allow slots to capture specific MIDI controls
  * ========================================================================== */
@@ -4157,6 +4162,17 @@ static void shadow_inprocess_render_to_buffer(void) {
     /* Clear the deferred buffer */
     memset(shadow_deferred_dsp_buffer, 0, sizeof(shadow_deferred_dsp_buffer));
 
+    /* Determine ring buffer write position (if multichannel shm is available) */
+    int16_t *mc_block = NULL;
+    if (shadow_multichannel_shm) {
+        uint32_t wr = shadow_multichannel_shm->write_seq;
+        uint32_t ring_idx = wr % MULTICHANNEL_RING_BLOCKS;
+        mc_block = shadow_multichannel_shm->ring +
+                   (ring_idx * FRAMES_PER_BLOCK * MULTICHANNEL_NUM_CHANNELS);
+        /* Pre-zero the entire block (all 10 channels) */
+        memset(mc_block, 0, FRAMES_PER_BLOCK * MULTICHANNEL_NUM_CHANNELS * sizeof(int16_t));
+    }
+
     /* Render each slot's DSP */
     if (shadow_plugin_v2 && shadow_plugin_v2->render_block) {
         for (int s = 0; s < SHADOW_CHAIN_INSTANCES; s++) {
@@ -4166,6 +4182,16 @@ static void shadow_inprocess_render_to_buffer(void) {
             shadow_plugin_v2->render_block(shadow_chain_slots[s].instance,
                                            render_buffer,
                                            MOVE_FRAMES_PER_BLOCK);
+
+            /* Copy pre-volume audio to multichannel ring buffer */
+            if (mc_block) {
+                int ch_offset = s * 2; /* Slot s occupies channels ch_offset, ch_offset+1 */
+                for (int f = 0; f < FRAMES_PER_BLOCK; f++) {
+                    mc_block[f * MULTICHANNEL_NUM_CHANNELS + ch_offset]     = render_buffer[f * 2];
+                    mc_block[f * MULTICHANNEL_NUM_CHANNELS + ch_offset + 1] = render_buffer[f * 2 + 1];
+                }
+            }
+
             float vol = shadow_chain_slots[s].volume;
             for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++) {
                 int32_t mixed = shadow_deferred_dsp_buffer[i] + (int32_t)(render_buffer[i] * vol);
@@ -4175,6 +4201,17 @@ static void shadow_inprocess_render_to_buffer(void) {
                 shadow_deferred_dsp_buffer[i] = (int16_t)mixed;
             }
         }
+    }
+
+    /* Copy master mix (post-volume, pre-master-FX) to multichannel channels 9-10 */
+    if (mc_block) {
+        for (int f = 0; f < FRAMES_PER_BLOCK; f++) {
+            mc_block[f * MULTICHANNEL_NUM_CHANNELS + 8] = shadow_deferred_dsp_buffer[f * 2];
+            mc_block[f * MULTICHANNEL_NUM_CHANNELS + 9] = shadow_deferred_dsp_buffer[f * 2 + 1];
+        }
+        /* Memory barrier + advance write sequence */
+        __sync_synchronize();
+        shadow_multichannel_shm->write_seq++;
     }
 
     /* Note: Master FX is applied in mix_from_buffer() AFTER mixing with Move's audio */
@@ -4447,10 +4484,32 @@ static void init_shadow_shm(void)
         printf("Shadow: Failed to create midi_out shm\n");
     }
 
+    /* Create/open multichannel audio ring buffer (for USB audio streaming) */
+    shm_multichannel_fd = shm_open(SHM_SHADOW_MULTICHANNEL, O_CREAT | O_RDWR, 0666);
+    if (shm_multichannel_fd >= 0) {
+        ftruncate(shm_multichannel_fd, MULTICHANNEL_SHM_SIZE);
+        shadow_multichannel_shm = (multichannel_shm_t *)mmap(NULL, MULTICHANNEL_SHM_SIZE,
+                                                              PROT_READ | PROT_WRITE,
+                                                              MAP_SHARED, shm_multichannel_fd, 0);
+        if (shadow_multichannel_shm == MAP_FAILED) {
+            shadow_multichannel_shm = NULL;
+            printf("Shadow: Failed to mmap multichannel shm\n");
+        } else {
+            memset(shadow_multichannel_shm, 0, MULTICHANNEL_SHM_SIZE);
+            shadow_multichannel_shm->sample_rate = 44100;
+            shadow_multichannel_shm->channels = MULTICHANNEL_NUM_CHANNELS;
+            shadow_multichannel_shm->frames_per_block = FRAMES_PER_BLOCK;
+            shadow_multichannel_shm->ring_blocks = MULTICHANNEL_RING_BLOCKS;
+        }
+    } else {
+        printf("Shadow: Failed to create multichannel shm\n");
+    }
+
     shadow_shm_initialized = 1;
-    printf("Shadow: Shared memory initialized (audio=%p, midi=%p, ui_midi=%p, display=%p, control=%p, ui=%p, param=%p, midi_out=%p)\n",
+    printf("Shadow: Shared memory initialized (audio=%p, midi=%p, ui_midi=%p, display=%p, control=%p, ui=%p, param=%p, midi_out=%p, multichannel=%p)\n",
            shadow_audio_shm, shadow_midi_shm, shadow_ui_midi_shm,
-           shadow_display_shm, shadow_control, shadow_ui_state, shadow_param, shadow_midi_out_shm);
+           shadow_display_shm, shadow_control, shadow_ui_state, shadow_param, shadow_midi_out_shm,
+           shadow_multichannel_shm);
 }
 
 #if SHADOW_DEBUG
