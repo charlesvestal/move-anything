@@ -1,12 +1,12 @@
 #!/bin/bash
-# stop_daemon.sh - Stop the UAC2 daemon gracefully
+# stop_daemon.sh - Stop the audio stream daemon gracefully
 
-PID_FILE="/var/run/uac2_daemon.pid"
+PID_FILE="/var/run/audio_stream_daemon.pid"
 
 if [ -f "$PID_FILE" ]; then
     pid=$(cat "$PID_FILE" 2>/dev/null)
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-        echo "Stopping UAC2 daemon (pid $pid)..."
+        echo "Stopping audio stream daemon (pid $pid)..."
         kill "$pid"
         sleep 1
         if kill -0 "$pid" 2>/dev/null; then
@@ -20,9 +20,9 @@ if [ -f "$PID_FILE" ]; then
     fi
 else
     # Try to find by name
-    pid=$(pidof uac2_daemon 2>/dev/null || true)
+    pid=$(pidof audio_stream_daemon 2>/dev/null || true)
     if [ -n "$pid" ]; then
-        echo "Stopping UAC2 daemon (pid $pid)..."
+        echo "Stopping audio stream daemon (pid $pid)..."
         kill "$pid"
         sleep 1
         if kill -0 "$pid" 2>/dev/null; then
@@ -30,6 +30,6 @@ else
         fi
         echo "Stopped"
     else
-        echo "UAC2 daemon not running"
+        echo "Audio stream daemon not running"
     fi
 fi

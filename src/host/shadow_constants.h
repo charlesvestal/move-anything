@@ -40,7 +40,7 @@
 #define SHADOW_MIDI_OUT_BUFFER_SIZE 512  /* MIDI out buffer from shadow UI (128 packets) */
 
 /* Multichannel USB audio ring buffer sizing */
-#define MULTICHANNEL_NUM_CHANNELS  10   /* 4 slots × 2ch + master mix 2ch */
+#define MULTICHANNEL_NUM_CHANNELS  14   /* 4 slots × 2ch + ME mix 2ch + Move native 2ch + combined 2ch */
 #define MULTICHANNEL_RING_BLOCKS   16   /* ~46ms buffer at 128 frames/block */
 
 /* ============================================================================
@@ -135,21 +135,29 @@ typedef struct shadow_midi_out_t {
 } shadow_midi_out_t;
 
 /*
- * Multichannel audio ring buffer for USB audio streaming.
- * Shim writes per-slot (pre-volume) audio + master mix into ring buffer.
- * UAC2 daemon reads and streams to host as 10-channel USB audio.
+ * Multichannel audio ring buffer for audio streaming.
+ * Shim writes per-slot, mix, and Move native audio into ring buffer.
+ * Stream daemon reads and sends to host as 14-channel UDP audio.
  *
  * Channel interleaving per frame:
- *   [S1L, S1R, S2L, S2R, S3L, S3R, S4L, S4R, MasterL, MasterR]
+ *   [S1L, S1R, S2L, S2R, S3L, S3R, S4L, S4R,
+ *    MixL, MixR, MoveL, MoveR, CombL, CombR]
  *
- * Ring buffer: MULTICHANNEL_RING_BLOCKS blocks, each 128 frames × 10 channels.
- * Total data size: 16 × 128 × 10 × 2 = 40960 bytes.
+ *   Channels  1-2:  Slot 1 L/R (pre-volume)
+ *   Channels  3-4:  Slot 2 L/R (pre-volume)
+ *   Channels  5-6:  Slot 3 L/R (pre-volume)
+ *   Channels  7-8:  Slot 4 L/R (pre-volume)
+ *   Channels  9-10: ME stereo mix (post-volume, pre-master-FX)
+ *   Channels 11-12: Native Move mix (without Move Everything)
+ *   Channels 13-14: Combined mix (Move + ME, post-master-FX, pre-master-volume)
+ *
+ * Ring buffer: MULTICHANNEL_RING_BLOCKS blocks, each 128 frames × 14 channels.
  */
 typedef struct multichannel_shm_t {
     volatile uint32_t write_seq;        /* Incremented by shim after each block write */
     volatile uint32_t read_seq;         /* Updated by daemon after each block read */
     uint32_t sample_rate;               /* 44100 */
-    uint32_t channels;                  /* 10 */
+    uint32_t channels;                  /* 14 */
     uint32_t frames_per_block;          /* 128 */
     uint32_t ring_blocks;               /* 16 */
     uint8_t reserved[32];

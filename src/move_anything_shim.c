@@ -758,10 +758,16 @@ static int shadow_startup_modwheel_countdown = 0;
 static int16_t shadow_deferred_dsp_buffer[FRAMES_PER_BLOCK * 2];
 static int shadow_deferred_dsp_valid = 0;
 
-/* Multichannel audio ring buffer for USB audio streaming (used by render function below,
+/* Multichannel audio ring buffer for audio streaming (used by render function below,
  * initialized in init_shadow_shm() further down) */
 static int shm_multichannel_fd = -1;
 static multichannel_shm_t *shadow_multichannel_shm = NULL;
+
+/* Buffers to capture Move native and combined audio from mix_from_buffer()
+ * for writing to multichannel ring buffer in render_to_buffer() */
+static int16_t shadow_mc_move_native[FRAMES_PER_BLOCK * 2];
+static int16_t shadow_mc_combined[FRAMES_PER_BLOCK * 2];
+static int shadow_mc_extra_valid = 0;
 
 /* ==========================================================================
  * Shadow Capture Rules - Allow slots to capture specific MIDI controls
@@ -4169,7 +4175,7 @@ static void shadow_inprocess_render_to_buffer(void) {
         uint32_t ring_idx = wr % MULTICHANNEL_RING_BLOCKS;
         mc_block = shadow_multichannel_shm->ring +
                    (ring_idx * FRAMES_PER_BLOCK * MULTICHANNEL_NUM_CHANNELS);
-        /* Pre-zero the entire block (all 10 channels) */
+        /* Pre-zero the entire block (all 14 channels) */
         memset(mc_block, 0, FRAMES_PER_BLOCK * MULTICHANNEL_NUM_CHANNELS * sizeof(int16_t));
     }
 
@@ -4203,12 +4209,26 @@ static void shadow_inprocess_render_to_buffer(void) {
         }
     }
 
-    /* Copy master mix (post-volume, pre-master-FX) to multichannel channels 9-10 */
+    /* Copy ME stereo mix (post-volume, pre-master-FX) to channels 9-10 */
     if (mc_block) {
         for (int f = 0; f < FRAMES_PER_BLOCK; f++) {
             mc_block[f * MULTICHANNEL_NUM_CHANNELS + 8] = shadow_deferred_dsp_buffer[f * 2];
             mc_block[f * MULTICHANNEL_NUM_CHANNELS + 9] = shadow_deferred_dsp_buffer[f * 2 + 1];
         }
+
+        /* Copy Move native and combined audio captured in mix_from_buffer().
+         * These are from the previous frame (~3ms behind slot audio). */
+        if (shadow_mc_extra_valid) {
+            for (int f = 0; f < FRAMES_PER_BLOCK; f++) {
+                /* Channels 11-12: Move native (without ME) */
+                mc_block[f * MULTICHANNEL_NUM_CHANNELS + 10] = shadow_mc_move_native[f * 2];
+                mc_block[f * MULTICHANNEL_NUM_CHANNELS + 11] = shadow_mc_move_native[f * 2 + 1];
+                /* Channels 13-14: Combined (Move + ME, post-master-FX) */
+                mc_block[f * MULTICHANNEL_NUM_CHANNELS + 12] = shadow_mc_combined[f * 2];
+                mc_block[f * MULTICHANNEL_NUM_CHANNELS + 13] = shadow_mc_combined[f * 2 + 1];
+            }
+        }
+
         /* Memory barrier + advance write sequence */
         __sync_synchronize();
         shadow_multichannel_shm->write_seq++;
@@ -4228,6 +4248,11 @@ static void shadow_inprocess_mix_from_buffer(void) {
 
     int16_t *mailbox_audio = (int16_t *)(global_mmap_addr + AUDIO_OUT_OFFSET);
 
+    /* Capture Move's native audio BEFORE mixing shadow audio (for multichannel stream) */
+    if (shadow_multichannel_shm) {
+        memcpy(shadow_mc_move_native, mailbox_audio, FRAMES_PER_BLOCK * 2 * sizeof(int16_t));
+    }
+
     /* Mix deferred buffer into mailbox audio */
     for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++) {
         int32_t mixed = mailbox_audio[i] + shadow_deferred_dsp_buffer[i];
@@ -4242,6 +4267,12 @@ static void shadow_inprocess_mix_from_buffer(void) {
         if (s->instance && s->api && s->api->process_block) {
             s->api->process_block(s->instance, mailbox_audio, FRAMES_PER_BLOCK);
         }
+    }
+
+    /* Capture combined audio AFTER master FX, BEFORE master volume (for multichannel stream) */
+    if (shadow_multichannel_shm) {
+        memcpy(shadow_mc_combined, mailbox_audio, FRAMES_PER_BLOCK * 2 * sizeof(int16_t));
+        shadow_mc_extra_valid = 1;
     }
 
     /* Capture audio for sampler BEFORE master volume scaling (Resample source only) */
