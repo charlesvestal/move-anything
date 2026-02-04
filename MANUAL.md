@@ -198,6 +198,100 @@ Access via **Shift+Vol + Knob 8**. Includes the full Module Store for downloadin
 
 ---
 
+## Multichannel Audio Streaming
+
+Move Everything can stream 14 channels of audio to your Mac over the existing USB connection. This gives you individual stereo tracks for each slot, the Move Everything mix, native Move audio, and the combined output — all available as inputs in Ableton Live or any DAW.
+
+### Channel Layout
+
+| Channels | Content |
+|----------|---------|
+| 1-2 | Slot 1 L/R (pre-volume) |
+| 3-4 | Slot 2 L/R (pre-volume) |
+| 5-6 | Slot 3 L/R (pre-volume) |
+| 7-8 | Slot 4 L/R (pre-volume) |
+| 9-10 | ME Stereo Mix (post-volume, pre-Master FX) |
+| 11-12 | Move Native (Move's own audio, without Move Everything) |
+| 13-14 | Combined (Move + ME, post-Master FX) |
+
+### One-Time Mac Setup
+
+1. Install BlackHole (virtual audio device):
+   ```
+   brew install blackhole-16ch
+   ```
+
+2. Build the receiver:
+   ```
+   cc -O2 -o move_audio_recv tools/move_audio_recv.c \
+      -framework CoreAudio -framework AudioToolbox -framework CoreFoundation
+   ```
+
+### Streaming to Ableton Live
+
+**Important:** Start Ableton Live before running the receiver. The receiver detects the audio device's sample rate at startup and resamples automatically if needed (e.g., Live running at 48kHz). Starting in the wrong order may cause audio artifacts.
+
+1. Open Ableton Live and set audio input to **BlackHole 16ch**
+
+2. Start the receiver on your Mac:
+   ```
+   ./move_audio_recv
+   ```
+
+3. Create stereo tracks for the channels you want to record:
+   - Track 1: Input **1/2** (Slot 1)
+   - Track 2: Input **3/4** (Slot 2)
+   - Track 3: Input **5/6** (Slot 3)
+   - Track 4: Input **7/8** (Slot 4)
+   - Track 5: Input **9/10** (ME Mix)
+   - Track 6: Input **11/12** (Move Native)
+   - Track 7: Input **13/14** (Combined)
+
+4. Arm the tracks and play
+
+The receiver shows connection status, packet rate, and buffer health. Press Ctrl+C to stop.
+
+### Recording to WAV Files
+
+You can record directly to WAV files without BlackHole:
+
+```
+# Record all 14 channels to a single WAV
+./move_audio_recv --wav session.wav
+
+# Record separate stereo WAVs per channel pair
+./move_audio_recv --wav session.wav --split
+
+# Record for a specific duration
+./move_audio_recv --wav session.wav --duration 30
+```
+
+With `--split`, you get individual files: `session_slot1.wav`, `session_slot2.wav`, `session_slot3.wav`, `session_slot4.wav`, `session_me_mix.wav`, `session_move_native.wav`, `session_combined.wav`.
+
+### Receiver Options
+
+| Option | Description |
+|--------|-------------|
+| `--list-devices` | Show available audio output devices and sample rates |
+| `--device <name>` | Output to a specific device (default: BlackHole 16ch) |
+| `--wav <file>` | Record to WAV file instead of audio output |
+| `--split` | With `--wav`, create separate stereo WAV per channel pair |
+| `--duration <sec>` | Stop recording after specified seconds |
+
+### Sample Rate
+
+Move streams audio at 44100 Hz. If your DAW runs at a different sample rate (e.g., 48000 Hz), the receiver automatically resamples to match the output device. To ensure correct detection, always start the receiver **after** your DAW is running and has claimed the audio device.
+
+### Notes
+
+- Always start your DAW before the receiver so the correct sample rate is detected
+- The stream daemon starts automatically when Move boots — no setup needed on the Move side
+- Audio is streamed over the USB NCM network link (the same connection used for SSH)
+- If you hear the audio through your speakers without Ableton, check Audio MIDI Setup for a Multi-Output Device that includes BlackHole
+- The stream adds ~1-2ms of latency beyond what's inherent in the audio block size
+
+---
+
 ## Tips
 
 - Slot settings persist between sessions

@@ -375,8 +375,14 @@ static bool resampler_feed(const int16_t *block)
 static void resampler_compact(void)
 {
     uint32_t consumed = (uint32_t)g_resampler.phase;
-    if (consumed == 0 || consumed >= g_resampler.buf_frames)
+    if (consumed == 0)
         return;
+    if (consumed >= g_resampler.buf_frames) {
+        /* All data consumed - reset buffer */
+        g_resampler.buf_frames = 0;
+        g_resampler.phase = 0.0;
+        return;
+    }
     uint32_t remaining = g_resampler.buf_frames - consumed;
     memmove(g_resampler.buf,
             &g_resampler.buf[consumed * NUM_CHANNELS],
@@ -395,6 +401,42 @@ static AudioDeviceIOProcID g_io_proc_id = NULL;
 /* Target ring buffer fill level in blocks - low for minimal latency,
  * high enough to absorb jitter */
 #define TARGET_RING_FILL  4
+
+/* ============================================================================
+ * Sample Rate Change Listener
+ * ============================================================================ */
+
+static OSStatus sample_rate_changed(AudioObjectID device,
+                                     UInt32 numAddresses,
+                                     const AudioObjectPropertyAddress *addresses,
+                                     void *clientData)
+{
+    (void)device; (void)numAddresses; (void)addresses; (void)clientData;
+
+    AudioObjectPropertyAddress srProp = {
+        kAudioDevicePropertyNominalSampleRate,
+        kAudioDevicePropertyScopeOutput,
+        kAudioObjectPropertyElementMain
+    };
+    Float64 new_sr = 0;
+    UInt32 srSize = sizeof(new_sr);
+    OSStatus err = AudioObjectGetPropertyData(g_device, &srProp, 0, NULL, &srSize, &new_sr);
+    if (err != noErr)
+        return noErr;
+
+    double old_ratio = g_resampler.ratio;
+    resampler_init(SAMPLE_RATE, new_sr);
+
+    if (g_resampler.active) {
+        fprintf(stderr, "\nDevice sample rate changed to %.0f Hz (resampling from %d Hz)\n",
+                new_sr, SAMPLE_RATE);
+    } else {
+        fprintf(stderr, "\nDevice sample rate changed to %.0f Hz (no resampling needed)\n", new_sr);
+    }
+
+    (void)old_ratio;
+    return noErr;
+}
 
 static OSStatus audio_io_proc(AudioDeviceID device,
                               const AudioTimeStamp *now,
@@ -486,11 +528,16 @@ static OSStatus audio_io_proc(AudioDeviceID device,
         }
     }
 
-    /* Drop excess blocks to keep latency low */
-    uint32_t buffered = ring_available();
-    while (buffered > TARGET_RING_FILL) {
-        ring_read();
-        buffered--;
+    /* Drop excess blocks to keep latency low.
+     * Skip when resampling - the resampler's internal buffer naturally
+     * manages consumption rate. Dropping ring blocks while the resampler
+     * has buffered partial data creates audio discontinuities. */
+    if (!g_resampler.active) {
+        uint32_t buffered = ring_available();
+        while (buffered > TARGET_RING_FILL) {
+            ring_read();
+            buffered--;
+        }
     }
 
     return noErr;
@@ -511,11 +558,8 @@ static bool start_coreaudio(const char *device_name)
         kAudioObjectPropertyElementMain
     };
 
-    /* Try to set 44100 - avoids resampling if device allows it */
-    Float64 sr = SAMPLE_RATE;
-    AudioObjectSetPropertyData(g_device, &srProp, 0, NULL, sizeof(sr), &sr);
-
-    /* Read back actual sample rate (another app may own it) */
+    /* Read device sample rate - don't try to change it, as another app
+     * (e.g. Ableton Live) may own the clock. We resample if needed. */
     Float64 actual_sr = 0;
     UInt32 srSize = sizeof(actual_sr);
     OSStatus err = AudioObjectGetPropertyData(g_device, &srProp, 0, NULL, &srSize, &actual_sr);
@@ -532,6 +576,14 @@ static bool start_coreaudio(const char *device_name)
     } else {
         fprintf(stderr, "Device sample rate: %.0f Hz (no resampling needed)\n", actual_sr);
     }
+
+    /* Listen for sample rate changes (e.g. when Ableton Live takes over the clock) */
+    AudioObjectPropertyAddress srListenProp = {
+        kAudioDevicePropertyNominalSampleRate,
+        kAudioDevicePropertyScopeOutput,
+        kAudioObjectPropertyElementMain
+    };
+    AudioObjectAddPropertyListener(g_device, &srListenProp, sample_rate_changed, NULL);
 
     /* Set buffer size */
     UInt32 bufferFrames = FRAMES_PER_BLOCK;
