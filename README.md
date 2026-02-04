@@ -49,6 +49,29 @@ curl -L https://raw.githubusercontent.com/charlesvestal/move-anything/main/scrip
 
 Usage details, shortcuts, and workflows are documented in [MANUAL.md](MANUAL.md) (primarily standalone-focused).
 
+## Multichannel Audio Streaming
+
+Stream Move Everything's audio to your Mac over USB for multi-track recording in Ableton Live (or any DAW). Each slot gets its own stereo pair — 14 channels total via BlackHole.
+
+```
+Slot 1 ──► Ch 1-2
+Slot 2 ──► Ch 3-4
+Slot 3 ──► Ch 5-6
+Slot 4 ──► Ch 7-8
+ME Mix ──► Ch 9-10
+Move   ──► Ch 11-12
+All    ──► Ch 13-14
+```
+
+**Setup:**
+```bash
+brew install blackhole-16ch
+cc -O2 -o move_audio_recv tools/move_audio_recv.c \
+   -framework CoreAudio -framework AudioToolbox -framework CoreFoundation
+```
+
+Start your DAW first (so it claims the audio device at its sample rate), then run `./move_audio_recv`. The receiver resamples automatically if needed (e.g., 44100 to 48000 Hz). The stream daemon runs automatically on Move after install. See [MANUAL.md](MANUAL.md#multichannel-audio-streaming) for full details.
+
 ## Documentation
 
 - [MANUAL.md](MANUAL.md) - User guide and shortcuts 

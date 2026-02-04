@@ -69,6 +69,9 @@ build/
   host/menu_ui.js            # Host menu
   shared/                    # Shared JS utilities
   patches/                   # Chain patches
+  usb_audio/
+    audio_stream_daemon      # UDP audio streaming daemon
+    stop_daemon.sh           # Stop script
   modules/
     chain/                   # Signal Chain module
       audio_fx/              # Audio FX plugins (Freeverb)
@@ -76,6 +79,9 @@ build/
       midi_fx/               # MIDI FX (Chord, Arp)
     controller/              # MIDI controller
     store/                   # Module Store
+
+tools/
+  move_audio_recv.c          # Mac-side receiver (build natively, not cross-compiled)
 
 move-anything.tar.gz         # Deployable package
 ```
@@ -366,6 +372,28 @@ The release workflow should preserve `install_path` when updating release.json:
     EOFJ
     fi
 ```
+
+## Multichannel Audio Receiver (Mac)
+
+The audio receiver is a native Mac tool — it's not cross-compiled. Build it directly on your Mac:
+
+```bash
+cc -O2 -o move_audio_recv tools/move_audio_recv.c \
+   -framework CoreAudio -framework AudioToolbox -framework CoreFoundation
+```
+
+No Xcode project is needed, just the command-line tools (`xcode-select --install`).
+
+The receiver takes UDP audio from the stream daemon on Move and outputs it to a CoreAudio device (BlackHole-16ch by default) or records to WAV files. It automatically resamples if the output device runs at a different sample rate than 44100 Hz (e.g., 48000 Hz when Ableton Live is set to 48kHz). Start your DAW before the receiver so the correct sample rate is detected at startup.
+
+### Move-side Daemon
+
+The `audio_stream_daemon` is cross-compiled for ARM as part of the normal `./scripts/build.sh`. It reads from the multichannel shared memory ring buffer and broadcasts UDP packets over the NCM link. It starts automatically via `shim-entrypoint.sh` — no manual setup needed on the Move.
+
+### Dependencies
+
+- **Mac receiver**: macOS frameworks only (CoreAudio, AudioToolbox, CoreFoundation). Optional: `brew install blackhole-16ch` for routing audio to a DAW.
+- **Move daemon**: No additional dependencies beyond the standard build toolchain (`-lrt -lpthread`).
 
 ## Architecture
 
