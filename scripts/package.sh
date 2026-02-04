@@ -19,6 +19,11 @@ if [ -d "./bin" ]; then
     ITEMS="$ITEMS ./bin"
 fi
 
+# Add usb_audio directory if it exists (UAC2 multichannel audio daemon)
+if [ -d "./usb_audio" ]; then
+    ITEMS="$ITEMS ./usb_audio"
+fi
+
 tar -czvf ../move-anything.tar.gz \
     --transform 's,^\.,move-anything,' \
     $ITEMS
