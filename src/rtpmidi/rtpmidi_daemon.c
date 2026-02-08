@@ -80,24 +80,27 @@ static int shm_init(void) {
 }
 
 /*
- * Write a 3-byte MIDI message into the shared memory ring buffer
+ * Write a 3-byte MIDI message into the shared memory buffer
  * as a USB-MIDI packet (4 bytes, cable 2).
+ * Does NOT toggle the ready flag - call shm_flush() after writing
+ * all messages for a given RTP packet to signal the shim once.
  */
 static void shm_write_midi(uint8_t status, uint8_t d1, uint8_t d2) {
     if (!rtp_shm) return;
 
     uint16_t idx = rtp_shm->write_idx;
-    uint8_t *slot = &rtp_shm->buffer[idx];
+    if (idx + 4 > SHADOW_RTP_MIDI_BUFFER_SIZE) return;  /* Buffer full, drop */
 
-    format_usb_midi_packet(slot, status, d1, d2);
+    format_usb_midi_packet(&rtp_shm->buffer[idx], status, d1, d2);
+    rtp_shm->write_idx = idx + 4;
+}
 
-    /* Advance write index, wrapping within buffer (4 bytes per packet) */
-    idx += 4;
-    if (idx >= SHADOW_RTP_MIDI_BUFFER_SIZE)
-        idx = 0;
-
-    rtp_shm->write_idx = idx;
-    rtp_shm->ready ^= 1;  /* Toggle to signal new data */
+/* Signal the shim that new MIDI data is available.
+ * Call once after writing all messages from an RTP packet. */
+static void shm_flush(void) {
+    if (!rtp_shm) return;
+    if (rtp_shm->write_idx == 0) return;  /* Nothing written */
+    rtp_shm->ready++;  /* Increment (not toggle) so every flush is visible */
 }
 
 /* ============================================================================
@@ -259,9 +262,17 @@ static void handle_control_packet(int sock_fd, const uint8_t *buf, int len,
 
 static void handle_data_packet(int sock_fd, const uint8_t *buf, int len,
                                struct sockaddr_in *src, socklen_t src_len) {
-    (void)sock_fd;
-    (void)src;
-    (void)src_len;
+    if (len < 4) return;
+
+    /* AppleMIDI command packets can arrive on the data port too.
+     * macOS sends a second invitation on the data port after the control
+     * port handshake; we must accept it for the session to be established. */
+    uint16_t sig;
+    memcpy(&sig, buf, 2);
+    if (ntohs(sig) == APPLEMIDI_SIGNATURE) {
+        handle_control_packet(sock_fd, buf, len, src, src_len);
+        return;
+    }
 
     if (len < 13) return;
 
@@ -382,6 +393,9 @@ static void handle_data_packet(int sock_fd, const uint8_t *buf, int len,
     }
 
     (void)j_flag;  /* Journal parsing intentionally not implemented */
+
+    /* Signal the shim once after all messages in this packet are written */
+    shm_flush();
 }
 
 /* ============================================================================
