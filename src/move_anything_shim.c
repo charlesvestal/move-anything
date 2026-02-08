@@ -6100,13 +6100,13 @@ static void shadow_inject_rtp_midi(void) {
     last_shadow_rtp_midi_ready = shadow_rtp_midi_shm->ready;
 
     uint8_t *midi_in = shadow_mailbox + MIDI_IN_OFFSET;
+    int hw_offset = 0;
 
     for (int i = 0; i < shadow_rtp_midi_shm->write_idx && i < SHADOW_RTP_MIDI_BUFFER_SIZE; i += 4) {
         uint8_t cin = shadow_rtp_midi_shm->buffer[i] & 0x0F;
         if (cin < 0x08 || cin > 0x0E) continue;  /* Skip invalid CIN */
 
-        /* Find an empty slot in MIDI_IN */
-        int hw_offset = 0;
+        /* Find an empty slot in MIDI_IN (continue from last position) */
         while (hw_offset < MIDI_BUFFER_SIZE) {
             if (midi_in[hw_offset] == 0 && midi_in[hw_offset+1] == 0 &&
                 midi_in[hw_offset+2] == 0 && midi_in[hw_offset+3] == 0) {
@@ -6117,6 +6117,7 @@ static void shadow_inject_rtp_midi(void) {
         if (hw_offset >= MIDI_BUFFER_SIZE) break;  /* Buffer full */
 
         memcpy(&midi_in[hw_offset], &shadow_rtp_midi_shm->buffer[i], 4);
+        hw_offset += 4;
     }
 
     /* Clear after processing */
