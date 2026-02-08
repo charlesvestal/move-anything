@@ -157,9 +157,9 @@ typedef struct shadow_screenreader_t {
  * Same pattern as shadow_midi_out_t but for input direction.
  */
 typedef struct shadow_rtp_midi_t {
-    volatile uint8_t write_idx;      /* Daemon increments after writing */
+    volatile uint16_t write_idx;     /* Daemon increments after writing (needs >255 for 256-byte buffer) */
     volatile uint8_t ready;          /* Toggle to signal new data */
-    volatile uint8_t reserved[2];
+    volatile uint8_t reserved;
     uint8_t buffer[SHADOW_RTP_MIDI_BUFFER_SIZE];  /* USB-MIDI packets (4 bytes each) */
 } shadow_rtp_midi_t;
 
