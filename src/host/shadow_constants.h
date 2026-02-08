@@ -27,6 +27,7 @@
 #define SHM_SHADOW_PARAM      "/move-shadow-param"        /* Shadow param requests */
 #define SHM_SHADOW_MIDI_OUT   "/move-shadow-midi-out"   /* MIDI output from shadow UI */
 #define SHM_SHADOW_SCREENREADER "/move-shadow-screenreader" /* Screen reader announcements */
+#define SHM_SHADOW_RTP_MIDI   "/move-shadow-rtp-midi"  /* RTP-MIDI input injection */
 
 /* ============================================================================
  * Buffer Sizes
@@ -39,6 +40,7 @@
 #define SHADOW_PARAM_BUFFER_SIZE  65664  /* Large buffer for complex ui_hierarchy */
 #define SHADOW_MIDI_OUT_BUFFER_SIZE 512  /* MIDI out buffer from shadow UI (128 packets) */
 #define SHADOW_SCREENREADER_BUFFER_SIZE 512  /* Screen reader message buffer */
+#define SHADOW_RTP_MIDI_BUFFER_SIZE 256  /* RTP-MIDI injection buffer (64 USB-MIDI packets) */
 
 /* ============================================================================
  * Slot Configuration
@@ -147,6 +149,19 @@ typedef struct shadow_screenreader_t {
     volatile uint32_t timestamp_ms;  /* Timestamp of message (for rate limiting) */
     char text[SHADOW_SCREENREADER_TEXT_LEN];
 } shadow_screenreader_t;
+
+/*
+ * RTP-MIDI injection structure.
+ * External rtpmidi-daemon writes USB-MIDI packets here.
+ * Shim reads and merges into MIDI_IN mailbox region.
+ * Same pattern as shadow_midi_out_t but for input direction.
+ */
+typedef struct shadow_rtp_midi_t {
+    volatile uint8_t write_idx;      /* Daemon increments after writing */
+    volatile uint8_t ready;          /* Toggle to signal new data */
+    volatile uint8_t reserved[2];
+    uint8_t buffer[SHADOW_RTP_MIDI_BUFFER_SIZE];  /* USB-MIDI packets (4 bytes each) */
+} shadow_rtp_midi_t;
 
 /* Compile-time size checks */
 typedef char shadow_control_size_check[(sizeof(shadow_control_t) == CONTROL_BUFFER_SIZE) ? 1 : -1];
