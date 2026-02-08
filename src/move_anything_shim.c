@@ -2444,6 +2444,41 @@ static int shim_run_command(const char *const argv[]) {
     return -1;
 }
 
+static pid_t rtpmidi_daemon_pid = -1;
+static int rtpmidi_enabled = 0;
+
+/* Start the RTP-MIDI daemon */
+static void rtpmidi_start(void) {
+    if (rtpmidi_daemon_pid > 0) return;  /* Already running */
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        printf("rtpmidi: fork failed: %s\n", strerror(errno));
+        return;
+    }
+    if (pid == 0) {
+        /* Child - exec the daemon */
+        execl("/data/UserData/move-anything/rtpmidi-daemon",
+              "rtpmidi-daemon", (char *)NULL);
+        _exit(127);
+    }
+    rtpmidi_daemon_pid = pid;
+    rtpmidi_enabled = 1;
+    printf("rtpmidi: daemon started (pid %d)\n", pid);
+}
+
+/* Stop the RTP-MIDI daemon */
+static void rtpmidi_stop(void) {
+    if (rtpmidi_daemon_pid <= 0) return;
+
+    kill(rtpmidi_daemon_pid, SIGTERM);
+    int status;
+    waitpid(rtpmidi_daemon_pid, &status, WNOHANG);
+    printf("rtpmidi: daemon stopped (pid %d)\n", rtpmidi_daemon_pid);
+    rtpmidi_daemon_pid = -1;
+    rtpmidi_enabled = 0;
+}
+
 static FILE *sampler_wav_file = NULL;
 static uint32_t sampler_samples_written = 0;
 static char sampler_current_recording[256] = "";
@@ -4709,6 +4744,15 @@ static void shadow_inprocess_handle_param_request(void) {
                 native_resample_bridge_mode = new_mode;
                 shadow_param->error = 0;
                 shadow_param->result_len = 0;
+            } else if (!has_slot_prefix && strcmp(param_key, "rtpmidi_enabled") == 0) {
+                int enable = (shadow_param->value[0] == '1');
+                if (enable && !rtpmidi_enabled) {
+                    rtpmidi_start();
+                } else if (!enable && rtpmidi_enabled) {
+                    rtpmidi_stop();
+                }
+                shadow_param->error = 0;
+                shadow_param->result_len = 0;
             } else if (strcmp(param_key, "module") == 0) {
                 /* Load or unload master FX slot */
                 int result = shadow_master_fx_slot_load(mfx_slot, shadow_param->value);
@@ -4740,6 +4784,10 @@ static void shadow_inprocess_handle_param_request(void) {
                 int mode = (int)native_resample_bridge_mode;
                 if (mode < 0 || mode > 2) mode = 0;
                 shadow_param->result_len = snprintf(shadow_param->value, SHADOW_PARAM_VALUE_LEN, "%d", mode);
+                shadow_param->error = 0;
+            } else if (!has_slot_prefix && strcmp(param_key, "rtpmidi_enabled") == 0) {
+                shadow_param->result_len = snprintf(shadow_param->value,
+                    SHADOW_PARAM_VALUE_LEN, "%d", rtpmidi_enabled);
                 shadow_param->error = 0;
             } else if (strcmp(param_key, "module") == 0) {
                 strncpy(shadow_param->value, mfx->module_path, SHADOW_PARAM_VALUE_LEN - 1);
@@ -5425,6 +5473,9 @@ static void crash_signal_handler(int sig)
     const char suffix[] = " - terminating";
     for (int i = 0; suffix[i]; i++) msg[pos++] = suffix[i];
     msg[pos] = '\0';
+
+    /* Clean up RTP-MIDI daemon if running */
+    if (rtpmidi_daemon_pid > 0) kill(rtpmidi_daemon_pid, SIGTERM);
 
     unified_log_crash(msg);
     _exit(128 + sig);
