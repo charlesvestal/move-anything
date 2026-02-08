@@ -5362,6 +5362,8 @@ static uint8_t *shadow_ui_midi_shm = NULL;
 static uint8_t *shadow_display_shm = NULL;
 static shadow_midi_out_t *shadow_midi_out_shm = NULL;  /* MIDI output from shadow UI */
 static uint8_t last_shadow_midi_out_ready = 0;
+static shadow_rtp_midi_t *shadow_rtp_midi_shm = NULL;
+static uint8_t last_shadow_rtp_midi_ready = 0;
 static uint32_t last_screenreader_sequence = 0;  /* Track last spoken message */
 static uint64_t last_speech_time_ms = 0;  /* Rate limiting for TTS */
 
@@ -5394,6 +5396,7 @@ static int shm_control_fd = -1;
 static int shm_ui_fd = -1;
 static int shm_param_fd = -1;
 static int shm_midi_out_fd = -1;
+static int shm_rtp_midi_fd = -1;
 static int shm_screenreader_fd = -1;
 
 /* Shadow initialization state */
@@ -5621,6 +5624,23 @@ static void init_shadow_shm(void)
         printf("Shadow: Failed to create midi_out shm\n");
     }
 
+    /* Create/open RTP-MIDI injection shared memory */
+    shm_rtp_midi_fd = shm_open(SHM_SHADOW_RTP_MIDI, O_CREAT | O_RDWR, 0666);
+    if (shm_rtp_midi_fd >= 0) {
+        ftruncate(shm_rtp_midi_fd, sizeof(shadow_rtp_midi_t));
+        shadow_rtp_midi_shm = (shadow_rtp_midi_t *)mmap(NULL, sizeof(shadow_rtp_midi_t),
+                                                         PROT_READ | PROT_WRITE,
+                                                         MAP_SHARED, shm_rtp_midi_fd, 0);
+        if (shadow_rtp_midi_shm == MAP_FAILED) {
+            shadow_rtp_midi_shm = NULL;
+            printf("Shadow: Failed to mmap rtp_midi shm\n");
+        } else {
+            memset(shadow_rtp_midi_shm, 0, sizeof(shadow_rtp_midi_t));
+        }
+    } else {
+        printf("Shadow: Failed to create rtp_midi shm\n");
+    }
+
     /* Create/open screen reader shared memory (for accessibility: TTS and D-Bus announcements) */
     shm_screenreader_fd = shm_open(SHM_SHADOW_SCREENREADER, O_CREAT | O_RDWR, 0666);
     if (shm_screenreader_fd >= 0) {
@@ -5643,9 +5663,9 @@ static void init_shadow_shm(void)
     printf("Shadow: TTS engine configured (will init on first use)\n");
 
     shadow_shm_initialized = 1;
-    printf("Shadow: Shared memory initialized (audio=%p, midi=%p, ui_midi=%p, display=%p, control=%p, ui=%p, param=%p, midi_out=%p, screenreader=%p)\n",
+    printf("Shadow: Shared memory initialized (audio=%p, midi=%p, ui_midi=%p, display=%p, control=%p, ui=%p, param=%p, midi_out=%p, screenreader=%p, rtp_midi=%p)\n",
            shadow_audio_shm, shadow_midi_shm, shadow_ui_midi_shm,
-           shadow_display_shm, shadow_control, shadow_ui_state, shadow_param, shadow_midi_out_shm, shadow_screenreader_shm);
+           shadow_display_shm, shadow_control, shadow_ui_state, shadow_param, shadow_midi_out_shm, shadow_screenreader_shm, shadow_rtp_midi_shm);
 }
 
 #if SHADOW_DEBUG
@@ -6017,6 +6037,40 @@ static void shadow_inject_ui_midi_out(void) {
     /* Clear after processing */
     shadow_midi_out_shm->write_idx = 0;
     memset(shadow_midi_out_shm->buffer, 0, SHADOW_MIDI_OUT_BUFFER_SIZE);
+}
+
+/* Inject RTP-MIDI packets into shadow_mailbox MIDI_IN region.
+ * Called after hardware MIDI_IN has been copied to shadow_mailbox,
+ * so we merge wireless MIDI alongside wired USB MIDI. */
+static void shadow_inject_rtp_midi(void) {
+    if (!shadow_rtp_midi_shm) return;
+    if (shadow_rtp_midi_shm->ready == last_shadow_rtp_midi_ready) return;
+
+    last_shadow_rtp_midi_ready = shadow_rtp_midi_shm->ready;
+
+    uint8_t *midi_in = shadow_mailbox + MIDI_IN_OFFSET;
+
+    for (int i = 0; i < shadow_rtp_midi_shm->write_idx && i < SHADOW_RTP_MIDI_BUFFER_SIZE; i += 4) {
+        uint8_t cin = shadow_rtp_midi_shm->buffer[i] & 0x0F;
+        if (cin < 0x08 || cin > 0x0E) continue;  /* Skip invalid CIN */
+
+        /* Find an empty slot in MIDI_IN */
+        int hw_offset = 0;
+        while (hw_offset < MIDI_BUFFER_SIZE) {
+            if (midi_in[hw_offset] == 0 && midi_in[hw_offset+1] == 0 &&
+                midi_in[hw_offset+2] == 0 && midi_in[hw_offset+3] == 0) {
+                break;
+            }
+            hw_offset += 4;
+        }
+        if (hw_offset >= MIDI_BUFFER_SIZE) break;  /* Buffer full */
+
+        memcpy(&midi_in[hw_offset], &shadow_rtp_midi_shm->buffer[i], 4);
+    }
+
+    /* Clear after processing */
+    shadow_rtp_midi_shm->write_idx = 0;
+    memset(shadow_rtp_midi_shm->buffer, 0, SHADOW_RTP_MIDI_BUFFER_SIZE);
 }
 
 /* Check for and send screen reader announcements via D-Bus */
@@ -7804,6 +7858,9 @@ do_ioctl:
             /* Not in shadow mode - copy MIDI_IN directly */
             memcpy(sh_midi, hw_midi, MIDI_BUFFER_SIZE);
         }
+
+        /* Inject any RTP-MIDI packets into MIDI_IN */
+        shadow_inject_rtp_midi();
 
         /* === SHIFT+MENU SHORTCUT DETECTION AND BLOCKING (POST-IOCTL) ===
          * Scan hardware MIDI_IN for Shift+Menu, perform action, and block from reaching Move.
