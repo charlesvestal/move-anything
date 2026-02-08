@@ -444,6 +444,7 @@ let masterFxConfig = {
 let selectedMasterFxComponent = 0;    // -1=preset, 0-4: fx1, fx2, fx3, fx4, settings
 let selectingMasterFxModule = false;  // True when selecting module for a component
 let selectedMasterFxModuleIndex = 0;  // Index in MASTER_FX_OPTIONS during selection
+let rtpMidiEnabled = false;
 
 /* Master FX settings (shown when Settings component is selected) */
 const MASTER_FX_SETTINGS_ITEMS_BASE = [
@@ -456,6 +457,7 @@ const MASTER_FX_SETTINGS_ITEMS_BASE = [
     { key: "screen_reader_speed", label: "Voice Speed", type: "float", min: 0.5, max: 2.0, step: 0.1 },
     { key: "screen_reader_pitch", label: "Voice Pitch", type: "float", min: 80, max: 180, step: 5 },
     { key: "screen_reader_volume", label: "Voice Vol", type: "int", min: 0, max: 100, step: 5 },
+    { key: "rtpmidi_enabled", label: "RTP-MIDI", type: "bool" },
     { key: "save", label: "[Save]", type: "action" },
     { key: "save_as", label: "[Save As]", type: "action" },
     { key: "delete", label: "[Delete]", type: "action" }
@@ -4364,6 +4366,11 @@ function getMasterFxSettingValue(setting) {
         }
         return "70%";
     }
+    if (setting.key === "rtpmidi_enabled") {
+        const val = shadow_get_param(0, "master_fx:rtpmidi_enabled");
+        rtpMidiEnabled = (val === "1");
+        return rtpMidiEnabled ? "On" : "Off";
+    }
     return "-";
 }
 
@@ -4429,6 +4436,12 @@ function adjustMasterFxSetting(setting, delta) {
         val += delta * setting.step;
         val = Math.max(setting.min, Math.min(setting.max, val));
         tts_set_volume(Math.round(val));
+        return;
+    }
+
+    if (setting.key === "rtpmidi_enabled") {
+        rtpMidiEnabled = !rtpMidiEnabled;
+        shadow_set_param(0, "master_fx:rtpmidi_enabled", rtpMidiEnabled ? "1" : "0");
         return;
     }
 }
