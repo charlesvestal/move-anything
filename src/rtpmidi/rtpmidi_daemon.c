@@ -86,7 +86,7 @@ static int shm_init(void) {
 static void shm_write_midi(uint8_t status, uint8_t d1, uint8_t d2) {
     if (!rtp_shm) return;
 
-    uint8_t idx = rtp_shm->write_idx;
+    uint16_t idx = rtp_shm->write_idx;
     uint8_t *slot = &rtp_shm->buffer[idx];
 
     format_usb_midi_packet(slot, status, d1, d2);
