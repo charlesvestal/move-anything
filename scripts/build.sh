@@ -164,6 +164,15 @@ echo "Building Shadow UI..."
     -Llibs/quickjs/quickjs-2025-04-26 \
     -lquickjs -lm -ldl -lrt
 
+echo "Building RTP-MIDI daemon..."
+
+# Build RTP-MIDI daemon (receives MIDI over WiFi, injects into mailbox)
+"${CROSS_PREFIX}gcc" -g -O3 \
+    src/rtpmidi/rtpmidi_daemon.c \
+    -o build/rtpmidi-daemon \
+    -Isrc -Isrc/host \
+    -lrt
+
 mkdir -p ./build/test/
 if [ "$SCREEN_READER_ENABLED" = "1" ]; then
     echo "Building TTS test program..."
