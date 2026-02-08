@@ -3830,6 +3830,8 @@ static void shadow_log(const char *msg) {
 }
 
 static FILE *shadow_midi_out_log = NULL;
+#define OVERTAKE_MIDI_TRACE_FLAG "/data/UserData/move-anything/overtake_midi_trace_on"
+#define OVERTAKE_MIDI_TRACE_MAX_PER_TICK 80
 
 static int shadow_midi_out_log_enabled(void)
 {
@@ -3861,6 +3863,31 @@ static void shadow_midi_out_logf(const char *fmt, ...)
     va_end(args);
     fputc('\n', shadow_midi_out_log);
     fflush(shadow_midi_out_log);
+}
+
+static int shadow_overtake_midi_trace_enabled(void)
+{
+    static int enabled = -1;
+    static int check_counter = 0;
+    if (enabled < 0 || (check_counter++ % 200 == 0)) {
+        enabled = (access(OVERTAKE_MIDI_TRACE_FLAG, F_OK) == 0);
+    }
+    return enabled;
+}
+
+static void shadow_overtake_trace_event(const char *route,
+                                        int overtake_mode,
+                                        uint8_t cable, uint8_t cin,
+                                        uint8_t status, uint8_t d1, uint8_t d2,
+                                        int *trace_budget)
+{
+    if (!trace_budget || *trace_budget <= 0) return;
+    char msg[192];
+    snprintf(msg, sizeof(msg),
+             "OVT_TRACE route=%s mode=%d cable=%u cin=0x%02x status=0x%02x d1=%u d2=%u",
+             route ? route : "?", overtake_mode, cable, cin, status, d1, d2);
+    shadow_log(msg);
+    (*trace_budget)--;
 }
 
 static void shadow_chain_defaults(void) {
@@ -5967,7 +5994,16 @@ static void shadow_flush_pending_input_leds(void) {
                     break;
                 }
             }
-            if (!found) break;  /* Buffer full, try again next tick */
+            if (!found) {
+                if (shadow_overtake_midi_trace_enabled()) {
+                    char msg[96];
+                    snprintf(msg, sizeof(msg),
+                             "OVT_TRACE route=drop_input_led_flush_full sent=%d budget=%d",
+                             sent, budget);
+                    shadow_log(msg);
+                }
+                break;  /* Buffer full, try again next tick */
+            }
             shadow_input_pending_note_color[i] = -1;
             sent++;
         }
@@ -8253,6 +8289,7 @@ do_ioctl:
     if (shadow_display_mode && shadow_control && hardware_mmap_addr) {
         uint8_t *src = hardware_mmap_addr + MIDI_IN_OFFSET;  /* Scan unfiltered hardware buffer */
         int overtake_mode = shadow_control->overtake_mode;
+        int trace_budget = shadow_overtake_midi_trace_enabled() ? OVERTAKE_MIDI_TRACE_MAX_PER_TICK : 0;
 
         for (int j = 0; j < MIDI_BUFFER_SIZE; j += 4) {
             uint8_t cin = src[j] & 0x0F;
@@ -8279,17 +8316,24 @@ do_ioctl:
                     int is_ui_event = (type == 0xB0 &&
                                       (d1 == 14 || d1 == 3 || d1 == 51 ||  /* jog, click, back */
                                        (d1 >= 40 && d1 <= 43)));           /* track buttons */
-                    if (!is_ui_event) continue;  /* Skip non-UI events in menu mode */
+                    if (!is_ui_event) {
+                        shadow_overtake_trace_event("drop_menu_non_ui", overtake_mode,
+                                                   cable, cin, status, d1, d2, &trace_budget);
+                        continue;  /* Skip non-UI events in menu mode */
+                    }
                 }
 
                 /* Queue cable 2 note-on messages (external LED commands like M8)
                  * for rate-limited forwarding to prevent buffer overflow */
                 if (cable == 0x02 && type == 0x90) {
+                    shadow_overtake_trace_event("queue_input_led", overtake_mode,
+                                               cable, cin, status, d1, d2, &trace_budget);
                     shadow_queue_input_led(src[j], status, d1, d2);
                     continue;
                 }
 
                 /* All other messages: forward directly */
+                int forwarded = 0;
                 for (int slot = 0; slot < MIDI_BUFFER_SIZE; slot += 4) {
                     if (shadow_ui_midi_shm[slot] == 0) {
                         shadow_ui_midi_shm[slot] = src[j];
@@ -8297,8 +8341,16 @@ do_ioctl:
                         shadow_ui_midi_shm[slot + 2] = d1;
                         shadow_ui_midi_shm[slot + 3] = d2;
                         shadow_control->midi_ready++;
+                        forwarded = 1;
                         break;
                     }
+                }
+                if (forwarded) {
+                    shadow_overtake_trace_event("fwd_ui", overtake_mode,
+                                               cable, cin, status, d1, d2, &trace_budget);
+                } else {
+                    shadow_overtake_trace_event("drop_ui_full", overtake_mode,
+                                               cable, cin, status, d1, d2, &trace_budget);
                 }
                 continue;  /* Skip normal processing in overtake mode */
             }
