@@ -41,7 +41,7 @@ typedef struct {
     uint32_t remote_ssrc;
     uint32_t local_ssrc;
     uint32_t initiator_token;
-    struct sockaddr_in remote_addr;
+    struct sockaddr_storage remote_addr;
     socklen_t remote_addr_len;
 } rtpmidi_session_t;
 
@@ -50,7 +50,7 @@ static inline uint8_t midi_status_to_cin(uint8_t status) {
     return (status >> 4) & 0x0F;
 }
 
-/* Format a MIDI message as a cable-2 USB-MIDI packet */
+/* Format a MIDI message as a cable-2 USB-MIDI packet (external MIDI) */
 static inline void format_usb_midi_packet(uint8_t *out, uint8_t status, uint8_t d1, uint8_t d2) {
     uint8_t cin = midi_status_to_cin(status);
     out[0] = 0x20 | cin;  /* Cable 2 + CIN */

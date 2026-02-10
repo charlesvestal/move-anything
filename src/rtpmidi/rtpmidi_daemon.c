@@ -22,8 +22,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <poll.h>
-#include <net/if.h>
-#include <ifaddrs.h>
+#include <dbus/dbus.h>
 
 #include "../host/shadow_constants.h"
 #include "rtpmidi.h"
@@ -108,7 +107,9 @@ static void shm_flush(void) {
  * ============================================================================ */
 
 static int create_udp_socket(uint16_t port) {
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    /* Use IPv6 dual-stack socket to accept both IPv4 and IPv6 connections.
+     * macOS prefers IPv6 when resolving move.local, so we must handle both. */
+    int fd = socket(AF_INET6, SOCK_DGRAM, 0);
     if (fd < 0) {
         perror("rtpmidi: socket");
         return -1;
@@ -121,11 +122,19 @@ static int create_udp_socket(uint16_t port) {
         return -1;
     }
 
-    struct sockaddr_in addr;
+    /* Allow both IPv4 and IPv6 on the same socket */
+    int v6only = 0;
+    if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only)) < 0) {
+        perror("rtpmidi: setsockopt IPV6_V6ONLY");
+        close(fd);
+        return -1;
+    }
+
+    struct sockaddr_in6 addr;
     memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(port);
+    addr.sin6_family = AF_INET6;
+    addr.sin6_addr = in6addr_any;
+    addr.sin6_port = htons(port);
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         fprintf(stderr, "rtpmidi: bind port %u: %s\n", port, strerror(errno));
@@ -133,8 +142,25 @@ static int create_udp_socket(uint16_t port) {
         return -1;
     }
 
-    printf("rtpmidi: listening on UDP port %u\n", port);
+    printf("rtpmidi: listening on UDP port %u (dual-stack)\n", port);
     return fd;
+}
+
+/* ============================================================================
+ * Address formatting helper (supports both IPv4 and IPv6)
+ * ============================================================================ */
+
+static const char *format_addr(struct sockaddr_storage *addr, char *buf, size_t len) {
+    if (addr->ss_family == AF_INET) {
+        struct sockaddr_in *v4 = (struct sockaddr_in *)addr;
+        inet_ntop(AF_INET, &v4->sin_addr, buf, len);
+    } else if (addr->ss_family == AF_INET6) {
+        struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)addr;
+        inet_ntop(AF_INET6, &v6->sin6_addr, buf, len);
+    } else {
+        snprintf(buf, len, "unknown");
+    }
+    return buf;
 }
 
 /* ============================================================================
@@ -142,7 +168,7 @@ static int create_udp_socket(uint16_t port) {
  * ============================================================================ */
 
 static void handle_control_packet(int sock_fd, const uint8_t *buf, int len,
-                                  struct sockaddr_in *src, socklen_t src_len) {
+                                  struct sockaddr_storage *src, socklen_t src_len) {
     if (len < 4) return;
 
     uint16_t sig, cmd;
@@ -174,8 +200,9 @@ static void handle_control_packet(int sock_fd, const uint8_t *buf, int len,
             peer_name[name_len] = '\0';
         }
 
+        char addr_buf[INET6_ADDRSTRLEN];
         printf("rtpmidi: IN from %s (SSRC=0x%08X name=%s)\n",
-               inet_ntoa(src->sin_addr), remote_ssrc, peer_name);
+               format_addr(src, addr_buf, sizeof(addr_buf)), remote_ssrc, peer_name);
 
         /* Store session info */
         session.remote_ssrc = remote_ssrc;
@@ -249,8 +276,9 @@ static void handle_control_packet(int sock_fd, const uint8_t *buf, int len,
         remote_ssrc = ntohl(remote_ssrc);
 
         if (remote_ssrc == session.remote_ssrc) {
+            char bye_addr[INET6_ADDRSTRLEN];
             printf("rtpmidi: BYE from %s (SSRC=0x%08X)\n",
-                   inet_ntoa(src->sin_addr), remote_ssrc);
+                   format_addr(src, bye_addr, sizeof(bye_addr)), remote_ssrc);
             session.state = SESSION_IDLE;
         }
     }
@@ -261,7 +289,7 @@ static void handle_control_packet(int sock_fd, const uint8_t *buf, int len,
  * ============================================================================ */
 
 static void handle_data_packet(int sock_fd, const uint8_t *buf, int len,
-                               struct sockaddr_in *src, socklen_t src_len) {
+                               struct sockaddr_storage *src, socklen_t src_len) {
     if (len < 4) return;
 
     /* AppleMIDI command packets can arrive on the data port too.
@@ -277,12 +305,10 @@ static void handle_data_packet(int sock_fd, const uint8_t *buf, int len,
     if (len < 13) return;
 
     /* Validate RTP header: version must be 2, payload type must be 0x61 */
-    uint8_t rtp_byte0 = buf[0];
-    uint8_t rtp_version = (rtp_byte0 >> 6) & 0x03;
+    uint8_t rtp_version = (buf[0] >> 6) & 0x03;
     if (rtp_version != RTP_VERSION) return;
 
-    uint8_t rtp_byte1 = buf[1];
-    uint8_t payload_type = rtp_byte1 & 0x7F;
+    uint8_t payload_type = buf[1] & 0x7F;
     if (payload_type != RTP_PAYLOAD_TYPE) return;
 
     /* Parse MIDI command section at offset 12 */
@@ -312,83 +338,82 @@ static void handle_data_packet(int sock_fd, const uint8_t *buf, int len,
     int midi_end = offset + midi_list_len;
     if (midi_end > len) midi_end = len;
 
-    /* Parse MIDI messages from the list */
+    /* Parse MIDI messages from the MIDI command section.
+     *
+     * RTP-MIDI format: cmd [delta cmd] [delta cmd] ...
+     * - The first message has NO delta prefix in the byte stream.
+     *   (Z flag indicates whether its timestamp is zero, but the delta
+     *   value is not encoded in the stream for the first command.)
+     * - Subsequent messages have a variable-length delta prefix.
+     * - Delta encoding: continuation bytes have bit 7 set (0x80-0xFF),
+     *   final byte has bit 7 clear (0x00-0x7F). Same as standard MIDI VLQ.
+     * - Running status applies: if no new status byte, reuse previous. */
     uint8_t running_status = 0;
     int first_message = 1;
 
     while (offset < midi_end) {
-        /* Skip delta-time (variable length) unless Z flag and first message */
-        if (!first_message || !z_flag) {
-            /* Variable-length delta: continuation bytes have bit 7 set */
-            while (offset < midi_end && (buf[offset] & 0x80)) {
-                offset++;
-            }
-            if (offset < midi_end) offset++;  /* Final byte of delta */
+        /* Skip delta-time between messages (only after the first).
+         * The first message never has a delta prefix in the stream. */
+        if (!first_message) {
+            while (offset < midi_end && (buf[offset] & 0x80))
+                offset++;           /* continuation bytes */
+            if (offset < midi_end)
+                offset++;           /* final byte of delta */
         }
         first_message = 0;
 
         if (offset >= midi_end) break;
 
-        /* Read status or data byte */
+        /* Read status byte or use running status */
         uint8_t byte = buf[offset];
         uint8_t status;
 
-        if (byte & 0x80) {
-            /* Status byte */
+        if (byte >= 0xF8) {
+            /* System realtime (0xF8-0xFF): single byte, no data */
+            shm_write_midi(byte, 0, 0);
+            offset++;
+            continue;
+        } else if (byte >= 0x80) {
             status = byte;
             running_status = status;
             offset++;
         } else {
-            /* Data byte - use running status */
+            /* Running status */
             status = running_status;
-            if (status == 0) {
+            if (running_status == 0) {
                 offset++;
-                continue;  /* No running status established */
+                continue;  /* No running status to use, skip */
             }
         }
 
-        if (offset > midi_end) break;
+        if (offset >= midi_end) break;
 
-        /* Determine message length and dispatch */
         uint8_t high = status & 0xF0;
 
         if (high >= 0x80 && high <= 0xBF) {
-            /* Note Off, Note On, Poly Pressure, Control Change: 2 data bytes */
+            /* Note Off/On, Poly Pressure, CC: 2 data bytes */
             if (offset + 1 >= midi_end) break;
-            uint8_t d1 = buf[offset];
-            uint8_t d2 = buf[offset + 1];
+            shm_write_midi(status, buf[offset], buf[offset + 1]);
             offset += 2;
-            shm_write_midi(status, d1, d2);
         }
         else if (high == 0xC0 || high == 0xD0) {
             /* Program Change, Channel Pressure: 1 data byte */
-            if (offset >= midi_end) break;
-            uint8_t d1 = buf[offset];
+            shm_write_midi(status, buf[offset], 0);
             offset += 1;
-            shm_write_midi(status, d1, 0);
         }
         else if (high == 0xE0) {
             /* Pitch Bend: 2 data bytes */
             if (offset + 1 >= midi_end) break;
-            uint8_t d1 = buf[offset];
-            uint8_t d2 = buf[offset + 1];
+            shm_write_midi(status, buf[offset], buf[offset + 1]);
             offset += 2;
-            shm_write_midi(status, d1, d2);
         }
         else if (status == 0xF0) {
             /* SysEx: skip until 0xF7 */
-            while (offset < midi_end && buf[offset] != 0xF7) {
-                offset++;
-            }
-            if (offset < midi_end) offset++;  /* Skip 0xF7 */
-        }
-        else if (status >= 0xF8) {
-            /* System realtime: no data bytes */
-            shm_write_midi(status, 0, 0);
+            while (offset < midi_end && buf[offset] != 0xF7) offset++;
+            if (offset < midi_end) offset++;
         }
         else {
-            /* Other system common (0xF1-0xF7): skip */
-            break;
+            offset++;  /* Skip unknown */
         }
     }
 
@@ -399,224 +424,163 @@ static void handle_data_packet(int sock_fd, const uint8_t *buf, int len,
 }
 
 /* ============================================================================
- * mDNS service advertisement
+ * Avahi service advertisement via D-Bus
+ *
+ * Registers _apple-midi._udp with the system Avahi daemon using the D-Bus API.
+ * The registration lives as long as the D-Bus connection, so when the daemon
+ * exits the service is automatically removed. No files on the root partition.
  * ============================================================================ */
 
-/* Get the local non-loopback IPv4 address */
-static uint32_t get_local_ip(void) {
-    struct ifaddrs *ifaddr, *ifa;
-    uint32_t ip = 0;
+static DBusConnection *avahi_bus = NULL;
+static char avahi_group_path[256] = "";
 
-    if (getifaddrs(&ifaddr) < 0) return 0;
+static void avahi_register(const char *name, uint16_t port) {
+    DBusError err;
+    dbus_error_init(&err);
 
-    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
-        if (ifa->ifa_addr == NULL) continue;
-        if (ifa->ifa_addr->sa_family != AF_INET) continue;
-        if (ifa->ifa_flags & IFF_LOOPBACK) continue;
-
-        struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
-        ip = sa->sin_addr.s_addr;  /* Already in network byte order */
-        break;
+    avahi_bus = dbus_bus_get(DBUS_BUS_SYSTEM, &err);
+    if (dbus_error_is_set(&err) || !avahi_bus) {
+        fprintf(stderr, "rtpmidi: D-Bus connect failed: %s\n",
+                err.message ? err.message : "unknown");
+        dbus_error_free(&err);
+        return;
     }
 
-    freeifaddrs(ifaddr);
-    return ip;
+    /* Step 1: Create an EntryGroup */
+    DBusMessage *msg = dbus_message_new_method_call(
+        "org.freedesktop.Avahi", "/",
+        "org.freedesktop.Avahi.Server", "EntryGroupNew");
+    if (!msg) goto fail;
+
+    DBusMessage *reply = dbus_connection_send_with_reply_and_block(
+        avahi_bus, msg, 2000, &err);
+    dbus_message_unref(msg);
+
+    if (dbus_error_is_set(&err) || !reply) {
+        fprintf(stderr, "rtpmidi: EntryGroupNew failed: %s\n",
+                err.message ? err.message : "no reply");
+        dbus_error_free(&err);
+        goto fail;
+    }
+
+    const char *group_path_ptr = NULL;
+    if (!dbus_message_get_args(reply, &err,
+            DBUS_TYPE_OBJECT_PATH, &group_path_ptr, DBUS_TYPE_INVALID)) {
+        fprintf(stderr, "rtpmidi: EntryGroupNew parse failed: %s\n", err.message);
+        dbus_message_unref(reply);
+        dbus_error_free(&err);
+        goto fail;
+    }
+    snprintf(avahi_group_path, sizeof(avahi_group_path), "%s", group_path_ptr);
+    dbus_message_unref(reply);
+
+    /* Step 2: AddService(_apple-midi._udp, port) */
+    msg = dbus_message_new_method_call(
+        "org.freedesktop.Avahi", avahi_group_path,
+        "org.freedesktop.Avahi.EntryGroup", "AddService");
+    if (!msg) goto fail;
+
+    dbus_int32_t iface = -1;   /* AVAHI_IF_UNSPEC */
+    dbus_int32_t proto = -1;   /* AVAHI_PROTO_UNSPEC (dual-stack socket handles both) */
+    dbus_uint32_t flags = 0;
+    const char *svc_type = "_apple-midi._udp";
+    const char *domain = "";
+    const char *host = "";
+    dbus_uint16_t dbus_port = port;
+
+    dbus_message_append_args(msg,
+        DBUS_TYPE_INT32, &iface,
+        DBUS_TYPE_INT32, &proto,
+        DBUS_TYPE_UINT32, &flags,
+        DBUS_TYPE_STRING, &name,
+        DBUS_TYPE_STRING, &svc_type,
+        DBUS_TYPE_STRING, &domain,
+        DBUS_TYPE_STRING, &host,
+        DBUS_TYPE_UINT16, &dbus_port,
+        DBUS_TYPE_INVALID);
+
+    /* Empty TXT record array */
+    DBusMessageIter iter, sub;
+    dbus_message_iter_init_append(msg, &iter);
+    /* We already appended basic args, need to add the array at the end.
+     * Re-do: build message manually for the array. */
+    dbus_message_unref(msg);
+
+    msg = dbus_message_new_method_call(
+        "org.freedesktop.Avahi", avahi_group_path,
+        "org.freedesktop.Avahi.EntryGroup", "AddService");
+
+    dbus_message_iter_init_append(msg, &iter);
+    dbus_message_iter_append_basic(&iter, DBUS_TYPE_INT32, &iface);
+    dbus_message_iter_append_basic(&iter, DBUS_TYPE_INT32, &proto);
+    dbus_message_iter_append_basic(&iter, DBUS_TYPE_UINT32, &flags);
+    dbus_message_iter_append_basic(&iter, DBUS_TYPE_STRING, &name);
+    dbus_message_iter_append_basic(&iter, DBUS_TYPE_STRING, &svc_type);
+    dbus_message_iter_append_basic(&iter, DBUS_TYPE_STRING, &domain);
+    dbus_message_iter_append_basic(&iter, DBUS_TYPE_STRING, &host);
+    dbus_message_iter_append_basic(&iter, DBUS_TYPE_UINT16, &dbus_port);
+
+    /* TXT records: array of array of bytes (aay) - empty */
+    dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY, "ay", &sub);
+    dbus_message_iter_close_container(&iter, &sub);
+
+    reply = dbus_connection_send_with_reply_and_block(avahi_bus, msg, 2000, &err);
+    dbus_message_unref(msg);
+
+    if (dbus_error_is_set(&err)) {
+        fprintf(stderr, "rtpmidi: AddService failed: %s\n", err.message);
+        dbus_error_free(&err);
+        goto fail;
+    }
+    if (reply) dbus_message_unref(reply);
+
+    /* Step 3: Commit */
+    msg = dbus_message_new_method_call(
+        "org.freedesktop.Avahi", avahi_group_path,
+        "org.freedesktop.Avahi.EntryGroup", "Commit");
+
+    reply = dbus_connection_send_with_reply_and_block(avahi_bus, msg, 2000, &err);
+    dbus_message_unref(msg);
+
+    if (dbus_error_is_set(&err)) {
+        fprintf(stderr, "rtpmidi: Commit failed: %s\n", err.message);
+        dbus_error_free(&err);
+        goto fail;
+    }
+    if (reply) dbus_message_unref(reply);
+
+    printf("rtpmidi: registered Avahi service '%s' on port %u\n", name, port);
+    return;
+
+fail:
+    fprintf(stderr, "rtpmidi: Avahi registration failed (service won't be discoverable)\n");
+    if (avahi_bus) {
+        dbus_connection_unref(avahi_bus);
+        avahi_bus = NULL;
+    }
 }
 
-/* Write a DNS label (length byte + string) into buf, return bytes written */
-static int dns_write_label(uint8_t *buf, const char *label) {
-    int len = (int)strlen(label);
-    buf[0] = (uint8_t)len;
-    memcpy(buf + 1, label, len);
-    return 1 + len;
-}
+static void avahi_unregister(void) {
+    if (!avahi_bus) return;
 
-static int mdns_init(void) {
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) {
-        perror("rtpmidi: mdns socket");
-        return -1;
-    }
-
-    int opt = 1;
-    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        perror("rtpmidi: mdns SO_REUSEADDR");
-        close(fd);
-        return -1;
-    }
-
-#ifdef SO_REUSEPORT
-    if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0) {
-        perror("rtpmidi: mdns SO_REUSEPORT");
-        close(fd);
-        return -1;
-    }
-#endif
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(5353);
-
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("rtpmidi: mdns bind");
-        close(fd);
-        return -1;
-    }
-
-    /* Join multicast group 224.0.0.251 */
-    struct ip_mreq mreq;
-    mreq.imr_multiaddr.s_addr = inet_addr("224.0.0.251");
-    mreq.imr_interface.s_addr = htonl(INADDR_ANY);
-
-    if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
-        perror("rtpmidi: mdns multicast join");
-        close(fd);
-        return -1;
-    }
-
-    printf("rtpmidi: mDNS responder ready on port 5353\n");
-    return fd;
-}
-
-static void mdns_respond(int mdns_fd) {
-    uint8_t query[2048];
-    struct sockaddr_in src;
-    socklen_t src_len = sizeof(src);
-
-    int n = recvfrom(mdns_fd, query, sizeof(query), 0,
-                     (struct sockaddr *)&src, &src_len);
-    if (n < 12) return;
-
-    /* Check this is a query (QR bit = 0 in flags) */
-    uint16_t flags;
-    memcpy(&flags, query + 2, 2);
-    flags = ntohs(flags);
-    if (flags & 0x8000) return;  /* Not a query */
-
-    /* Scan for "_apple-midi" in the query */
-    int found = 0;
-    for (int i = 0; i < n - 12; i++) {
-        if (query[i] == 11 && i + 11 < n &&
-            memcmp(query + i + 1, "_apple-midi", 11) == 0) {
-            found = 1;
-            break;
+    if (avahi_group_path[0]) {
+        DBusError err;
+        dbus_error_init(&err);
+        DBusMessage *msg = dbus_message_new_method_call(
+            "org.freedesktop.Avahi", avahi_group_path,
+            "org.freedesktop.Avahi.EntryGroup", "Free");
+        if (msg) {
+            DBusMessage *reply = dbus_connection_send_with_reply_and_block(
+                avahi_bus, msg, 2000, &err);
+            dbus_message_unref(msg);
+            if (reply) dbus_message_unref(reply);
+            dbus_error_free(&err);
         }
     }
-    if (!found) return;
 
-    /* Build mDNS response */
-    uint8_t resp[512];
-    int off = 0;
-
-    /* DNS header */
-    uint16_t txid = 0;
-    uint16_t resp_flags = htons(0x8400);  /* Response, authoritative */
-    uint16_t zero = 0;
-    uint16_t ancount = htons(3);
-
-    memcpy(resp + off, &txid, 2); off += 2;
-    memcpy(resp + off, &resp_flags, 2); off += 2;
-    memcpy(resp + off, &zero, 2); off += 2;  /* QDCOUNT */
-    memcpy(resp + off, &ancount, 2); off += 2;  /* ANCOUNT */
-    memcpy(resp + off, &zero, 2); off += 2;  /* NSCOUNT */
-    memcpy(resp + off, &zero, 2); off += 2;  /* ARCOUNT */
-
-    /* Helper: write the service type labels: _apple-midi._udp.local */
-    /* We'll build the common name portions we need */
-
-    /* --- PTR record: _apple-midi._udp.local -> Move._apple-midi._udp.local --- */
-    /* Name: _apple-midi._udp.local */
-    int ptr_name_start = off;
-    off += dns_write_label(resp + off, "_apple-midi");
-    off += dns_write_label(resp + off, "_udp");
-    off += dns_write_label(resp + off, "local");
-    resp[off++] = 0;  /* Root label */
-
-    /* Type PTR (12), Class IN (1) */
-    uint16_t type_ptr = htons(12);
-    uint16_t class_in = htons(1);
-    uint32_t ttl = htonl(4500);
-
-    memcpy(resp + off, &type_ptr, 2); off += 2;
-    memcpy(resp + off, &class_in, 2); off += 2;
-    memcpy(resp + off, &ttl, 4); off += 4;
-
-    /* RDATA: Move._apple-midi._udp.local (with pointer to service type) */
-    int rdlen_off = off;
-    off += 2;  /* Placeholder for RDLENGTH */
-    int rdata_start = off;
-
-    off += dns_write_label(resp + off, service_name);
-    /* Pointer to _apple-midi._udp.local at ptr_name_start */
-    uint16_t ptr = htons(0xC000 | (uint16_t)ptr_name_start);
-    memcpy(resp + off, &ptr, 2); off += 2;
-
-    uint16_t rdlen = htons((uint16_t)(off - rdata_start));
-    memcpy(resp + rdlen_off, &rdlen, 2);
-
-    /* --- SRV record: Move._apple-midi._udp.local -> Move.local port 5004 --- */
-    /* Name: Move._apple-midi._udp.local (use label + pointer) */
-    off += dns_write_label(resp + off, service_name);
-    memcpy(resp + off, &ptr, 2); off += 2;  /* Pointer to _apple-midi._udp.local */
-
-    /* Type SRV (33), Class IN flush (0x8001) */
-    uint16_t type_srv = htons(33);
-    uint16_t class_flush = htons(0x8001);
-
-    memcpy(resp + off, &type_srv, 2); off += 2;
-    memcpy(resp + off, &class_flush, 2); off += 2;
-    memcpy(resp + off, &ttl, 4); off += 4;
-
-    /* SRV RDATA: priority(2) + weight(2) + port(2) + target */
-    int srv_rdlen_off = off;
-    off += 2;  /* Placeholder for RDLENGTH */
-    int srv_rdata_start = off;
-
-    uint16_t priority = 0;
-    uint16_t weight = 0;
-    uint16_t port = htons(RTPMIDI_CONTROL_PORT);
-    memcpy(resp + off, &priority, 2); off += 2;
-    memcpy(resp + off, &weight, 2); off += 2;
-    memcpy(resp + off, &port, 2); off += 2;
-
-    /* Target: Move.local */
-    int target_name_off = off;
-    off += dns_write_label(resp + off, service_name);
-    off += dns_write_label(resp + off, "local");
-    resp[off++] = 0;  /* Root label */
-
-    uint16_t srv_rdlen = htons((uint16_t)(off - srv_rdata_start));
-    memcpy(resp + srv_rdlen_off, &srv_rdlen, 2);
-
-    /* --- A record: Move.local -> local IP --- */
-    /* Name: pointer to Move.local from SRV target */
-    uint16_t target_ptr = htons(0xC000 | (uint16_t)target_name_off);
-    memcpy(resp + off, &target_ptr, 2); off += 2;
-
-    /* Type A (1), Class IN flush (0x8001) */
-    uint16_t type_a = htons(1);
-    memcpy(resp + off, &type_a, 2); off += 2;
-    memcpy(resp + off, &class_flush, 2); off += 2;
-    memcpy(resp + off, &ttl, 4); off += 4;
-
-    /* RDATA: 4-byte IPv4 address */
-    uint16_t a_rdlen = htons(4);
-    memcpy(resp + off, &a_rdlen, 2); off += 2;
-
-    uint32_t local_ip = get_local_ip();
-    memcpy(resp + off, &local_ip, 4); off += 4;
-
-    /* Send to multicast */
-    struct sockaddr_in mcast;
-    memset(&mcast, 0, sizeof(mcast));
-    mcast.sin_family = AF_INET;
-    mcast.sin_addr.s_addr = inet_addr("224.0.0.251");
-    mcast.sin_port = htons(5353);
-
-    sendto(mdns_fd, resp, off, 0,
-           (struct sockaddr *)&mcast, sizeof(mcast));
+    dbus_connection_unref(avahi_bus);
+    avahi_bus = NULL;
+    printf("rtpmidi: unregistered Avahi service\n");
 }
 
 /* ============================================================================
@@ -645,9 +609,9 @@ static void send_bye(int control_fd) {
     sendto(control_fd, pkt, sizeof(pkt), 0,
            (struct sockaddr *)&session.remote_addr, session.remote_addr_len);
 
-    printf("rtpmidi: sent BYE to %s:%u\n",
-           inet_ntoa(session.remote_addr.sin_addr),
-           ntohs(session.remote_addr.sin_port));
+    char bye_addr[INET6_ADDRSTRLEN];
+    printf("rtpmidi: sent BYE to %s\n",
+           format_addr(&session.remote_addr, bye_addr, sizeof(bye_addr)));
 
     session.state = SESSION_IDLE;
 }
@@ -657,6 +621,9 @@ static void send_bye(int control_fd) {
  * ============================================================================ */
 
 int main(int argc, char *argv[]) {
+    /* Line-buffer stdout so logs appear immediately when redirected */
+    setlinebuf(stdout);
+
     /* Parse optional --name argument */
     for (int i = 1; i < argc - 1; i++) {
         if (strcmp(argv[i], "--name") == 0) {
@@ -693,8 +660,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Initialize mDNS */
-    int mdns_fd = mdns_init();
+    /* Register with Avahi for mDNS advertisement */
+    avahi_register(service_name, RTPMIDI_CONTROL_PORT);
 
     /* Initialize session */
     memset(&session, 0, sizeof(session));
@@ -704,19 +671,16 @@ int main(int argc, char *argv[]) {
     printf("rtpmidi: daemon ready (SSRC=0x%08X)\n", session.local_ssrc);
 
     /* Main poll loop */
-    struct pollfd fds[3];
+    struct pollfd fds[2];
     fds[0].fd = control_fd;
     fds[0].events = POLLIN;
     fds[1].fd = data_fd;
     fds[1].events = POLLIN;
-    fds[2].fd = mdns_fd;
-    fds[2].events = (mdns_fd >= 0) ? POLLIN : 0;
 
     uint8_t buf[2048];
 
     while (running) {
-        int nfds = (mdns_fd >= 0) ? 3 : 2;
-        int ret = poll(fds, nfds, 1000);
+        int ret = poll(fds, 2, 1000);
 
         if (ret < 0) {
             if (errno == EINTR) continue;
@@ -728,7 +692,7 @@ int main(int argc, char *argv[]) {
 
         /* Control port */
         if (fds[0].revents & POLLIN) {
-            struct sockaddr_in src;
+            struct sockaddr_storage src;
             socklen_t src_len = sizeof(src);
             int n = recvfrom(control_fd, buf, sizeof(buf), 0,
                              (struct sockaddr *)&src, &src_len);
@@ -739,7 +703,7 @@ int main(int argc, char *argv[]) {
 
         /* Data port */
         if (fds[1].revents & POLLIN) {
-            struct sockaddr_in src;
+            struct sockaddr_storage src;
             socklen_t src_len = sizeof(src);
             int n = recvfrom(data_fd, buf, sizeof(buf), 0,
                              (struct sockaddr *)&src, &src_len);
@@ -747,21 +711,16 @@ int main(int argc, char *argv[]) {
                 handle_data_packet(data_fd, buf, n, &src, src_len);
             }
         }
-
-        /* mDNS */
-        if (nfds > 2 && (fds[2].revents & POLLIN)) {
-            mdns_respond(mdns_fd);
-        }
     }
 
     /* Shutdown */
     printf("rtpmidi: shutting down\n");
 
     send_bye(control_fd);
+    avahi_unregister();
 
     close(control_fd);
     close(data_fd);
-    if (mdns_fd >= 0) close(mdns_fd);
 
     if (rtp_shm) {
         munmap(rtp_shm, sizeof(shadow_rtp_midi_t));

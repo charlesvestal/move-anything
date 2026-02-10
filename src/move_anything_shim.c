@@ -2457,9 +2457,10 @@ static void rtpmidi_start(void) {
         return;
     }
     if (pid == 0) {
-        /* Child - exec the daemon */
-        execl("/data/UserData/move-anything/rtpmidi-daemon",
-              "rtpmidi-daemon", (char *)NULL);
+        /* Child - exec the Python daemon */
+        execl("/usr/bin/python3", "python3",
+              "/data/UserData/move-anything/rtpmidi_server.py",
+              (char *)NULL);
         _exit(127);
     }
     rtpmidi_daemon_pid = pid;
@@ -6092,37 +6093,16 @@ static void shadow_inject_ui_midi_out(void) {
 
 /* Inject RTP-MIDI packets into shadow_mailbox MIDI_IN region.
  * Called after hardware MIDI_IN has been copied to shadow_mailbox,
- * so we merge wireless MIDI alongside wired USB MIDI. */
+ * so we merge wireless MIDI alongside wired USB MIDI.
+ *
+ * Takes a local snapshot of the shm buffer to avoid races with
+ * the daemon writer, then clears the shm immediately so the
+ * daemon can continue writing new data. */
 static void shadow_inject_rtp_midi(void) {
-    if (!shadow_rtp_midi_shm) return;
-    if (shadow_rtp_midi_shm->ready == last_shadow_rtp_midi_ready) return;
-
-    last_shadow_rtp_midi_ready = shadow_rtp_midi_shm->ready;
-
-    uint8_t *midi_in = shadow_mailbox + MIDI_IN_OFFSET;
-    int hw_offset = 0;
-
-    for (int i = 0; i < shadow_rtp_midi_shm->write_idx && i < SHADOW_RTP_MIDI_BUFFER_SIZE; i += 4) {
-        uint8_t cin = shadow_rtp_midi_shm->buffer[i] & 0x0F;
-        if (cin < 0x08 || cin > 0x0E) continue;  /* Skip invalid CIN */
-
-        /* Find an empty slot in MIDI_IN (continue from last position) */
-        while (hw_offset < MIDI_BUFFER_SIZE) {
-            if (midi_in[hw_offset] == 0 && midi_in[hw_offset+1] == 0 &&
-                midi_in[hw_offset+2] == 0 && midi_in[hw_offset+3] == 0) {
-                break;
-            }
-            hw_offset += 4;
-        }
-        if (hw_offset >= MIDI_BUFFER_SIZE) break;  /* Buffer full */
-
-        memcpy(&midi_in[hw_offset], &shadow_rtp_midi_shm->buffer[i], 4);
-        hw_offset += 4;
-    }
-
-    /* Clear after processing */
-    shadow_rtp_midi_shm->write_idx = 0;
-    memset(shadow_rtp_midi_shm->buffer, 0, SHADOW_RTP_MIDI_BUFFER_SIZE);
+    /* RTP-MIDI injection now happens inside shadow_forward_midi() to route
+     * packets directly to shadow_midi_shm and avoid writing cable-2 data
+     * into Move's mailbox (which causes SIGABRT without a USB device). */
+    (void)0;
 }
 
 /* Check for and send screen reader announcements via D-Bus */
@@ -6325,6 +6305,62 @@ static void shadow_forward_midi(void)
             }
         }
         has_midi = 1;
+    }
+
+    /* Inject RTP-MIDI packets from the daemon into the filtered buffer.
+     * This routes wireless MIDI directly to the shadow instrument via
+     * shadow_midi_shm, bypassing Move's mailbox entirely (Move crashes
+     * if it sees cable-2 data without a physical USB device). */
+    if (shadow_rtp_midi_shm &&
+        shadow_rtp_midi_shm->ready != last_shadow_rtp_midi_ready) {
+        last_shadow_rtp_midi_ready = shadow_rtp_midi_shm->ready;
+
+        uint16_t rtp_count = shadow_rtp_midi_shm->write_idx;
+        if (rtp_count > SHADOW_RTP_MIDI_BUFFER_SIZE)
+            rtp_count = SHADOW_RTP_MIDI_BUFFER_SIZE;
+
+        uint8_t rtp_buf[SHADOW_RTP_MIDI_BUFFER_SIZE];
+        memcpy(rtp_buf, (const void *)shadow_rtp_midi_shm->buffer, rtp_count);
+        shadow_rtp_midi_shm->write_idx = 0;
+
+        /* Debug: log RTP-MIDI injection */
+        static FILE *rtp_log = NULL;
+        if (!rtp_log) {
+            rtp_log = fopen("/tmp/rtpmidi_shim.log", "a");
+        }
+
+        for (int r = 0; r + 3 < (int)rtp_count; r += 4) {
+            uint8_t cin = rtp_buf[r] & 0x0F;
+            if (cin < 0x08 || cin > 0x0E) continue;
+
+            /* Find an empty slot in the filtered buffer */
+            int placed = 0;
+            for (int s = 0; s < MIDI_BUFFER_SIZE; s += 4) {
+                if (filtered[s] == 0 && filtered[s+1] == 0 &&
+                    filtered[s+2] == 0 && filtered[s+3] == 0) {
+                    memcpy(&filtered[s], &rtp_buf[r], 4);
+                    has_midi = 1;
+                    placed = 1;
+                    if (rtp_log) {
+                        fprintf(rtp_log, "rtp-inject: slot=%d %02x %02x %02x %02x\n",
+                                s, rtp_buf[r], rtp_buf[r+1], rtp_buf[r+2], rtp_buf[r+3]);
+                        fflush(rtp_log);
+                    }
+                    break;
+                }
+            }
+            if (!placed && rtp_log) {
+                fprintf(rtp_log, "rtp-inject: FULL - dropped %02x %02x %02x %02x\n",
+                        rtp_buf[r], rtp_buf[r+1], rtp_buf[r+2], rtp_buf[r+3]);
+                fflush(rtp_log);
+            }
+        }
+
+        if (rtp_log && rtp_count > 0) {
+            fprintf(rtp_log, "rtp-inject: count=%u has_midi=%d midi_ready=%u\n",
+                    rtp_count, has_midi, shadow_control->midi_ready);
+            fflush(rtp_log);
+        }
     }
 
     if (has_midi) {

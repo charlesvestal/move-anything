@@ -13,7 +13,7 @@ cd "$REPO_ROOT"
 cd ./build
 
 # Build list of items to package
-ITEMS="./move-anything ./move-anything-shim.so ./rtpmidi-daemon ./shim-entrypoint.sh ./start.sh ./stop.sh ./host ./shared ./modules ./shadow ./patches ./test"
+ITEMS="./move-anything ./move-anything-shim.so ./rtpmidi_server.py ./shim-entrypoint.sh ./start.sh ./stop.sh ./host ./shared ./modules ./shadow ./patches ./test"
 
 # Add bin directory if it exists (contains curl for store module)
 if [ -d "./bin" ]; then
