@@ -1,0 +1,29 @@
+# Makefile for SEQOMD DSP Plugin Tests
+#
+# Usage:
+#   make -f Makefile.test        # Build tests
+#   make -f Makefile.test run    # Build and run tests
+#   make -f Makefile.test clean  # Clean build artifacts
+
+CC = gcc
+CFLAGS = -Wall -Wextra -g -O0 -I../../..
+
+# Source files
+TEST_SRC = test_seq_plugin.c
+DSP_SRC = seq_plugin.c midi.c scheduler.c transpose.c scale.c arpeggiator.c track.c params.c
+
+# Output
+TEST_BIN = test_seq_plugin
+
+.PHONY: all run clean
+
+all: $(TEST_BIN)
+
+$(TEST_BIN): $(TEST_SRC) $(DSP_SRC) seq_plugin.h
+	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) -lm
+
+run: $(TEST_BIN)
+	./$(TEST_BIN)
+
+clean:
+	rm -f $(TEST_BIN)
