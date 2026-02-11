@@ -290,6 +290,70 @@ function clearLedBatch() {
     return ledClearIndex >= totalItems;
 }
 
+/* LED output queue for overtake modules - prevents SHM buffer flooding.
+ * Intercepts move_midi_internal_send during overtake mode.
+ * LED messages (note-on, CC on cable 0) are queued with last-writer-wins.
+ * Non-LED messages pass through immediately.
+ * Queue is flushed after each tick(), sending at most LED_QUEUE_MAX_PER_TICK. */
+const LED_QUEUE_MAX_PER_TICK = 16;
+let ledQueueNotes = {};      /* note -> [cin, status, note, color] */
+let ledQueueCCs = {};        /* cc -> [cin, status, cc, color] */
+let ledQueueActive = false;
+let originalMidiInternalSend = null;
+
+function activateLedQueue() {
+    originalMidiInternalSend = globalThis.move_midi_internal_send;
+    ledQueueNotes = {};
+    ledQueueCCs = {};
+    ledQueueActive = true;
+
+    globalThis.move_midi_internal_send = function(arr) {
+        if (!ledQueueActive || !originalMidiInternalSend) {
+            return originalMidiInternalSend ? originalMidiInternalSend(arr) : undefined;
+        }
+        const type = arr[1] & 0xF0;
+        if (type === 0x90) {
+            ledQueueNotes[arr[2]] = [arr[0], arr[1], arr[2], arr[3]];
+        } else if (type === 0xB0) {
+            ledQueueCCs[arr[2]] = [arr[0], arr[1], arr[2], arr[3]];
+        } else {
+            /* Non-LED messages (sysex, etc.) pass through immediately */
+            return originalMidiInternalSend(arr);
+        }
+    };
+}
+
+function deactivateLedQueue() {
+    if (originalMidiInternalSend) {
+        globalThis.move_midi_internal_send = originalMidiInternalSend;
+        originalMidiInternalSend = null;
+    }
+    ledQueueNotes = {};
+    ledQueueCCs = {};
+    ledQueueActive = false;
+}
+
+function flushLedQueue() {
+    if (!ledQueueActive || !originalMidiInternalSend) return;
+    let count = 0;
+
+    /* Flush note LEDs (pads, steps) */
+    for (let note in ledQueueNotes) {
+        if (count >= LED_QUEUE_MAX_PER_TICK) break;
+        originalMidiInternalSend(ledQueueNotes[note]);
+        delete ledQueueNotes[note];
+        count++;
+    }
+
+    /* Flush CC LEDs (buttons, knob indicators) */
+    for (let cc in ledQueueCCs) {
+        if (count >= LED_QUEUE_MAX_PER_TICK) break;
+        originalMidiInternalSend(ledQueueCCs[cc]);
+        delete ledQueueCCs[cc];
+        count++;
+    }
+}
+
 /* Knob mapping state (overlay uses shared menu_layout.mjs) */
 let knobMappings = [];       // {cc, name, value} for each knob
 let lastKnobSlot = -1;       // Track slot changes to refresh mappings
@@ -1041,7 +1105,9 @@ function scanForOvertakeModules() {
                     id: json.id || name,
                     name: json.name || name,
                     path: dirPath,
-                    uiPath: `${dirPath}/${json.ui || 'ui.js'}`
+                    uiPath: `${dirPath}/${json.ui || 'ui.js'}`,
+                    dsp: json.dsp || null,
+                    basePath: dirPath
                 });
             }
         } catch (e) {
@@ -1126,6 +1192,16 @@ let overtakeExitPending = false;
 
 /* Exit overtake mode back to Move */
 function exitOvertakeMode() {
+    /* Deactivate LED queue before cleanup - restores original move_midi_internal_send */
+    deactivateLedQueue();
+
+    /* Unload overtake DSP if loaded */
+    if (typeof shadow_set_param === "function") {
+        shadow_set_param(0, "overtake_dsp:unload", "1");
+    }
+    delete globalThis.host_module_set_param;
+    delete globalThis.host_module_get_param;
+
     overtakeModuleLoaded = false;
     overtakeModulePath = "";
     overtakeModuleCallbacks = null;
@@ -1174,6 +1250,10 @@ function loadOvertakeModule(moduleInfo) {
         hostVolumeKnobTouched = false;
         debugLog("loadOvertakeModule: escape state reset");
 
+        /* Activate LED queue before loading module - intercepts move_midi_internal_send
+         * to prevent SHM buffer flooding from modules that send many LEDs per tick */
+        activateLedQueue();
+
         /* Save current globals before loading - module may overwrite them */
         const savedInit = globalThis.init;
         const savedTick = globalThis.tick;
@@ -1183,14 +1263,44 @@ function loadOvertakeModule(moduleInfo) {
         setView(VIEWS.OVERTAKE_MODULE);
         needsRedraw = true;
 
-        /* Load the module's UI script */
+        /* Step 2: Load DSP plugin if the module has one (before JS load so params work) */
+        if (moduleInfo.dsp && typeof shadow_set_param === "function") {
+            const dspPath = moduleInfo.basePath + "/" + moduleInfo.dsp;
+            debugLog("loadOvertakeModule: loading DSP from " + dspPath);
+            shadow_set_param(0, "overtake_dsp:load", dspPath);
+        }
+
+        /* Step 3: Install host_module_set_param / host_module_get_param shims BEFORE
+         * loading the module JS. QuickJS ES modules resolve bare global identifiers at
+         * compile time — if the identifier doesn't exist on globalThis when the module
+         * is evaluated, it won't be found later even if added afterwards. */
+        globalThis.host_module_set_param = function(key, value) {
+            if (typeof shadow_set_param === "function") {
+                return shadow_set_param(0, "overtake_dsp:" + key, String(value));
+            }
+        };
+        globalThis.host_module_get_param = function(key) {
+            if (typeof shadow_get_param === "function") {
+                return shadow_get_param(0, "overtake_dsp:" + key);
+            }
+            return null;
+        };
+        debugLog("loadOvertakeModule: param shims installed");
+
+        /* Step 4: Load the module's UI script (after DSP + shims so module can use them) */
         debugLog("loadOvertakeModule: loading " + moduleInfo.uiPath);
         if (typeof shadow_load_ui_module === "function") {
             const result = shadow_load_ui_module(moduleInfo.uiPath);
             debugLog("loadOvertakeModule: shadow_load_ui_module returned " + result);
             if (!result) {
+                deactivateLedQueue();
                 overtakeModuleLoaded = false;
                 overtakeModuleCallbacks = null;
+                delete globalThis.host_module_set_param;
+                delete globalThis.host_module_get_param;
+                if (typeof shadow_set_param === "function") {
+                    shadow_set_param(0, "overtake_dsp:unload", "1");
+                }
                 if (typeof shadow_set_overtake_mode === "function") {
                     shadow_set_overtake_mode(0);
                 }
@@ -1198,10 +1308,13 @@ function loadOvertakeModule(moduleInfo) {
             }
         } else {
             debugLog("loadOvertakeModule: shadow_load_ui_module not available");
+            deactivateLedQueue();
+            delete globalThis.host_module_set_param;
+            delete globalThis.host_module_get_param;
             return false;
         }
 
-        /* Capture the module's callbacks */
+        /* Step 5: Capture the module's callbacks */
         overtakeModuleCallbacks = {
             init: (globalThis.init !== savedInit) ? globalThis.init : null,
             tick: (globalThis.tick !== savedTick) ? globalThis.tick : null,
@@ -1219,7 +1332,7 @@ function loadOvertakeModule(moduleInfo) {
 
         overtakeModuleLoaded = true;
 
-        /* Step 2: Defer init() call - LEDs will be cleared progressively during loading screen */
+        /* Step 6: Defer init() call - LEDs will be cleared progressively during loading screen */
         overtakeInitPending = true;
         overtakeInitTicks = 0;
         ledClearIndex = 0;  /* Start LED clearing from beginning */
@@ -1228,8 +1341,15 @@ function loadOvertakeModule(moduleInfo) {
         return true;
     } catch (e) {
         debugLog("loadOvertakeModule error: " + e);
+        deactivateLedQueue();
         overtakeModuleLoaded = false;
         overtakeModuleCallbacks = null;
+        /* Clean up DSP and param shims on error */
+        if (typeof shadow_set_param === "function") {
+            shadow_set_param(0, "overtake_dsp:unload", "1");
+        }
+        delete globalThis.host_module_set_param;
+        delete globalThis.host_module_get_param;
         if (typeof shadow_set_overtake_mode === "function") {
             shadow_set_overtake_mode(0);
         }
@@ -6751,6 +6871,7 @@ globalThis.tick = function() {
 
                     /* Clear LEDs in batches (buffer is small) */
                     const ledsCleared = clearLedBatch();
+                    flushLedQueue();  /* Drain queued LED clears to SHM */
                     debugLog("OVERTAKE init phase: ledsCleared=" + ledsCleared);
 
                     /* After LEDs cleared and delay passed, call init */
@@ -6768,6 +6889,7 @@ globalThis.tick = function() {
                                 exitOvertakeMode();
                             }
                         }
+                        flushLedQueue();  /* Drain any LEDs set during init() */
                     }
                 } else {
                     /* Call the overtake module's tick() function */
@@ -6780,6 +6902,7 @@ globalThis.tick = function() {
                             exitOvertakeMode();
                         }
                     }
+                    flushLedQueue();  /* Drain queued LED updates to SHM after module tick */
                 }
             } catch (e) {
                 debugLog("OVERTAKE_MODULE case EXCEPTION: " + e);

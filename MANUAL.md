@@ -194,6 +194,7 @@ When selection a Module, "[Get more...]" will open the Module Store to download 
 - **SF2** - SoundFont player
 - **Mini-JV** - Roland JV-880 emulation
 - **OB-Xd** - Oberheim-style virtual analog
+- **Webstream** - Web audio search and streaming
 
 **Audio Effects:**
 - **CloudSeed** - Shimmer reverb
