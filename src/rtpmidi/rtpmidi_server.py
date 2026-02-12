@@ -536,6 +536,22 @@ def main():
     # Line-buffer stdout
     sys.stdout.reconfigure(line_buffering=True)
 
+    # Kill any existing rtpmidi_server instances before starting
+    my_pid = os.getpid()
+    try:
+        import subprocess
+        result = subprocess.run(['pgrep', '-f', 'rtpmidi_server'],
+                                capture_output=True, text=True, timeout=5)
+        for line in result.stdout.strip().split('\n'):
+            if line.strip():
+                pid = int(line.strip())
+                if pid != my_pid:
+                    print(f"rtpmidi: killing existing instance pid={pid}")
+                    os.kill(pid, signal.SIGTERM)
+        time.sleep(0.3)
+    except Exception:
+        pass
+
     print(f"rtpmidi: starting RTP-MIDI daemon ({service_name})")
 
     signal.signal(signal.SIGINT, signal_handler)
@@ -585,6 +601,7 @@ def main():
                     session.handle_control(control_sock, data, addr)
                 else:
                     # Data port: could be AppleMIDI or RTP-MIDI
+                    print(f"rtpmidi: data port recv {len(data)} bytes from {addr[0]}")
                     result = parse_midi_commands(data, shm)
                     if result is not None:
                         # Was an AppleMIDI command on data port

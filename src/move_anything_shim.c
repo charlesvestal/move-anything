@@ -2469,7 +2469,16 @@ static void rtpmidi_start(void) {
         return;
     }
     if (pid == 0) {
-        /* Child - exec the Python daemon */
+        /* Child - redirect stdout/stderr to log file, then exec daemon.
+         * The daemon's kill-existing-instances logic handles stale processes. */
+        int logfd = open("/data/UserData/move-anything/rtpmidi.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (logfd >= 0) {
+            dup2(logfd, STDOUT_FILENO);
+            dup2(logfd, STDERR_FILENO);
+            close(logfd);
+        }
+        /* Set PYTHONUNBUFFERED for real-time log output */
+        setenv("PYTHONUNBUFFERED", "1", 1);
         execl("/usr/bin/python3", "python3",
               "/data/UserData/move-anything/rtpmidi_server.py",
               (char *)NULL);
@@ -6428,19 +6437,8 @@ static void shadow_drain_ui_midi_dsp(void) {
     memset(shadow_midi_dsp_shm->buffer, 0, SHADOW_MIDI_DSP_BUFFER_SIZE);
 }
 
-/* Inject RTP-MIDI packets into shadow_mailbox MIDI_IN region.
- * Called after hardware MIDI_IN has been copied to shadow_mailbox,
- * so we merge wireless MIDI alongside wired USB MIDI.
- *
- * Takes a local snapshot of the shm buffer to avoid races with
- * the daemon writer, then clears the shm immediately so the
- * daemon can continue writing new data. */
-static void shadow_inject_rtp_midi(void) {
-    /* RTP-MIDI injection now happens inside shadow_forward_midi() to route
-     * packets directly to shadow_midi_shm and avoid writing cable-2 data
-     * into Move's mailbox (which causes SIGABRT without a USB device). */
-    (void)0;
-}
+/* RTP-MIDI injection happens inline in the post-ioctl MIDI_IN rebuild.
+ * See the "MIDI_IN: Position-preserving copy" section in the ioctl handler. */
 
 /* Check for and send screen reader announcements via D-Bus */
 static void shadow_check_screenreader_announcements(void) {
@@ -6893,36 +6891,6 @@ static void shadow_filter_move_input(void)
         /* Pass through all other MIDI (aftertouch, pitch bend, etc.) */
     }
 
-    /* Inject RTP-MIDI packets from the wireless daemon into shadow_ui_midi_shm.
-     * This is the same buffer that shadow_ui.c reads, which routes MIDI to
-     * the chain host for sound production.  Packets use cable 2 (external MIDI)
-     * so they appear identical to USB MIDI input. */
-    if (shadow_rtp_midi_shm && shadow_ui_midi_shm &&
-        shadow_rtp_midi_shm->ready != last_shadow_rtp_midi_ready) {
-        last_shadow_rtp_midi_ready = shadow_rtp_midi_shm->ready;
-
-        uint16_t rtp_count = shadow_rtp_midi_shm->write_idx;
-        if (rtp_count > SHADOW_RTP_MIDI_BUFFER_SIZE)
-            rtp_count = SHADOW_RTP_MIDI_BUFFER_SIZE;
-
-        uint8_t rtp_buf[SHADOW_RTP_MIDI_BUFFER_SIZE];
-        memcpy(rtp_buf, (const void *)shadow_rtp_midi_shm->buffer, rtp_count);
-        shadow_rtp_midi_shm->write_idx = 0;
-
-        for (int r = 0; r + 3 < (int)rtp_count; r += 4) {
-            uint8_t cin = rtp_buf[r] & 0x0F;
-            if (cin < 0x08 || cin > 0x0E) continue;
-
-            /* Find empty slot in UI MIDI buffer */
-            for (int slot = 0; slot < MIDI_BUFFER_SIZE; slot += 4) {
-                if (shadow_ui_midi_shm[slot] == 0) {
-                    memcpy(&shadow_ui_midi_shm[slot], &rtp_buf[r], 4);
-                    shadow_control->midi_ready++;
-                    break;
-                }
-            }
-        }
-    }
 }
 
 static int is_usb_midi_data(uint8_t cin)
@@ -8167,10 +8135,11 @@ do_ioctl:
     shadow_check_screenreader_announcements();
 
     /* === SHADOW MAILBOX SYNC (PRE-IOCTL) ===
-     * Copy shadow mailbox to hardware before ioctl.
-     * Move has been writing to shadow_mailbox; now we send that to hardware. */
+     * Copy Move→hardware regions only (MIDI_OUT, AUDIO_OUT, DISPLAY).
+     * MIDI_IN and AUDIO_IN are hardware→CPU (filled by DMA during ioctl)
+     * and must NOT be written back — doing so corrupts the SPI interface. */
     if (hardware_mmap_addr) {
-        memcpy(hardware_mmap_addr, shadow_mailbox, MAILBOX_SIZE);
+        memcpy(hardware_mmap_addr, shadow_mailbox, MIDI_IN_OFFSET);
     }
 
     /* === HARDWARE TRANSACTION === */
@@ -8202,72 +8171,133 @@ do_ioctl:
             skipback_capture((int16_t *)(hardware_mmap_addr + AUDIO_IN_OFFSET));
         }
 
-        /* Copy MIDI_IN with filtering when in shadow display mode */
+        /* === MIDI_IN: Position-preserving copy with filtering + RTP injection ===
+         *
+         * Move reads MIDI_IN from shadow_mailbox (intercepted via LD_PRELOAD).
+         * Events are 4-byte USB-MIDI packets at fixed positions in the 256-byte buffer.
+         *
+         * Shadow mode: zero buffer, copy valid events AT ORIGINAL POSITIONS,
+         *   filtering junk cables and shadow-intercepted controls.
+         *   Filtered slots become zeros (empty), preserving buffer layout.
+         * Normal mode: straight memcpy (no filtering needed).
+         *
+         * RTP-MIDI events are appended after the last hardware event.
+         * Rate-limited to 8/tick to avoid SIGABRT from MIDI processing overload. */
         uint8_t *hw_midi = hardware_mmap_addr + MIDI_IN_OFFSET;
         uint8_t *sh_midi = shadow_mailbox + MIDI_IN_OFFSET;
         int overtake_mode = shadow_control ? shadow_control->overtake_mode : 0;
+        int sh_end = 0;  /* Offset just past the last non-zero slot */
 
         if (shadow_display_mode && shadow_control) {
-            /* Filter MIDI_IN: zero out jog/back/knobs */
+            /* Position-preserving filter: zero the buffer, then copy valid
+             * events back at their original positions. This preserves the
+             * layout Move's firmware expects. */
+            memset(sh_midi, 0, MIDI_BUFFER_SIZE);
             for (int j = 0; j < MIDI_BUFFER_SIZE; j += 4) {
                 uint8_t cin = hw_midi[j] & 0x0F;
                 uint8_t cable = (hw_midi[j] >> 4) & 0x0F;
-                uint8_t status = hw_midi[j + 1];
-                uint8_t type = status & 0xF0;
-                uint8_t d1 = hw_midi[j + 2];
+
+                if (cin < 0x04 || cin > 0x0E) continue;
+                if (cable != 0x00 && cable != 0x02) continue;
 
                 int filter = 0;
-
-                /* Only filter internal cable (0x00) */
                 if (cable == 0x00) {
-                    /* In overtake mode, filter ALL cable 0 events from Move */
+                    uint8_t status = hw_midi[j + 1];
+                    uint8_t type = status & 0xF0;
+                    uint8_t d1 = hw_midi[j + 2];
                     if (overtake_mode) {
                         filter = 1;
                     } else {
-                        /* CC messages: filter jog/back controls (let up/down through for octave) */
                         if (cin == 0x0B && type == 0xB0) {
-                            if (d1 == CC_JOG_WHEEL || d1 == CC_JOG_CLICK || d1 == CC_BACK) {
+                            if (d1 == CC_JOG_WHEEL || d1 == CC_JOG_CLICK || d1 == CC_BACK)
                                 filter = 1;
-                            }
-                            /* Filter knob CCs when shift held */
-                            if (d1 >= CC_KNOB1 && d1 <= CC_KNOB8) {
+                            if (d1 >= CC_KNOB1 && d1 <= CC_KNOB8)
                                 filter = 1;
-                            }
-                            /* Filter Menu and Jog Click CCs when Shift+Volume shortcut is active */
-                            if ((d1 == CC_MENU || d1 == CC_JOG_CLICK) && shadow_shift_held && shadow_volume_knob_touched) {
+                            if ((d1 == CC_MENU || d1 == CC_JOG_CLICK) && shadow_shift_held && shadow_volume_knob_touched)
                                 filter = 1;
-                            }
                         }
-                        /* Note messages: filter knob touches (0-9) */
                         if ((cin == 0x09 || cin == 0x08) && (type == 0x90 || type == 0x80)) {
-                            if (d1 <= 9) {
+                            if (d1 <= 9)
                                 filter = 1;
-                            }
                         }
                     }
                 }
 
-                if (filter) {
-                    /* Zero the event in shadow buffer */
-                    sh_midi[j] = 0;
-                    sh_midi[j + 1] = 0;
-                    sh_midi[j + 2] = 0;
-                    sh_midi[j + 3] = 0;
-                } else {
-                    /* Copy event as-is */
-                    sh_midi[j] = hw_midi[j];
+                if (!filter) {
+                    /* Copy at ORIGINAL position — no compacting */
+                    sh_midi[j]     = hw_midi[j];
                     sh_midi[j + 1] = hw_midi[j + 1];
                     sh_midi[j + 2] = hw_midi[j + 2];
                     sh_midi[j + 3] = hw_midi[j + 3];
+                    sh_end = j + 4;
                 }
             }
         } else {
-            /* Not in shadow mode - copy MIDI_IN directly */
+            /* Normal mode: straight copy, preserve Move's buffer exactly.
+             * Find sh_end by scanning FORWARD for the first slot with an
+             * invalid USB-MIDI CIN. The SPI fills trailing bytes with junk
+             * (non-zero but not valid MIDI), so backward scan would always
+             * find sh_end near 252, leaving no room for RTP injection. */
             memcpy(sh_midi, hw_midi, MIDI_BUFFER_SIZE);
+            sh_end = 0;
+            for (int j = 0; j < MIDI_BUFFER_SIZE; j += 4) {
+                uint8_t cin = sh_midi[j] & 0x0F;
+                if (cin >= 0x04 && cin <= 0x0E) {
+                    sh_end = j + 4;
+                } else {
+                    break;  /* First non-MIDI slot = end of real events */
+                }
+            }
         }
 
-        /* Inject any RTP-MIDI packets into MIDI_IN */
-        shadow_inject_rtp_midi();
+        /* Drain RTP-MIDI SHM: snapshot + clear atomically, then inject.
+         * Rate-limited to 8 events/tick (at 344Hz ≈ 2752 events/sec). */
+        if (shadow_rtp_midi_shm) {
+            uint16_t rtp_count = shadow_rtp_midi_shm->write_idx;
+            if (rtp_count > 0) {
+                if (rtp_count > SHADOW_RTP_MIDI_BUFFER_SIZE)
+                    rtp_count = SHADOW_RTP_MIDI_BUFFER_SIZE;
+                uint8_t rtp_buf[SHADOW_RTP_MIDI_BUFFER_SIZE];
+                memcpy(rtp_buf, (const void *)shadow_rtp_midi_shm->buffer, rtp_count);
+                shadow_rtp_midi_shm->write_idx = 0;
+
+                int rtp_injected = 0;
+                const int RTP_MAX_PER_TICK = 8;
+
+                for (int r = 0; r + 3 < (int)rtp_count; r += 4) {
+                    uint8_t cin = rtp_buf[r] & 0x0F;
+                    if (cin < 0x08 || cin > 0x0E) continue;
+                    if (rtp_injected >= RTP_MAX_PER_TICK) break;
+
+                    /* 1) Inject into shadow MIDI_IN as cable 2 (external USB MIDI).
+                     * This is what Move expects for external MIDI input.
+                     * Cable 0 = internal hardware controls — NEVER use for RTP
+                     * as it causes Move to interpret notes/CCs as pad/knob events. */
+                    if (sh_end < MIDI_BUFFER_SIZE) {
+                        memcpy(&sh_midi[sh_end], &rtp_buf[r], 4);
+                        sh_end += 4;
+                    }
+
+                    /* 2) Inject into shadow_ui_midi_shm — this is the path
+                     * shadow_ui.js reads and routes to the chain host for
+                     * sound production. Without this, shadow synths never
+                     * receive the MIDI. */
+                    if (shadow_ui_midi_shm && shadow_control) {
+                        for (int slot = 0; slot < MIDI_BUFFER_SIZE; slot += 4) {
+                            if (shadow_ui_midi_shm[slot] == 0) {
+                                memcpy(&shadow_ui_midi_shm[slot], &rtp_buf[r], 4);
+                                shadow_control->midi_ready++;
+                                break;
+                            }
+                        }
+                    }
+
+                    rtp_injected++;
+                }
+
+            }
+        }
+
 
         /* === SHIFT+MENU SHORTCUT DETECTION AND BLOCKING (POST-IOCTL) ===
          * Scan hardware MIDI_IN for Shift+Menu, perform action, and block from reaching Move.
@@ -8721,9 +8751,12 @@ do_ioctl:
         for (int j = 0; j < MIDI_BUFFER_SIZE; j += 4) {
             uint8_t cin = src[j] & 0x0F;
             uint8_t cable = (src[j] >> 4) & 0x0F;
-            /* In overtake mode, allow sysex (CIN 0x04-0x07) and normal messages (0x08-0x0E) */
+            /* In overtake mode, allow sysex (CIN 0x04-0x07) and normal messages (0x08-0x0E)
+             * but only from valid cables: 0 (internal Move) and 2 (external USB MIDI).
+             * Other cables (1, 3, 5, 15 etc.) are hardware junk. */
             if (overtake_mode) {
                 if (cin < 0x04 || cin > 0x0E) continue;
+                if (cable != 0x00 && cable != 0x02) continue;
             } else {
                 if (cin < 0x08 || cin > 0x0E) continue;
                 if (cable != 0x00) continue;  /* Only internal cable 0 (Move hardware) */
