@@ -2053,6 +2053,7 @@ static void link_audio_parse_session(const uint8_t *pkt, size_t len,
                                      int sockfd, const struct sockaddr *dest,
                                      socklen_t addrlen);
 static void link_audio_intercept_audio(const uint8_t *pkt);
+static void link_audio_start_keepalive(void);
 static void *link_audio_publisher_thread(void *arg);
 static void link_audio_start_publisher(void);
 
@@ -2349,6 +2350,13 @@ static void link_audio_intercept_audio(const uint8_t *pkt)
     ch->sequence = link_audio_read_u32_be(pkt + 44);
 
     link_audio.packets_intercepted++;
+
+    /* Start keepalive thread once we've received enough packets.
+     * This must happen while the link-subscriber is still alive so there's
+     * overlap — the subscriber will exit ~3s after audio starts flowing. */
+    if (!link_audio.keepalive_running && link_audio.packets_intercepted >= 10) {
+        link_audio_start_keepalive();
+    }
 }
 
 /* Read from a Move channel's ring buffer (called from consumer thread) */
@@ -2387,6 +2395,159 @@ static int link_audio_read_channel(int idx, int16_t *out, int frames)
     __sync_synchronize();
     ch->read_pos = rp;
     return 1;
+}
+
+/* ---- ChannelRequest keepalive (replaces subscriber after bootstrap) ---- */
+
+/* Read subscriber's PeerID from file (hex-encoded, 16 chars) */
+static int link_audio_load_subscriber_peer_id(void)
+{
+    if (link_audio.subscriber_peer_id_loaded) return 1;
+
+    FILE *f = fopen("/data/UserData/move-anything/link-subscriber-peer-id", "r");
+    if (!f) return 0;
+
+    char hex[32];
+    if (!fgets(hex, sizeof(hex), f)) {
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+
+    /* Parse 16 hex chars → 8 bytes */
+    for (int i = 0; i < 8; i++) {
+        unsigned int byte;
+        if (sscanf(hex + i * 2, "%2x", &byte) != 1) return 0;
+        link_audio.subscriber_peer_id[i] = (uint8_t)byte;
+    }
+
+    link_audio.subscriber_peer_id_loaded = 1;
+    char logbuf[128];
+    snprintf(logbuf, sizeof(logbuf),
+             "Link Audio: loaded subscriber peer ID %02x%02x%02x%02x%02x%02x%02x%02x",
+             link_audio.subscriber_peer_id[0], link_audio.subscriber_peer_id[1],
+             link_audio.subscriber_peer_id[2], link_audio.subscriber_peer_id[3],
+             link_audio.subscriber_peer_id[4], link_audio.subscriber_peer_id[5],
+             link_audio.subscriber_peer_id[6], link_audio.subscriber_peer_id[7]);
+    shadow_log(logbuf);
+    return 1;
+}
+
+/* Build a 36-byte ChannelRequest packet (chnnlsv v1 wire format) */
+static void link_audio_build_channel_request(uint8_t *pkt,
+                                              const uint8_t *peer_id,
+                                              const uint8_t *channel_id)
+{
+    /* Protocol header: "chnnlsv" + version 1 */
+    memcpy(pkt, LINK_AUDIO_MAGIC, LINK_AUDIO_MAGIC_LEN);
+    pkt[7] = LINK_AUDIO_VERSION;
+
+    /* Message header */
+    pkt[8] = LINK_AUDIO_MSG_REQUEST;   /* msg_type = 4 (ChannelRequest) */
+    pkt[9] = 5;                         /* TTL = 5 seconds */
+    pkt[10] = 0;                        /* GroupId high = 0 */
+    pkt[11] = 0;                        /* GroupId low = 0 */
+
+    /* NodeId (our peer ID, same as subscriber's) */
+    memcpy(pkt + 12, peer_id, 8);
+
+    /* Payload: ChannelId entry (tag + size + data) */
+    pkt[20] = 'c'; pkt[21] = 'h'; pkt[22] = 'i'; pkt[23] = 'd';  /* key = "chid" */
+    link_audio_write_u32_be(pkt + 24, 8);                           /* size = 8 bytes */
+    memcpy(pkt + 28, channel_id, 8);                                /* channel ID */
+}
+
+#define LINK_AUDIO_CHANNEL_REQUEST_SIZE 36
+#define LINK_AUDIO_KEEPALIVE_INTERVAL_MS 2000
+
+/* Keepalive thread: sends raw ChannelRequest packets to Move's chnnlsv socket */
+static void *link_audio_keepalive_thread(void *arg)
+{
+    (void)arg;
+
+    shadow_log("Link Audio: keepalive thread started");
+
+    /* Destination: Move's own chnnlsv listening address.
+     * Audio will be sent back to our socket, but the sendto() hook
+     * intercepts it before it reaches the network. */
+    struct sockaddr_in6 dest_addr;
+    memcpy(&dest_addr, &link_audio.move_local_addr, sizeof(dest_addr));
+
+    uint8_t pkt[LINK_AUDIO_CHANNEL_REQUEST_SIZE];
+    uint32_t iteration = 0;
+
+    while (link_audio.keepalive_running && link_audio.enabled) {
+        /* Sleep between heartbeats */
+        struct timespec ts = {LINK_AUDIO_KEEPALIVE_INTERVAL_MS / 1000,
+                              (LINK_AUDIO_KEEPALIVE_INTERVAL_MS % 1000) * 1000000L};
+        nanosleep(&ts, NULL);
+        iteration++;
+
+        /* Send ChannelRequest for each discovered Move channel */
+        for (int i = 0; i < link_audio.move_channel_count; i++) {
+            if (!link_audio.channels[i].active) continue;
+
+            link_audio_build_channel_request(pkt,
+                                              link_audio.subscriber_peer_id,
+                                              link_audio.channels[i].channel_id);
+
+            /* Use real_sendto to bypass our sendto() hook */
+            real_sendto(link_audio.keepalive_socket_fd, pkt,
+                        LINK_AUDIO_CHANNEL_REQUEST_SIZE, 0,
+                        (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+        }
+
+        /* Log periodically */
+        if (iteration % 30 == 0) {
+            char logbuf[128];
+            snprintf(logbuf, sizeof(logbuf),
+                     "Link Audio: keepalive sent %d channel requests (iter %u)",
+                     link_audio.move_channel_count, iteration);
+            shadow_log(logbuf);
+        }
+    }
+
+    close(link_audio.keepalive_socket_fd);
+    link_audio.keepalive_socket_fd = -1;
+    shadow_log("Link Audio: keepalive thread exited");
+    return NULL;
+}
+
+static void link_audio_start_keepalive(void)
+{
+    if (link_audio.keepalive_running) return;
+    if (!link_audio.subscriber_peer_id_loaded) {
+        if (!link_audio_load_subscriber_peer_id()) {
+            shadow_log("Link Audio: keepalive deferred (no subscriber peer ID yet)");
+            return;
+        }
+    }
+    if (link_audio.move_channel_count == 0) {
+        shadow_log("Link Audio: keepalive deferred (no channels discovered)");
+        return;
+    }
+
+    /* Create UDP socket for sending ChannelRequests */
+    link_audio.keepalive_socket_fd = socket(AF_INET6, SOCK_DGRAM, 0);
+    if (link_audio.keepalive_socket_fd < 0) {
+        shadow_log("Link Audio: keepalive failed to create socket");
+        return;
+    }
+
+    /* Bind to ephemeral port */
+    struct sockaddr_in6 bind_addr;
+    memset(&bind_addr, 0, sizeof(bind_addr));
+    bind_addr.sin6_family = AF_INET6;
+    bind_addr.sin6_addr = in6addr_any;
+    bind_addr.sin6_port = 0;
+    bind(link_audio.keepalive_socket_fd, (struct sockaddr *)&bind_addr,
+         sizeof(bind_addr));
+
+    link_audio.keepalive_running = 1;
+    pthread_create(&link_audio.keepalive_thread, NULL,
+                   link_audio_keepalive_thread, NULL);
+
+    shadow_log("Link Audio: keepalive thread launched");
 }
 
 /* ---- Shadow audio publisher ---- */
