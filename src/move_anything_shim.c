@@ -1262,6 +1262,14 @@ static volatile int native_bridge_split_valid = 0;
 static volatile float native_bridge_makeup_desired_gain = 1.0f;
 static volatile float native_bridge_makeup_applied_gain = 1.0f;
 static volatile int native_bridge_makeup_limited = 0;
+/* Raw hardware AUDIO_IN saved before bridge overwrites it.
+ * Exposed to sub-plugins (e.g. linein) via host_api_v1_t.raw_audio_in
+ * so they read actual hardware input instead of bridge content. */
+static int16_t raw_audio_in_buffer[FRAMES_PER_BLOCK * 2];
+/* Set in mix_from_buffer when Link Audio zero-rebuild was used.
+ * Tells the bridge makeup to use the snapshot path (clean rebuilt audio)
+ * instead of the split-component path (which has monitoring contamination). */
+static volatile int native_bridge_la_rebuilt = 0;
 
 static int shadow_read_global_volume_from_settings(float *linear_out, float *db_out);
 
@@ -1518,7 +1526,7 @@ static void native_resample_bridge_apply_overwrite_makeup(const int16_t *src,
      * 20× = +26dB. */
     float max_makeup = 20.0f;
 
-    if (!shadow_master_fx_chain_active() && native_bridge_split_valid) {
+    if (!shadow_master_fx_chain_active() && native_bridge_split_valid && !native_bridge_la_rebuilt) {
         /* Component compensation for no-MFX case */
         float native_gain = (inv_mv < max_makeup) ? inv_mv : max_makeup;
         int limiter_hit = 0;
@@ -1535,11 +1543,12 @@ static void native_resample_bridge_apply_overwrite_makeup(const int16_t *src,
         native_bridge_makeup_desired_gain = inv_mv;
         native_bridge_makeup_applied_gain = native_gain;
         native_bridge_makeup_limited = limiter_hit;
-    } else if (shadow_master_fx_chain_active()) {
-        /* MFX-active case: snapshot is already post-FX.
-         * Compensate by inverse master volume so playback through Move's
-         * master volume lands at live level, then cap by available headroom
-         * to avoid hard clipping. */
+    } else if (shadow_master_fx_chain_active() || native_bridge_la_rebuilt) {
+        /* MFX-active or Link Audio zero-rebuild case: snapshot is already
+         * post-FX (or rebuilt from clean LA data, free of monitoring
+         * contamination).  Compensate by inverse master volume so playback
+         * through Move's master volume lands at live level, then cap by
+         * available headroom to avoid hard clipping. */
         float applied_gain = (inv_mv < max_makeup) ? inv_mv : max_makeup;
         float peak = 0.0f;
         for (size_t i = 0; i < samples; i++) {
@@ -5194,6 +5203,7 @@ static int shadow_inprocess_load_chain(void) {
     shadow_host_api.audio_out_offset = MOVE_AUDIO_OUT_OFFSET;
     shadow_host_api.audio_in_offset = MOVE_AUDIO_IN_OFFSET;
     shadow_host_api.log = shadow_log;
+    shadow_host_api.raw_audio_in = raw_audio_in_buffer;
 
     move_plugin_init_v2_fn init_v2 = (move_plugin_init_v2_fn)dlsym(
         shadow_dsp_handle, MOVE_PLUGIN_INIT_V2_SYMBOL);
@@ -6712,6 +6722,7 @@ static void shadow_overtake_dsp_load(const char *path) {
     overtake_host_api.audio_out_offset = MOVE_AUDIO_OUT_OFFSET;
     overtake_host_api.audio_in_offset = MOVE_AUDIO_IN_OFFSET;
     overtake_host_api.log = shadow_log;
+    overtake_host_api.raw_audio_in = raw_audio_in_buffer;
     overtake_host_api.midi_send_internal = overtake_midi_send_internal;
     overtake_host_api.midi_send_external = overtake_midi_send_external;
 
@@ -6931,6 +6942,7 @@ static void shadow_inprocess_mix_from_buffer(void) {
     int rebuild_from_la = (link_audio.enabled && shadow_chain_process_fx &&
                            link_audio.move_channel_count >= 4 &&
                            la_receiving);
+    native_bridge_la_rebuilt = rebuild_from_la;
 
     if (rebuild_from_la) {
         /* Zero the mailbox — all audio reconstructed from Link Audio */
@@ -9582,6 +9594,13 @@ do_ioctl:
                MIDI_IN_OFFSET - DISPLAY_OFFSET);     /* DISPLAY: 768-2047 */
         memcpy(shadow_mailbox + AUDIO_IN_OFFSET, hardware_mmap_addr + AUDIO_IN_OFFSET,
                MAILBOX_SIZE - AUDIO_IN_OFFSET);      /* AUDIO_IN: 2304-4095 */
+
+        /* Save raw hardware AUDIO_IN before bridge overwrites it.
+         * Sub-plugins (e.g. linein) read from raw_audio_in_buffer via
+         * host_api_v1_t.raw_audio_in to avoid feeding back on bridge content. */
+        memcpy(raw_audio_in_buffer,
+               shadow_mailbox + AUDIO_IN_OFFSET,
+               FRAMES_PER_BLOCK * 2 * sizeof(int16_t));
 
         /* Bridge Move Everything's total mix into native resampling path when selected. */
         native_resample_bridge_apply();
