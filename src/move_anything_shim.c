@@ -1527,22 +1527,18 @@ static void native_resample_bridge_apply_overwrite_makeup(const int16_t *src,
     float max_makeup = 20.0f;
 
     if (!shadow_master_fx_chain_active() && native_bridge_split_valid && !native_bridge_la_rebuilt) {
-        /* Component compensation for no-MFX case */
-        float native_gain = (inv_mv < max_makeup) ? inv_mv : max_makeup;
-        int limiter_hit = 0;
-
+        /* ME-only bridge: skip move_component to prevent monitoring feedback.
+         * Move's AUDIO_OUT may contain monitoring of previous bridge content;
+         * including move_component here creates a compounding feedback loop.
+         * ME component is clean (rendered from raw_audio_in for linein, or
+         * from MIDI-driven synths which don't read AUDIO_IN). */
         for (size_t i = 0; i < samples; i++) {
-            float move_scaled = (float)native_bridge_move_component[i] * native_gain;
-            float me = (float)native_bridge_me_component[i];
-            float sum = move_scaled + me;
-            if (sum > 32767.0f) { sum = 32767.0f; limiter_hit = 1; }
-            if (sum < -32768.0f) { sum = -32768.0f; limiter_hit = 1; }
-            dst[i] = (int16_t)lroundf(sum);
+            dst[i] = native_bridge_me_component[i];
         }
 
-        native_bridge_makeup_desired_gain = inv_mv;
-        native_bridge_makeup_applied_gain = native_gain;
-        native_bridge_makeup_limited = limiter_hit;
+        native_bridge_makeup_desired_gain = 1.0f;
+        native_bridge_makeup_applied_gain = 1.0f;
+        native_bridge_makeup_limited = 0;
     } else if (shadow_master_fx_chain_active() || native_bridge_la_rebuilt) {
         /* MFX-active or Link Audio zero-rebuild case: snapshot is already
          * post-FX (or rebuilt from clean LA data, free of monitoring
@@ -7060,10 +7056,17 @@ static void shadow_inprocess_mix_from_buffer(void) {
         }
     }
 
-    /* Capture native bridge source AFTER master FX, BEFORE master volume.
-     * This bakes master FX into native bridge resampling while keeping
-     * capture independent of master-volume attenuation. */
-    native_capture_total_mix_snapshot_from_buffer(mailbox_audio);
+    /* Capture native bridge source for resampling.
+     * With LA: mailbox was zeroed and rebuilt from clean per-track data, so
+     * capture the full mix (includes MFX, free of monitoring contamination).
+     * Without LA: mailbox contains Move's AUDIO_OUT which may include
+     * monitoring of previous bridge content.  Use ME-only (pre-MFX) to
+     * prevent the monitoring feedback loop from compounding. */
+    if (rebuild_from_la) {
+        native_capture_total_mix_snapshot_from_buffer(mailbox_audio);
+    } else {
+        native_capture_total_mix_snapshot_from_buffer(native_bridge_me_component);
+    }
 
     /* Capture audio for sampler BEFORE master volume scaling (Resample source only) */
     if (sampler_source == SAMPLER_SOURCE_RESAMPLE) {
