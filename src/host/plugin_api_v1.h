@@ -51,6 +51,14 @@ typedef struct host_api_v1 {
     int (*midi_send_internal)(const uint8_t *msg, int len);
     int (*midi_send_external)(const uint8_t *msg, int len);
 
+    /* Raw hardware audio input (pre-bridge).
+     * Points to a buffer with MOVE_FRAMES_PER_BLOCK stereo frames of raw
+     * hardware AUDIO_IN, captured before the native resample bridge overwrites
+     * the mailbox AUDIO_IN region.  Plugins that need the actual hardware input
+     * (e.g. line-in) should read from this instead of mapped_memory+audio_in_offset
+     * to avoid feeding back on bridge content.  May be NULL if not available. */
+    int16_t *raw_audio_in;
+
 } host_api_v1_t;
 
 /*
