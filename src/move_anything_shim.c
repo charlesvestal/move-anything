@@ -2157,22 +2157,48 @@ static void link_audio_parse_session(const uint8_t *pkt, size_t len,
     memcpy(link_audio.move_peer_id, pkt + 12, 8);
 
     /* Capture network info for self-subscriber (first time only).
-     * We're on the audio thread here, so the socket fd is valid for getsockname. */
-    if (!link_audio.addr_captured && dest && dest->sa_family == AF_INET6) {
+     * We're on the audio thread here, so the socket fd is valid for getsockname.
+     * In standalone mode (no Live), dest may be IPv4 loopback — we handle both
+     * IPv4 and IPv6 by promoting IPv4 to IPv4-mapped-IPv6 if needed. */
+    if (!link_audio.addr_captured && dest) {
         link_audio.move_socket_fd = sockfd;
-        memcpy(&link_audio.move_addr, dest, sizeof(struct sockaddr_in6));
+        if (dest->sa_family == AF_INET6) {
+            memcpy(&link_audio.move_addr, dest, sizeof(struct sockaddr_in6));
+        }
         link_audio.move_addrlen = addrlen;
 
-        /* Capture Move's own local address via getsockname (valid on audio thread).
-         * The local port from getsockname IS Move's listening port — do NOT
-         * overwrite it with the destination port (that's the peer's port). */
-        socklen_t local_len = sizeof(link_audio.move_local_addr);
-        if (getsockname(sockfd, (struct sockaddr *)&link_audio.move_local_addr,
-                        &local_len) == 0) {
-            /* Keep the port from getsockname — it's Move's bound/listening port */
+        /* Capture Move's own local address via getsockname.
+         * The local port IS Move's listening port for chnnlsv. */
+        struct sockaddr_storage local_ss;
+        socklen_t local_len = sizeof(local_ss);
+        if (getsockname(sockfd, (struct sockaddr *)&local_ss, &local_len) != 0) {
+            char logbuf[128];
+            snprintf(logbuf, sizeof(logbuf),
+                     "Link Audio: getsockname failed (errno=%d)", errno);
+            shadow_log(logbuf);
+            return;
+        }
+
+        if (local_ss.ss_family == AF_INET6) {
+            memcpy(&link_audio.move_local_addr, &local_ss, sizeof(struct sockaddr_in6));
+        } else if (local_ss.ss_family == AF_INET) {
+            /* Promote IPv4 to IPv4-mapped-IPv6 for the keepalive sender */
+            struct sockaddr_in *in4 = (struct sockaddr_in *)&local_ss;
+            memset(&link_audio.move_local_addr, 0, sizeof(link_audio.move_local_addr));
+            link_audio.move_local_addr.sin6_family = AF_INET6;
+            link_audio.move_local_addr.sin6_port = in4->sin_port;
+            /* ::ffff:a.b.c.d */
+            memset(&link_audio.move_local_addr.sin6_addr.s6_addr[10], 0xff, 2);
+            memcpy(&link_audio.move_local_addr.sin6_addr.s6_addr[12],
+                   &in4->sin_addr, 4);
+            char logbuf[128];
+            snprintf(logbuf, sizeof(logbuf),
+                     "Link Audio: promoted IPv4 local addr to v6-mapped, port=%d",
+                     ntohs(in4->sin_port));
+            shadow_log(logbuf);
         } else {
-            /* Fallback: copy dest addr (better than nothing) */
-            memcpy(&link_audio.move_local_addr, dest, sizeof(struct sockaddr_in6));
+            shadow_log("Link Audio: getsockname returned unknown family");
+            return;
         }
 
         link_audio.addr_captured = 1;
@@ -2562,6 +2588,48 @@ static void link_audio_start_keepalive(void)
                    link_audio_keepalive_thread, NULL);
 
     shadow_log("Link Audio: keepalive thread launched");
+}
+
+/* ---- Subscriber transport signaling ---- */
+
+static volatile pid_t link_audio_subscriber_pid = 0;
+/* Delayed re-enable: set to N ioctl blocks when MIDI Start detected.
+ * Decremented each ioctl; when it hits 0, SIGUSR2 is sent.
+ * 700 blocks × ~2.9ms/block ≈ 2 seconds after Play. */
+static volatile int link_audio_reenable_countdown = 0;
+#define LINK_AUDIO_REENABLE_BLOCKS 700
+
+/* Read subscriber PID from file (written by link-subscriber on startup) */
+static pid_t link_audio_read_subscriber_pid(void)
+{
+    FILE *f = fopen("/data/UserData/move-anything/link-subscriber-pid", "r");
+    if (!f) return 0;
+    int pid = 0;
+    fscanf(f, "%d", &pid);
+    fclose(f);
+    return (pid_t)pid;
+}
+
+/* Signal subscriber to disable Link (transport stopped → numPeers drops to 0) */
+static void link_audio_signal_transport_stop(void)
+{
+    if (!link_audio.enabled) return;
+    /* Remove enable flag if pending, create disable flag */
+    unlink("/data/UserData/move-anything/link-subscriber-enable");
+    FILE *f = fopen("/data/UserData/move-anything/link-subscriber-disable", "w");
+    if (f) fclose(f);
+    shadow_log("Link Audio: created disable flag (transport stopped)");
+}
+
+/* Signal subscriber to re-enable Link (transport started → audio resumes) */
+static void link_audio_signal_transport_start(void)
+{
+    if (!link_audio.enabled) return;
+    /* Remove disable flag if pending, create enable flag */
+    unlink("/data/UserData/move-anything/link-subscriber-disable");
+    FILE *f = fopen("/data/UserData/move-anything/link-subscriber-enable", "w");
+    if (f) fclose(f);
+    shadow_log("Link Audio: created enable flag (transport started)");
 }
 
 /* ---- Shadow audio publisher ---- */
@@ -6613,6 +6681,14 @@ static void shadow_inprocess_process_midi(void) {
      * - Capture rules are handled in shadow_filter_move_input (post-ioctl)
      * - Internal notes/CCs should only reach Move, not DSP */
 
+    /* Link Audio: delayed re-enable after transport start.
+     * Counted down each ioctl block (~2.9ms each). */
+    if (link_audio_reenable_countdown > 0) {
+        if (--link_audio_reenable_countdown == 0) {
+            link_audio_signal_transport_start();
+        }
+    }
+
     /* MIDI_OUT → DSP: Move's track output contains only musical notes.
      * Internal controls (knob touches, step buttons) do NOT appear in MIDI_OUT.
      * We must clear packets after reading to avoid re-processing stale data. */
@@ -6634,6 +6710,18 @@ static void shadow_inprocess_process_midi(void) {
             /* Sampler sees clock from cable 0 only (Move internal) to avoid double-counting */
             if (cable == 0) {
                 sampler_on_clock(status_usb);
+                /* Link Audio subscriber transport signaling:
+                 * Stop: disable immediately (ByeBye → numPeers=0)
+                 * Start: schedule delayed re-enable (~2s after Play is
+                 *        processed, so requestBeatAtTime already ran
+                 *        with numPeers=0). Also cancel any pending
+                 *        re-enable on stop to handle quick stop/start. */
+                if (status_usb == 0xFC) {
+                    link_audio_reenable_countdown = 0; /* cancel pending */
+                    link_audio_signal_transport_stop();
+                } else if (status_usb == 0xFA || status_usb == 0xFB) {
+                    link_audio_reenable_countdown = LINK_AUDIO_REENABLE_BLOCKS;
+                }
             }
 
             /* Filter cable 0 (Move UI events) - track output is on cable 2 */
