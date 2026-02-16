@@ -1,16 +1,18 @@
 /*
- * link_subscriber.cpp — Standalone Link Audio subscriber (bootstrap mode)
+ * link_subscriber.cpp — Standalone Link Audio subscriber
  *
  * Uses the Ableton Link SDK's LinkAudioSource to subscribe to Move's
  * per-track audio channels. This triggers Move to stream audio via
  * chnnlsv, which the shim's sendto() hook intercepts.
  *
- * After bootstrapping (establishing the chnnlsv subscription), this
- * process writes its NodeId to a file and exits. The shim's keepalive
- * thread takes over sending ChannelRequest heartbeats to keep audio
- * flowing, while the subscriber's ALIVE TTL expires — removing it as
- * a Link peer so Move's numPeers() drops to 0, eliminating the
- * quantum launch delay.
+ * To avoid the quantum launch delay (Move waits for the next downbeat
+ * when numPeers > 0), the subscriber responds to signals from the shim:
+ *   SIGUSR1 = transport stopped → disable Link (numPeers drops to 0)
+ *   SIGUSR2 = transport started → re-enable Link (audio resumes)
+ *
+ * This way, Link is disabled while Move is stopped, so pressing Play
+ * sees numPeers=0 and starts immediately. After play begins, Link is
+ * re-enabled and audio FX resume within ~2 seconds.
  *
  * Running as a standalone process (not inside Move's LD_PRELOAD shim)
  * avoids the hook conflicts that caused SIGSEGV in the in-shim approach.
@@ -34,6 +36,10 @@
 
 static std::atomic<bool> g_running{true};
 
+/* File-based IPC flags (signals are unreliable with Link SDK's threads) */
+static const char *FLAG_DISABLE = "/data/UserData/move-anything/link-subscriber-disable";
+static const char *FLAG_ENABLE  = "/data/UserData/move-anything/link-subscriber-enable";
+
 /* Channel IDs discovered via callback — processed in main loop */
 struct PendingChannel {
     ableton::ChannelId id;
@@ -46,7 +52,7 @@ static std::atomic<bool> g_channels_changed{false};
 
 static std::atomic<uint64_t> g_buffers_received{0};
 
-static const char *PEER_ID_FILE = "/data/UserData/move-anything/link-subscriber-peer-id";
+static const char *PID_FILE = "/data/UserData/move-anything/link-subscriber-pid";
 
 static void signal_handler(int sig)
 {
@@ -58,11 +64,12 @@ static void signal_handler(int sig)
         case SIGABRT: msg = "link-subscriber: SIGABRT\n"; break;
         case SIGTERM: msg = "link-subscriber: SIGTERM\n"; break;
         case SIGINT:  msg = "link-subscriber: SIGINT\n"; break;
+        case SIGUSR1: return;  /* unused — using file-based IPC instead */
+        case SIGUSR2: return;
     }
     (void)write(STDOUT_FILENO, msg, strlen(msg));
 
     if (sig == SIGSEGV || sig == SIGBUS || sig == SIGABRT) {
-        /* _exit() skips destructors — acceptable for fatal signals */
         _exit(128 + sig);
     }
     g_running = false;
@@ -82,20 +89,21 @@ static bool is_link_audio_enabled()
     return content.find("true", colon) < nl;
 }
 
-/* Write the 8-byte NodeId as hex to a file for the shim to read */
-static void write_peer_id(const ableton::link::NodeId& nodeId)
+static void write_pid_file()
 {
-    FILE *f = fopen(PEER_ID_FILE, "w");
+    FILE *f = fopen(PID_FILE, "w");
     if (!f) {
-        printf("link-subscriber: failed to write peer ID file\n");
+        printf("link-subscriber: failed to write PID file\n");
         return;
     }
-    for (int i = 0; i < 8; i++) {
-        fprintf(f, "%02x", nodeId[i]);
-    }
-    fprintf(f, "\n");
+    fprintf(f, "%d\n", getpid());
     fclose(f);
-    printf("link-subscriber: wrote peer ID to %s\n", PEER_ID_FILE);
+    printf("link-subscriber: wrote PID %d to %s\n", getpid(), PID_FILE);
+}
+
+static void remove_pid_file()
+{
+    unlink(PID_FILE);
 }
 
 int main()
@@ -105,6 +113,8 @@ int main()
     std::signal(SIGSEGV, signal_handler);
     std::signal(SIGBUS, signal_handler);
     std::signal(SIGABRT, signal_handler);
+    std::signal(SIGUSR1, signal_handler);
+    std::signal(SIGUSR2, signal_handler);
 
     setvbuf(stdout, NULL, _IOLBF, 0);
 
@@ -112,16 +122,36 @@ int main()
         return 0;
     }
 
-    printf("link-subscriber: starting (bootstrap mode)\n");
+    printf("link-subscriber: starting (signal-controlled mode)\n");
 
-    /* Join Link session and enable audio */
+    write_pid_file();
+
+    /* Wait for Move to be running before joining Link — if we create the
+     * session first, our initial tempo (120 BPM) overwrites Move's project
+     * tempo.  By waiting, Move creates the session and we adopt its tempo. */
+    printf("link-subscriber: waiting for Move to start...\n");
+    for (int wait = 0; wait < 60 && g_running; wait++) {
+        /* Check if MoveOriginal process exists */
+        FILE *p = popen("pgrep -f MoveOriginal", "r");
+        if (p) {
+            char buf[32];
+            bool found = (fgets(buf, sizeof(buf), p) != nullptr);
+            pclose(p);
+            if (found) {
+                printf("link-subscriber: Move detected, waiting 5s for Link init...\n");
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                break;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+
+    /* Join Link session and enable audio.
+     * The BPM here only matters if no session exists yet — since Move starts
+     * first, the subscriber adopts Move's tempo automatically. */
     ableton::LinkAudio link(120.0, "ME-Sub");
     link.enable(true);
     link.enableLinkAudio(true);
-
-    /* Write our NodeId to a file so the shim can take over ChannelRequest
-     * heartbeats with the same identity after we exit */
-    write_peer_id(link.nodeId());
 
     /* Create a dummy sink so that our PeerAnnouncements include at least one
      * channel.  Move's Sink handler looks up ChannelRequest.peerId in
@@ -154,12 +184,58 @@ int main()
 
     uint64_t last_count = 0;
     int tick = 0;
-    bool audio_confirmed = false;
-    int audio_confirm_ticks = 0;
+    bool link_enabled = true;
 
     while (g_running) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        /* Sleep in short bursts so we respond quickly to signals.
+         * std::this_thread::sleep_for retries after EINTR on Linux,
+         * so a single 500ms sleep won't wake up for signal flags. */
+        for (int s = 0; s < 10 && g_running; s++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            /* Check file-based IPC flags between each 50ms nap */
+            if (access(FLAG_DISABLE, F_OK) == 0 ||
+                access(FLAG_ENABLE, F_OK) == 0)
+                break;
+        }
         tick++;
+
+        /* Handle disable request (transport stopped → hide from Link peers).
+         * ByeBye message causes immediate numPeers drop on Move's side.
+         * Stay disabled until shim creates the enable flag file.
+         *
+         * Only disable when we're the only peer (numPeers <= 1 from Move's
+         * perspective = just us). If Live or other real peers are connected,
+         * keep Link enabled so quantum sync works correctly with them. */
+        if (access(FLAG_DISABLE, F_OK) == 0) {
+            unlink(FLAG_DISABLE);
+            if (link_enabled) {
+                std::size_t peers = link.numPeers();
+                if (peers <= 1) {
+                    printf("link-subscriber: disabling Link (transport stopped, "
+                           "numPeers=%zu — no real peers)\n", peers);
+                    sources.clear();
+                    link.enable(false);
+                    link_enabled = false;
+                } else {
+                    printf("link-subscriber: ignoring disable (numPeers=%zu — "
+                           "real peers connected, keeping quantum sync)\n", peers);
+                }
+            }
+        }
+
+        /* Handle enable request from shim (created ~2s after MIDI Start,
+         * well after Move has processed requestBeatAtTime with numPeers=0) */
+        if (access(FLAG_ENABLE, F_OK) == 0) {
+            unlink(FLAG_ENABLE);
+            if (!link_enabled) {
+                printf("link-subscriber: re-enabling Link (shim request)\n");
+                link.enable(true);
+                link_enabled = true;
+            }
+        }
+
+        /* Skip source management while Link is disabled */
+        if (!link_enabled) continue;
 
         /* Create sources when channels change */
         if (g_channels_changed.exchange(false)) {
@@ -196,90 +272,25 @@ int main()
                     printf("link-subscriber: ERROR (unknown)\n");
                 }
 
-                /* Small delay between source creation to avoid overwhelming */
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
 
             printf("link-subscriber: %zu sources active\n", sources.size());
         }
 
-        /* Check if audio is flowing — once we see buffers, start countdown */
-        if (!audio_confirmed && !sources.empty()) {
-            uint64_t count = g_buffers_received.load(std::memory_order_relaxed);
-            if (count > 0) {
-                if (audio_confirm_ticks == 0) {
-                    printf("link-subscriber: audio flowing (%llu buffers), "
-                           "waiting for shim keepalive to start...\n",
-                           (unsigned long long)count);
-                }
-                audio_confirm_ticks++;
-                /* Wait 3 seconds after first audio to let the shim start its
-                 * keepalive thread before we exit */
-                if (audio_confirm_ticks >= 6) {
-                    audio_confirmed = true;
-                    printf("link-subscriber: bootstrap complete, exiting "
-                           "(shim keepalive takes over)\n");
-                    break;
-                }
-            }
-        }
-
-        /* Safety timeout: if no audio after 60 seconds, stay running
-         * (fall back to old behavior) */
-        if (tick >= 120 && !audio_confirmed) {
-            printf("link-subscriber: no audio after 60s, staying in "
-                   "persistent mode\n");
-            /* Fall through to persistent loop below */
-            break;
-        }
-    }
-
-    /* If audio was confirmed (bootstrap succeeded), exit cleanly.
-     * The shim's keepalive thread will maintain the subscription. */
-    if (audio_confirmed) {
-        sources.clear();
-        printf("link-subscriber: bootstrap exit (%llu total buffers)\n",
-               (unsigned long long)g_buffers_received.load());
-        return 0;
-    }
-
-    /* Fallback: persistent mode (original behavior) if bootstrap failed */
-    printf("link-subscriber: running in persistent mode\n");
-    while (g_running) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        tick++;
-
-        if (g_channels_changed.exchange(false)) {
-            std::vector<PendingChannel> pending;
-            {
-                std::lock_guard<std::mutex> lock(g_pending_mu);
-                pending = g_pending_channels;
-            }
-            sources.clear();
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            sources.reserve(pending.size());
-            for (const auto& pc : pending) {
-                try {
-                    sources.emplace_back(link, pc.id,
-                        [](ableton::LinkAudioSource::BufferHandle) {
-                            g_buffers_received.fetch_add(1, std::memory_order_relaxed);
-                        });
-                } catch (...) {}
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            }
-        }
-
         if (tick % 60 == 0) {
             uint64_t count = g_buffers_received.load(std::memory_order_relaxed);
             if (count != last_count) {
-                printf("link-subscriber: %llu audio buffers received\n",
-                       (unsigned long long)count);
+                printf("link-subscriber: %llu audio buffers received (link=%s)\n",
+                       (unsigned long long)count,
+                       link_enabled ? "on" : "off");
                 last_count = count;
             }
         }
     }
 
     sources.clear();
+    remove_pid_file();
     printf("link-subscriber: shutting down (%llu total buffers)\n",
            (unsigned long long)g_buffers_received.load());
     return 0;
