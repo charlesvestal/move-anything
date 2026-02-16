@@ -100,13 +100,6 @@ typedef struct {
     link_audio_pub_channel_t pub_channels[LINK_AUDIO_SHADOW_CHANNELS];
     volatile int publisher_tick;       /* set by ioctl thread to wake publisher */
 
-    /* Keepalive thread (sends raw ChannelRequest heartbeats after subscriber exits) */
-    volatile int keepalive_running;
-    pthread_t keepalive_thread;
-    int keepalive_socket_fd;
-    uint8_t subscriber_peer_id[8];  /* copied from link-subscriber's NodeId */
-    volatile int subscriber_peer_id_loaded;
-
     /* Debug/stats */
     volatile uint32_t packets_intercepted;
     volatile uint32_t packets_published;

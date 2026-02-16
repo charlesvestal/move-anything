@@ -5,14 +5,11 @@
  * per-track audio channels. This triggers Move to stream audio via
  * chnnlsv, which the shim's sendto() hook intercepts.
  *
- * To avoid the quantum launch delay (Move waits for the next downbeat
- * when numPeers > 0), the subscriber responds to signals from the shim:
- *   SIGUSR1 = transport stopped → disable Link (numPeers drops to 0)
- *   SIGUSR2 = transport started → re-enable Link (audio resumes)
- *
- * This way, Link is disabled while Move is stopped, so pressing Play
- * sees numPeers=0 and starts immediately. After play begins, Link is
- * re-enabled and audio FX resume within ~2 seconds.
+ * Built with LINK_SUBSCRIBER_MODE, which patches the SDK so the
+ * subscriber stays in its own Link session (never merges with Move).
+ * This means Move's numPeers stays 0 — no quantum launch delay —
+ * while audio flows normally via the independent chnnlsv layer.
+ * See libs/link/PATCHES.md for details on the SDK patches.
  *
  * Running as a standalone process (not inside Move's LD_PRELOAD shim)
  * avoids the hook conflicts that caused SIGSEGV in the in-shim approach.
@@ -35,10 +32,6 @@
 #include <vector>
 
 static std::atomic<bool> g_running{true};
-
-/* File-based IPC flags (signals are unreliable with Link SDK's threads) */
-static const char *FLAG_DISABLE = "/data/UserData/move-anything/link-subscriber-disable";
-static const char *FLAG_ENABLE  = "/data/UserData/move-anything/link-subscriber-enable";
 
 /* Channel IDs discovered via callback — processed in main loop */
 struct PendingChannel {
@@ -64,7 +57,7 @@ static void signal_handler(int sig)
         case SIGABRT: msg = "link-subscriber: SIGABRT\n"; break;
         case SIGTERM: msg = "link-subscriber: SIGTERM\n"; break;
         case SIGINT:  msg = "link-subscriber: SIGINT\n"; break;
-        case SIGUSR1: return;  /* unused — using file-based IPC instead */
+        case SIGUSR1: return;
         case SIGUSR2: return;
     }
     (void)write(STDOUT_FILENO, msg, strlen(msg));
@@ -122,16 +115,17 @@ int main()
         return 0;
     }
 
-    printf("link-subscriber: starting (signal-controlled mode)\n");
+    printf("link-subscriber: starting (cross-session mode, no ALIVE filtering)\n");
 
     write_pid_file();
 
     /* Wait for Move to be running before joining Link — if we create the
      * session first, our initial tempo (120 BPM) overwrites Move's project
-     * tempo.  By waiting, Move creates the session and we adopt its tempo. */
+     * tempo.  By waiting, Move creates the session and we adopt its tempo.
+     * NOTE: with LINK_SUBSCRIBER_MODE, sessions never merge, but we still
+     * want Move running first so it's already advertising its channels. */
     printf("link-subscriber: waiting for Move to start...\n");
     for (int wait = 0; wait < 60 && g_running; wait++) {
-        /* Check if MoveOriginal process exists */
         FILE *p = popen("pgrep -f MoveOriginal", "r");
         if (p) {
             char buf[32];
@@ -146,12 +140,19 @@ int main()
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
-    /* Join Link session and enable audio.
-     * The BPM here only matters if no session exists yet — since Move starts
-     * first, the subscriber adopts Move's tempo automatically. */
+    /* Create Link instance and enable.
+     * With LINK_SUBSCRIBER_MODE:
+     *   - resetState() is skipped on zero peers (stable nodeId)
+     *   - joinSessionCallback is a no-op (never merges into Move's session)
+     *   - sessionMembershipCallback skips updateLinkAudio (no cross-session pruning)
+     *   - channels() returns all channels regardless of session
+     * This means the subscriber stays in its own session permanently.
+     * Move sees us via ALIVE but doesn't count us as a session peer. */
     ableton::LinkAudio link(120.0, "ME-Sub");
     link.enable(true);
     link.enableLinkAudio(true);
+
+    printf("link-subscriber: Link enabled (own session, numPeers on Move stays 0)\n");
 
     /* Create a dummy sink so that our PeerAnnouncements include at least one
      * channel.  Move's Sink handler looks up ChannelRequest.peerId in
@@ -161,8 +162,11 @@ int main()
     ableton::LinkAudioSink dummySink(link, "ME-Sub-Ack", 256);
     printf("link-subscriber: dummy sink created (triggers peer announcement)\n");
 
-    /* Callback just records channel IDs — source creation deferred to main loop
-     * because LinkAudioSource constructor isn't safe from the callback thread */
+    /* Callback records channel IDs — source creation deferred to main loop
+     * because LinkAudioSource constructor isn't safe from the callback thread.
+     * With LINK_SUBSCRIBER_MODE, link.channels() returns ALL channels
+     * regardless of session, so we see Move's channels even though we're
+     * in a different session. */
     link.setChannelsChangedCallback([&]() {
         auto channels = link.channels();
         std::lock_guard<std::mutex> lock(g_pending_mu);
@@ -184,58 +188,10 @@ int main()
 
     uint64_t last_count = 0;
     int tick = 0;
-    bool link_enabled = true;
 
     while (g_running) {
-        /* Sleep in short bursts so we respond quickly to signals.
-         * std::this_thread::sleep_for retries after EINTR on Linux,
-         * so a single 500ms sleep won't wake up for signal flags. */
-        for (int s = 0; s < 10 && g_running; s++) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            /* Check file-based IPC flags between each 50ms nap */
-            if (access(FLAG_DISABLE, F_OK) == 0 ||
-                access(FLAG_ENABLE, F_OK) == 0)
-                break;
-        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
         tick++;
-
-        /* Handle disable request (transport stopped → hide from Link peers).
-         * ByeBye message causes immediate numPeers drop on Move's side.
-         * Stay disabled until shim creates the enable flag file.
-         *
-         * Only disable when we're the only peer (numPeers <= 1 from Move's
-         * perspective = just us). If Live or other real peers are connected,
-         * keep Link enabled so quantum sync works correctly with them. */
-        if (access(FLAG_DISABLE, F_OK) == 0) {
-            unlink(FLAG_DISABLE);
-            if (link_enabled) {
-                std::size_t peers = link.numPeers();
-                if (peers <= 1) {
-                    printf("link-subscriber: disabling Link (transport stopped, "
-                           "numPeers=%zu — no real peers)\n", peers);
-                    sources.clear();
-                    link.enable(false);
-                    link_enabled = false;
-                } else {
-                    printf("link-subscriber: ignoring disable (numPeers=%zu — "
-                           "real peers connected, keeping quantum sync)\n", peers);
-                }
-            }
-        }
-
-        /* Handle enable request from shim (created ~2s after MIDI Start,
-         * well after Move has processed requestBeatAtTime with numPeers=0) */
-        if (access(FLAG_ENABLE, F_OK) == 0) {
-            unlink(FLAG_ENABLE);
-            if (!link_enabled) {
-                printf("link-subscriber: re-enabling Link (shim request)\n");
-                link.enable(true);
-                link_enabled = true;
-            }
-        }
-
-        /* Skip source management while Link is disabled */
-        if (!link_enabled) continue;
 
         /* Create sources when channels change */
         if (g_channels_changed.exchange(false)) {
@@ -281,9 +237,8 @@ int main()
         if (tick % 60 == 0) {
             uint64_t count = g_buffers_received.load(std::memory_order_relaxed);
             if (count != last_count) {
-                printf("link-subscriber: %llu audio buffers received (link=%s)\n",
-                       (unsigned long long)count,
-                       link_enabled ? "on" : "off");
+                printf("link-subscriber: %llu audio buffers received\n",
+                       (unsigned long long)count);
                 last_count = count;
             }
         }
