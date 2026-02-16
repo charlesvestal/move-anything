@@ -4667,6 +4667,10 @@ static void load_feature_config(void)
             while (*colon == ' ' || *colon == '\t') colon++;
             if (strncmp(colon, "true", 4) == 0) {
                 link_audio.enabled = 1;
+                /* Pre-create disable flag so subscriber disables after
+                 * initial handshake. First Play will see numPeers=0. */
+                FILE *df = fopen("/data/UserData/move-anything/link-subscriber-disable", "w");
+                if (df) fclose(df);
             }
         }
     }
