@@ -174,7 +174,6 @@ if [ -d "./libs/link/include/ableton" ]; then
     "${CROSS_PREFIX}g++" -std=c++17 -O3 -DNDEBUG \
         -DLINK_PLATFORM_UNIX=1 \
         -DLINK_PLATFORM_LINUX=1 \
-        -DLINK_SUBSCRIBER_MODE=1 \
         -Wno-multichar \
         -I./libs/link/include \
         -I./libs/link/modules/asio-standalone/asio/include \
