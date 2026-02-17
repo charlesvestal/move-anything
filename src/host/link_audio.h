@@ -100,11 +100,28 @@ typedef struct {
     link_audio_pub_channel_t pub_channels[LINK_AUDIO_SHADOW_CHANNELS];
     volatile int publisher_tick;       /* set by ioctl thread to wake publisher */
 
+    /* Per-channel fade-in state to prevent clicks when audio resumes */
+    volatile int fade_samples_remaining[LINK_AUDIO_MOVE_CHANNELS];
+
+    /* ALIVE→ByeBye rewrite: hide subscriber from Move's peer count.
+     * The recvfrom hook rewrites discovery ALIVE packets from the subscriber
+     * to ByeBye, so Move's numPeers stays 0 (no quantum on Play).
+     * LinkAudio (chnnlsv) is unaffected — audio keeps flowing. */
+    volatile int filter_subscriber_alive;    /* 1 = rewrite ALIVE→ByeBye */
+    uint8_t subscriber_node_id[16];          /* subscriber's 16-byte nodeId */
+    volatile int subscriber_node_id_known;   /* 1 = nodeId captured from ALIVE */
+
     /* Debug/stats */
     volatile uint32_t packets_intercepted;
     volatile uint32_t packets_published;
     volatile uint32_t underruns;
     volatile uint32_t overruns;   /* ring buffer overflow (producer too far ahead) */
+
+    /* ByeBye rewrite diagnostics */
+    volatile uint32_t discovery_packets_seen;   /* total _asdp_v packets received */
+    volatile uint32_t alive_packets_rewritten;  /* ALIVE→ByeBye rewrites done */
+    volatile uint32_t recvfrom_calls;           /* total recvfrom hook invocations */
+    volatile uint32_t recvmsg_calls;            /* total recvmsg hook invocations */
 } link_audio_state_t;
 
 #endif /* LINK_AUDIO_H */

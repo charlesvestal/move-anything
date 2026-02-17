@@ -5,11 +5,10 @@
  * per-track audio channels. This triggers Move to stream audio via
  * chnnlsv, which the shim's sendto() hook intercepts.
  *
- * Built with LINK_SUBSCRIBER_MODE, which patches the SDK so the
- * subscriber stays in its own Link session (never merges with Move).
- * This means Move's numPeers stays 0 — no quantum launch delay —
- * while audio flows normally via the independent chnnlsv layer.
- * See libs/link/PATCHES.md for details on the SDK patches.
+ * The subscriber stays always active — audio flows continuously.
+ * The shim handles quantum avoidance by rewriting the subscriber's
+ * ALIVE packets to ByeBye in its recvfrom hook, so Move never counts
+ * the subscriber as a Link peer (numPeers stays 0).
  *
  * Running as a standalone process (not inside Move's LD_PRELOAD shim)
  * avoids the hook conflicts that caused SIGSEGV in the in-shim approach.
@@ -33,6 +32,8 @@
 
 static std::atomic<bool> g_running{true};
 
+static const char *TEMPO_FILE = "/data/UserData/move-anything/link-audio-tempo";
+
 /* Channel IDs discovered via callback — processed in main loop */
 struct PendingChannel {
     ableton::ChannelId id;
@@ -49,7 +50,6 @@ static const char *PID_FILE = "/data/UserData/move-anything/link-subscriber-pid"
 
 static void signal_handler(int sig)
 {
-    /* Use write() — async-signal-safe, unlike printf() */
     const char *msg = "link-subscriber: caught signal\n";
     switch (sig) {
         case SIGSEGV: msg = "link-subscriber: SIGSEGV\n"; break;
@@ -80,6 +80,18 @@ static bool is_link_audio_enabled()
     if (colon == std::string::npos) return false;
     auto nl = content.find('\n', colon);
     return content.find("true", colon) < nl;
+}
+
+/* Read tempo from file written by shim. Returns 0 on failure. */
+static double read_tempo_file()
+{
+    FILE *f = fopen(TEMPO_FILE, "r");
+    if (!f) return 0;
+    double tempo = 0;
+    fscanf(f, "%lf", &tempo);
+    fclose(f);
+    if (tempo >= 20.0 && tempo <= 999.0) return tempo;
+    return 0;
 }
 
 static void write_pid_file()
@@ -115,15 +127,13 @@ int main()
         return 0;
     }
 
-    printf("link-subscriber: starting (cross-session mode, no ALIVE filtering)\n");
+    printf("link-subscriber: starting (always-active mode)\n");
 
     write_pid_file();
 
     /* Wait for Move to be running before joining Link — if we create the
-     * session first, our initial tempo (120 BPM) overwrites Move's project
-     * tempo.  By waiting, Move creates the session and we adopt its tempo.
-     * NOTE: with LINK_SUBSCRIBER_MODE, sessions never merge, but we still
-     * want Move running first so it's already advertising its channels. */
+     * session first, our initial tempo overwrites Move's project tempo.
+     * By waiting, Move creates the session and we adopt its tempo. */
     printf("link-subscriber: waiting for Move to start...\n");
     for (int wait = 0; wait < 60 && g_running; wait++) {
         FILE *p = popen("pgrep -f MoveOriginal", "r");
@@ -140,19 +150,17 @@ int main()
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
-    /* Create Link instance and enable.
-     * With LINK_SUBSCRIBER_MODE:
-     *   - resetState() is skipped on zero peers (stable nodeId)
-     *   - joinSessionCallback is a no-op (never merges into Move's session)
-     *   - sessionMembershipCallback skips updateLinkAudio (no cross-session pruning)
-     *   - channels() returns all channels regardless of session
-     * This means the subscriber stays in its own session permanently.
-     * Move sees us via ALIVE but doesn't count us as a session peer. */
-    ableton::LinkAudio link(120.0, "ME-Sub");
+    /* Read project tempo from shim's tempo file, fall back to 120 BPM */
+    double initial_tempo = read_tempo_file();
+    if (initial_tempo <= 0) initial_tempo = 120.0;
+    printf("link-subscriber: initial tempo = %.1f BPM\n", initial_tempo);
+
+    /* Create Link instance — always enabled, shim handles quantum avoidance
+     * by rewriting our ALIVE packets to ByeBye in its recvfrom hook */
+    ableton::LinkAudio link(initial_tempo, "ME-Sub");
     link.enable(true);
     link.enableLinkAudio(true);
-
-    printf("link-subscriber: Link enabled (own session, numPeers on Move stays 0)\n");
+    printf("link-subscriber: Link enabled (numPeers=%zu)\n", link.numPeers());
 
     /* Create a dummy sink so that our PeerAnnouncements include at least one
      * channel.  Move's Sink handler looks up ChannelRequest.peerId in
@@ -163,10 +171,7 @@ int main()
     printf("link-subscriber: dummy sink created (triggers peer announcement)\n");
 
     /* Callback records channel IDs — source creation deferred to main loop
-     * because LinkAudioSource constructor isn't safe from the callback thread.
-     * With LINK_SUBSCRIBER_MODE, link.channels() returns ALL channels
-     * regardless of session, so we see Move's channels even though we're
-     * in a different session. */
+     * because LinkAudioSource constructor isn't safe from the callback thread. */
     link.setChannelsChangedCallback([&]() {
         auto channels = link.channels();
         std::lock_guard<std::mutex> lock(g_pending_mu);
@@ -205,13 +210,10 @@ int main()
             sources.clear();
             printf("link-subscriber: cleared old sources\n");
 
-            /* Small delay to let SDK process the unsubscriptions */
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-            /* Pre-allocate to avoid reallocation (which moves LinkAudioSource objects) */
             sources.reserve(pending.size());
 
-            /* Create new sources one at a time */
             for (const auto& pc : pending) {
                 printf("link-subscriber: subscribing to %s/%s...\n",
                        pc.peerName.c_str(), pc.name.c_str());
@@ -219,7 +221,9 @@ int main()
                 try {
                     sources.emplace_back(link, pc.id,
                         [](ableton::LinkAudioSource::BufferHandle) {
-                            g_buffers_received.fetch_add(1, std::memory_order_relaxed);
+                            /* Deliberately empty — we only need the subscription
+                             * to trigger Move's audio flow.  Counting or touching
+                             * the buffer wastes CPU on this constrained device. */
                         });
                     printf("link-subscriber: OK\n");
                 } catch (const std::exception& e) {
@@ -237,8 +241,9 @@ int main()
         if (tick % 60 == 0) {
             uint64_t count = g_buffers_received.load(std::memory_order_relaxed);
             if (count != last_count) {
-                printf("link-subscriber: %llu audio buffers received\n",
-                       (unsigned long long)count);
+                printf("link-subscriber: %llu buffers (peers=%zu)\n",
+                       (unsigned long long)count,
+                       link.numPeers());
                 last_count = count;
             }
         }

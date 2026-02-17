@@ -40,6 +40,9 @@
 #include "host/tts_engine.h"
 #include "host/link_audio.h"
 
+/* Link Audio IPC file paths (used by D-Bus handler and link_audio section) */
+#define LINK_AUDIO_TEMPO_FILE   "/data/UserData/move-anything/link-audio-tempo"
+
 /* Debug flags - set to 1 to enable various debug logging */
 #define SHADOW_DEBUG 0           /* Master debug flag for mailbox/MIDI debug */
 #define SHADOW_TRACE_DEBUG 0     /* SPI/MIDI trace logging */
@@ -1827,6 +1830,16 @@ static void shadow_dbus_handle_text(const char *text)
                  text, sampler_set_tempo);
         shadow_log(msg);
 
+        /* Write tempo file for link-subscriber so it uses the correct
+         * tempo when re-enabling Link (avoids overwriting Move's tempo) */
+        if (link_audio.enabled && sampler_set_tempo >= 20.0f) {
+            FILE *tf = fopen(LINK_AUDIO_TEMPO_FILE, "w");
+            if (tf) {
+                fprintf(tf, "%.2f\n", sampler_set_tempo);
+                fclose(tf);
+            }
+        }
+
         /* Rebuild cache in case sets were added/renamed */
         shadow_rebuild_set_name_cache();
 
@@ -2069,6 +2082,19 @@ static void link_audio_parse_session(const uint8_t *pkt, size_t len,
 static void link_audio_intercept_audio(const uint8_t *pkt);
 static void *link_audio_publisher_thread(void *arg);
 static void link_audio_start_publisher(void);
+
+/* Fade-in length when audio resumes after gap (samples, stereo) */
+#define LINK_AUDIO_FADE_SAMPLES 256
+
+/* Link discovery protocol constants for ALIVE→ByeBye rewriting */
+#define LINK_DISCOVERY_MAGIC    "_asdp_v\x01"
+#define LINK_DISCOVERY_MAGIC_LEN 8
+#define LINK_DISCOVERY_TYPE_ALIVE    1
+#define LINK_DISCOVERY_TYPE_RESPONSE 2
+#define LINK_DISCOVERY_TYPE_BYEBYE   3
+#define LINK_DISCOVERY_NODEID_OFFSET 12
+#define LINK_DISCOVERY_NODEID_LEN    16
+#define LINK_DISCOVERY_MIN_PKT_LEN   28
 
 /* Read big-endian uint32 from buffer */
 static inline uint32_t link_audio_read_u32_be(const uint8_t *p)
@@ -2389,6 +2415,15 @@ static void link_audio_intercept_audio(const uint8_t *pkt)
     ch->sequence = link_audio_read_u32_be(pkt + 44);
 
     link_audio.packets_intercepted++;
+
+    /* Auto-activate ALIVE filter once audio is flowing.
+     * ~1000 packets = ~3s of audio across 5 channels — enough time
+     * for the subscriber to complete discovery and chnnlsv handshake. */
+    if (!link_audio.filter_subscriber_alive &&
+        link_audio.packets_intercepted == 1000) {
+        link_audio.filter_subscriber_alive = 1;
+        shadow_log("Link Audio: auto-activated ALIVE filter (audio established)");
+    }
 }
 
 /* Read from a Move channel's ring buffer (called from consumer thread) */
@@ -2405,9 +2440,11 @@ static int link_audio_read_channel(int idx, int16_t *out, int frames)
     uint32_t avail = wp - rp;
 
     if (avail < (uint32_t)samples) {
-        /* Underrun — zero-fill */
+        /* Underrun — zero-fill.  Set fade counter so next successful read
+         * applies a fade-in to prevent clicks from sudden audio appearance. */
         memset(out, 0, samples * sizeof(int16_t));
         link_audio.underruns++;
+        link_audio.fade_samples_remaining[idx] = LINK_AUDIO_FADE_SAMPLES;
         return 0;
     }
 
@@ -2417,6 +2454,8 @@ static int link_audio_read_channel(int idx, int16_t *out, int frames)
      * cancellation.  Keep one frame of margin to avoid racing the writer. */
     if (avail > (uint32_t)samples * 4) {
         rp = wp - (uint32_t)samples;
+        /* Resuming after a large gap — apply fade-in */
+        link_audio.fade_samples_remaining[idx] = LINK_AUDIO_FADE_SAMPLES;
     }
 
     for (int i = 0; i < samples; i++) {
@@ -2426,18 +2465,126 @@ static int link_audio_read_channel(int idx, int16_t *out, int frames)
 
     __sync_synchronize();
     ch->read_pos = rp;
+
+    /* Apply fade-in if resuming after underrun/gap.
+     * Ramp per stereo frame so L and R get equal gain. */
+    int fade = link_audio.fade_samples_remaining[idx];
+    if (fade > 0) {
+        int apply = fade < samples ? fade : samples;
+        for (int i = 0; i < apply; i++) {
+            int pos = LINK_AUDIO_FADE_SAMPLES - fade + i;
+            /* Both samples of a stereo pair get the same gain (pos/2) */
+            int32_t scaled = ((int32_t)out[i] * (pos / 2)) / (LINK_AUDIO_FADE_SAMPLES / 2);
+            out[i] = (int16_t)scaled;
+        }
+        link_audio.fade_samples_remaining[idx] = fade - apply;
+    }
+
     return 1;
 }
 
-/* ---- recvfrom() hook: filter subscriber's ALIVE from Move's peer count ---- */
+/* ---- ALIVE→ByeBye rewrite (recvfrom hook) ---- */
 
-/* Link discovery protocol magic (7 bytes + 1 version byte = 8 total).
- * ALIVE/Response/ByeBye all use this header on multicast 224.76.78.75:20808.
- * Layout after magic: [type:1][ttl:1][groupId:2][nodeId:8] */
-/* ALIVE filtering removed — cross-session subscriber approach means
- * the subscriber stays in its own Link session (never merges with Move),
- * so numPeers on Move's side stays 0 without needing to filter ALIVEs.
- * See libs/link/PATCHES.md for details. */
+/* Real recvfrom/recvmsg function pointers */
+static ssize_t (*real_recvfrom)(int, void*, size_t, int,
+                                struct sockaddr*, socklen_t*) = NULL;
+static ssize_t (*real_recvmsg)(int, struct msghdr*, int) = NULL;
+
+/* Check if a packet is a Link discovery ALIVE and, when the filter
+ * is active, rewrite it to ByeBye (type 3) so numPeers drops to 0.
+ *
+ * We rewrite ALL incoming ALIVEs (not just the subscriber's) because
+ * the peer name is NOT in the discovery layer — it's only in chnnlsv.
+ * Move's own SDK ignores packets with its own nodeId regardless of
+ * message type, so rewriting Move's loopback ALIVEs is harmless.
+ *
+ * Rate-limited to ~2/sec to avoid flooding the SDK with ByeBye
+ * processing that could steal CPU from the audio thread.
+ *
+ * When filter is OFF (transport playing), ALIVEs pass through normally
+ * and peers (including Live) reappear within ~2s.  Returns 1 if rewritten. */
+static int link_audio_maybe_rewrite_alive(uint8_t *pkt, ssize_t len)
+{
+    if (!link_audio.enabled || len < LINK_DISCOVERY_MIN_PKT_LEN)
+        return 0;
+
+    /* Check discovery protocol magic "_asdp_v\x01" */
+    if (memcmp(pkt, LINK_DISCOVERY_MAGIC, LINK_DISCOVERY_MAGIC_LEN) != 0)
+        return 0;
+
+    link_audio.discovery_packets_seen++;
+    uint8_t msg_type = pkt[8];
+
+    /* When filtering, we need to both REMOVE existing peers and PREVENT
+     * new ones from appearing.  Three mechanisms:
+     *
+     * 1) Rate-limited ByeBye (2/sec): actively removes peers from SDK
+     * 2) Corrupt ALIVEs between ByeByes: SDK ignores unrecognized packets
+     * 3) Corrupt Response packets: prevents peer re-addition via
+     *    the ALIVE→Response handshake (Move sends ALIVE, subscriber
+     *    responds, and that Response would re-establish the peer).
+     *
+     * This keeps numPeers=0 without flooding the SDK with ByeBye work. */
+    if (link_audio.filter_subscriber_alive &&
+        (msg_type == LINK_DISCOVERY_TYPE_ALIVE ||
+         msg_type == LINK_DISCOVERY_TYPE_RESPONSE)) {
+
+        if (msg_type == LINK_DISCOVERY_TYPE_ALIVE) {
+            static struct timespec last_rewrite = {0, 0};
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long elapsed_ms = (now.tv_sec - last_rewrite.tv_sec) * 1000 +
+                              (now.tv_nsec - last_rewrite.tv_nsec) / 1000000;
+            if (elapsed_ms >= 100) {  /* 10/s — fast peer removal, low SDK overhead */
+                /* Rewrite to ByeBye — actively removes the peer */
+                pkt[8] = LINK_DISCOVERY_TYPE_BYEBYE;
+                last_rewrite = now;
+                link_audio.alive_packets_rewritten++;
+                return 1;
+            }
+        }
+
+        /* Corrupt magic so SDK ignores this packet entirely */
+        pkt[0] = 0;
+        return 1;
+    }
+
+    return 0;
+}
+
+/* Hook recvfrom to intercept Link discovery packets */
+ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
+                 struct sockaddr *src_addr, socklen_t *addrlen)
+{
+    if (!real_recvfrom)
+        real_recvfrom = dlsym(RTLD_NEXT, "recvfrom");
+
+    ssize_t n = real_recvfrom(sockfd, buf, len, flags, src_addr, addrlen);
+
+    if (n > 0 && link_audio.enabled) {
+        link_audio.recvfrom_calls++;
+        link_audio_maybe_rewrite_alive((uint8_t *)buf, n);
+    }
+
+    return n;
+}
+
+/* Hook recvmsg (some SDK codepaths use recvmsg instead of recvfrom) */
+ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags)
+{
+    if (!real_recvmsg)
+        real_recvmsg = dlsym(RTLD_NEXT, "recvmsg");
+
+    ssize_t n = real_recvmsg(sockfd, msg, flags);
+
+    if (n > 0 && link_audio.enabled && msg->msg_iovlen > 0) {
+        link_audio.recvmsg_calls++;
+        link_audio_maybe_rewrite_alive(
+            (uint8_t *)msg->msg_iov[0].iov_base, n);
+    }
+
+    return n;
+}
 
 /* ---- Shadow audio publisher ---- */
 
@@ -4474,6 +4621,18 @@ static void load_feature_config(void)
             while (*colon == ' ' || *colon == '\t') colon++;
             if (strncmp(colon, "true", 4) == 0) {
                 link_audio.enabled = 1;
+                /* Write current tempo (if known) for subscriber startup */
+                if (sampler_set_tempo >= 20.0f) {
+                    FILE *tf = fopen(LINK_AUDIO_TEMPO_FILE, "w");
+                    if (tf) {
+                        fprintf(tf, "%.2f\n", sampler_set_tempo);
+                        fclose(tf);
+                    }
+                }
+                /* Start with ALIVE filter OFF so subscriber can complete
+                 * the discovery handshake and audio can begin flowing.
+                 * Filter auto-activates once audio is established. */
+                link_audio.filter_subscriber_alive = 0;
             }
         }
     }
@@ -6509,11 +6668,21 @@ static void shadow_inprocess_process_midi(void) {
             /* Sampler sees clock from cable 0 only (Move internal) to avoid double-counting */
             if (cable == 0) {
                 sampler_on_clock(status_usb);
-                /* Link Audio transport signaling is available but currently
-                 * disabled — toggling the subscriber on stop/start causes
-                 * audio dropouts and gain staging issues. The subscriber
-                 * stays always-on, accepting quantum delay as a tradeoff
-                 * for stable audio FX processing. */
+                /* Link Audio ALIVE→ByeBye filter control:
+                 * Stop  → start filtering subscriber's ALIVE packets
+                 *          so numPeers drops to 0 (no quantum on Play).
+                 * Start → stop filtering (audio was never interrupted). */
+                if (status_usb == 0xFC) {
+                    if (link_audio.enabled) {
+                        link_audio.filter_subscriber_alive = 1;
+                        shadow_log("Link Audio: ALIVE filter ON (transport stopped)");
+                    }
+                } else if (status_usb == 0xFA || status_usb == 0xFB) {
+                    if (link_audio.enabled) {
+                        link_audio.filter_subscriber_alive = 0;
+                        shadow_log("Link Audio: ALIVE filter OFF (transport started)");
+                    }
+                }
             }
 
             /* Filter cable 0 (Move UI events) - track output is on cable 2 */
@@ -9225,10 +9394,14 @@ int ioctl(int fd, unsigned long request, ...)
 
                 int ui_alive = shadow_ui_pid_alive(shadow_ui_pid);
                 unified_log("shim", LOG_LEVEL_DEBUG,
-                    "Heartbeat: pid=%d rss=%ldKB overruns=%d shadow_ui_pid=%d(alive=%d) display_mode=%d la_pkts=%u la_ch=%d",
+                    "Heartbeat: pid=%d rss=%ldKB overruns=%d shadow_ui_pid=%d(alive=%d) display_mode=%d la_pkts=%u la_ch=%d"
+                    " bb_filter=%d bb_nodeid=%d bb_disc=%u bb_rewr=%u bb_recvfrom=%u bb_recvmsg=%u",
                     getpid(), rss_kb, consecutive_overruns,
                     (int)shadow_ui_pid, ui_alive, shadow_display_mode,
-                    link_audio.packets_intercepted, link_audio.move_channel_count);
+                    link_audio.packets_intercepted, link_audio.move_channel_count,
+                    link_audio.filter_subscriber_alive, link_audio.subscriber_node_id_known,
+                    link_audio.discovery_packets_seen, link_audio.alive_packets_rewritten,
+                    link_audio.recvfrom_calls, link_audio.recvmsg_calls);
             }
         }
     }
