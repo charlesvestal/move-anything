@@ -47,6 +47,19 @@
 /* Timing */
 #define LINK_AUDIO_SESSION_INTERVAL_MS     1000
 
+/* Link discovery protocol constants (for recvfrom hook) */
+#define LINK_DISCOVERY_MAGIC        "_asdp_v\x01"
+#define LINK_DISCOVERY_MAGIC_LEN    8
+#define LINK_DISCOVERY_TYPE_ALIVE   1
+#define LINK_DISCOVERY_TYPE_RESPONSE 2
+#define LINK_DISCOVERY_TYPE_BYEBYE  3
+#define LINK_DISCOVERY_MIN_PKT_LEN  20
+
+/* Mute period after Play: suppress mailbox fallback during reconnection.
+ * Counted in frames (mono).  At 128 frames/block (~344 Hz ioctl rate),
+ * 88200 frames = ~2 seconds, covering the ALIVE→Announce→Request chain. */
+#define LINK_AUDIO_PLAY_MUTE_FRAMES  (44100 * 2)
+
 /* Per-channel state with SPSC ring buffer */
 typedef struct {
     uint8_t  channel_id[8];     /* 8-byte channel identifier from session */
@@ -103,27 +116,25 @@ typedef struct {
     /* Per-channel fade-in state to prevent clicks when audio resumes */
     volatile int fade_samples_remaining[LINK_AUDIO_MOVE_CHANNELS];
 
-    /* Discovery filter: hide subscriber from Move's peer count.
-     * Corrupts ALL discovery packets (ALIVE + Response) so the subscriber
-     * peer times out from Move's SDK.  A single ByeBye is sent on demand
-     * (filter activation + each transport Stop) for immediate peer removal.
-     * LinkAudio (chnnlsv) is unaffected — audio keeps flowing. */
-    volatile int filter_subscriber_alive;    /* 1 = corrupt discovery packets */
-    volatile int byebye_pending;             /* 1 = next ALIVE becomes ByeBye */
-    uint8_t subscriber_node_id[16];          /* subscriber's 16-byte nodeId */
-    volatile int subscriber_node_id_known;   /* 1 = nodeId captured from ALIVE */
+    /* Quantum avoidance: ByeBye-on-Stop + fast reconnect on Play.
+     * While stopped, recvfrom hook drops all incoming discovery ALIVEs
+     * AND RESPONSEs so Move sees numPeers=0 (RESPONSEs are replies to
+     * Move's own outbound ALIVEs and also trigger sawPeerOnGateway).
+     * On Stop, ALIVEs are rewritten to ByeByes to evict existing peers.
+     * On Play, filter lifts; subscriber's ALIVE re-establishes audio.
+     * play_mute_remaining suppresses mailbox fallback during reconnect. */
+    volatile int filter_active;            /* 1 = DROP all incoming ALIVEs + RESPONSEs */
+    volatile int byebye_pending;           /* >0 = convert next N ALIVEs to ByeByes */
+    volatile int play_mute_remaining;      /* frames until mailbox fallback re-enabled */
+    volatile uint32_t filter_drops;        /* packets dropped by filter */
+    volatile uint32_t filter_byebyes;      /* ByeByes injected */
+    volatile uint32_t discovery_packets;   /* total discovery packets seen */
 
     /* Debug/stats */
     volatile uint32_t packets_intercepted;
     volatile uint32_t packets_published;
     volatile uint32_t underruns;
     volatile uint32_t overruns;   /* ring buffer overflow (producer too far ahead) */
-
-    /* ByeBye rewrite diagnostics */
-    volatile uint32_t discovery_packets_seen;   /* total _asdp_v packets received */
-    volatile uint32_t alive_packets_rewritten;  /* ALIVE→ByeBye rewrites done */
-    volatile uint32_t recvfrom_calls;           /* total recvfrom hook invocations */
-    volatile uint32_t recvmsg_calls;            /* total recvmsg hook invocations */
 } link_audio_state_t;
 
 #endif /* LINK_AUDIO_H */
