@@ -103,11 +103,13 @@ typedef struct {
     /* Per-channel fade-in state to prevent clicks when audio resumes */
     volatile int fade_samples_remaining[LINK_AUDIO_MOVE_CHANNELS];
 
-    /* ALIVE→ByeBye rewrite: hide subscriber from Move's peer count.
-     * The recvfrom hook rewrites discovery ALIVE packets from the subscriber
-     * to ByeBye, so Move's numPeers stays 0 (no quantum on Play).
+    /* Discovery filter: hide subscriber from Move's peer count.
+     * Corrupts ALL discovery packets (ALIVE + Response) so the subscriber
+     * peer times out from Move's SDK.  A single ByeBye is sent on demand
+     * (filter activation + each transport Stop) for immediate peer removal.
      * LinkAudio (chnnlsv) is unaffected — audio keeps flowing. */
-    volatile int filter_subscriber_alive;    /* 1 = rewrite ALIVE→ByeBye */
+    volatile int filter_subscriber_alive;    /* 1 = corrupt discovery packets */
+    volatile int byebye_pending;             /* 1 = next ALIVE becomes ByeBye */
     uint8_t subscriber_node_id[16];          /* subscriber's 16-byte nodeId */
     volatile int subscriber_node_id_known;   /* 1 = nodeId captured from ALIVE */
 

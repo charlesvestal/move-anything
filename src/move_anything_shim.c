@@ -2418,10 +2418,12 @@ static void link_audio_intercept_audio(const uint8_t *pkt)
 
     /* Auto-activate ALIVE filter once audio is flowing.
      * ~1000 packets = ~3s of audio across 5 channels — enough time
-     * for the subscriber to complete discovery and chnnlsv handshake. */
+     * for the subscriber to complete discovery and chnnlsv handshake.
+     * Queue a ByeBye to immediately remove the subscriber peer. */
     if (!link_audio.filter_subscriber_alive &&
         link_audio.packets_intercepted == 1000) {
         link_audio.filter_subscriber_alive = 1;
+        link_audio.byebye_pending = 1;
         shadow_log("Link Audio: auto-activated ALIVE filter (audio established)");
     }
 }
@@ -2515,33 +2517,22 @@ static int link_audio_maybe_rewrite_alive(uint8_t *pkt, ssize_t len)
     link_audio.discovery_packets_seen++;
     uint8_t msg_type = pkt[8];
 
-    /* When filtering, we need to both REMOVE existing peers and PREVENT
-     * new ones from appearing.  Three mechanisms:
-     *
-     * 1) Rate-limited ByeBye (2/sec): actively removes peers from SDK
-     * 2) Corrupt ALIVEs between ByeByes: SDK ignores unrecognized packets
-     * 3) Corrupt Response packets: prevents peer re-addition via
-     *    the ALIVE→Response handshake (Move sends ALIVE, subscriber
-     *    responds, and that Response would re-establish the peer).
-     *
-     * This keeps numPeers=0 without flooding the SDK with ByeBye work. */
+    /* When filtering: corrupt ALL discovery packets so the subscriber peer
+     * eventually times out (~8s) and numPeers drops to 0.
+     * On demand (filter activation + transport Stop), send exactly ONE
+     * ByeBye for immediate peer removal.  No continuous ByeBye flood,
+     * so no SDK lock contention or audio choppiness. */
     if (link_audio.filter_subscriber_alive &&
         (msg_type == LINK_DISCOVERY_TYPE_ALIVE ||
          msg_type == LINK_DISCOVERY_TYPE_RESPONSE)) {
 
-        if (msg_type == LINK_DISCOVERY_TYPE_ALIVE) {
-            static struct timespec last_rewrite = {0, 0};
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            long elapsed_ms = (now.tv_sec - last_rewrite.tv_sec) * 1000 +
-                              (now.tv_nsec - last_rewrite.tv_nsec) / 1000000;
-            if (elapsed_ms >= 100) {  /* 10/s — fast peer removal, low SDK overhead */
-                /* Rewrite to ByeBye — actively removes the peer */
-                pkt[8] = LINK_DISCOVERY_TYPE_BYEBYE;
-                last_rewrite = now;
-                link_audio.alive_packets_rewritten++;
-                return 1;
-            }
+        if (msg_type == LINK_DISCOVERY_TYPE_ALIVE && link_audio.byebye_pending) {
+            /* Send exactly one ByeBye to immediately remove the peer */
+            pkt[8] = LINK_DISCOVERY_TYPE_BYEBYE;
+            link_audio.byebye_pending = 0;
+            link_audio.alive_packets_rewritten++;
+            shadow_log("Link Audio: sent ByeBye (peer removal)");
+            return 1;
         }
 
         /* Corrupt magic so SDK ignores this packet entirely */
@@ -6668,19 +6659,13 @@ static void shadow_inprocess_process_midi(void) {
             /* Sampler sees clock from cable 0 only (Move internal) to avoid double-counting */
             if (cable == 0) {
                 sampler_on_clock(status_usb);
-                /* Link Audio ALIVE→ByeBye filter control:
-                 * Stop  → start filtering subscriber's ALIVE packets
-                 *          so numPeers drops to 0 (no quantum on Play).
-                 * Start → stop filtering (audio was never interrupted). */
+                /* Link Audio: on transport Stop, queue a ByeBye to immediately
+                 * remove the subscriber peer so next Play starts without quantum.
+                 * Filter stays on permanently — no need to toggle on Start. */
                 if (status_usb == 0xFC) {
-                    if (link_audio.enabled) {
-                        link_audio.filter_subscriber_alive = 1;
-                        shadow_log("Link Audio: ALIVE filter ON (transport stopped)");
-                    }
-                } else if (status_usb == 0xFA || status_usb == 0xFB) {
-                    if (link_audio.enabled) {
-                        link_audio.filter_subscriber_alive = 0;
-                        shadow_log("Link Audio: ALIVE filter OFF (transport started)");
+                    if (link_audio.enabled && link_audio.filter_subscriber_alive) {
+                        link_audio.byebye_pending = 1;
+                        shadow_log("Link Audio: ByeBye queued (transport stopped)");
                     }
                 }
             }
