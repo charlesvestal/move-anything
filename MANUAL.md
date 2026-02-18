@@ -76,7 +76,8 @@ MIDI FX → Sound Generator → Audio FX 1 → Audio FX 2
 
 1. Navigate to an empty position and click the jog wheel
 2. Choose from installed modules of that type
-3. To change an existing module: hold **Shift** and click the jog wheel
+
+**Tip:** To swap a module that's already loaded, highlight it in the slot editor and hold **Shift + Jog Click**. This opens the module picker so you can replace it without clearing the slot first.
 
 ### Using Modules
 
@@ -96,7 +97,12 @@ The last position in each slot contains settings:
 | **Knob 1-8** | Assign any module parameter to a knob. These work even in normal Move mode (hold Shift + turn knob). |
 | **Volume** | Slot volume level |
 | **Receive Ch** | MIDI channel this slot listens to (match your Move track's MIDI Out) |
-| **Forward Ch** | MIDI channel sent to the synth module (use for multitimbral patches) |
+| **Forward Ch** | MIDI channel sent to the synth module (see below) |
+
+**Forward Channel modes:**
+- **Auto** (default): Remaps MIDI to the slot's receive channel. If Receive Ch is "All", passes through unchanged.
+- **Thru**: Passes the original MIDI channel through unchanged — useful for multitimbral synths that respond differently on each channel.
+- **1-16**: Forces all MIDI to a specific channel regardless of what was received.
 
 ### Slot Presets
 
@@ -122,39 +128,63 @@ Access via **Shift+Vol + Menu**. Contains four audio effect slots that process t
 
 ---
 
-## Routing Move Tracks Through Custom FX
+## Link Audio (Move 2.0+)
 
-On Move firmware 2.0.0+, you can route Move's own track audio through Move Everything's audio effects using Link Audio. This lets you add effects like CloudSeed reverb, TapeDelay, or NAM amp models to your native Move tracks.
+On Move firmware 2.0.0+, Link Audio lets you route Move's own track audio through Move Everything's effects. This gives you access to effects like CloudSeed reverb, TapeDelay, or NAM amp models on your native Move tracks — but it changes how audio is mixed. Understanding the tradeoffs helps you decide when to use it.
+
+### Link Audio On vs Off
+
+| | **Link Audio On** | **Link Audio Off** |
+|---|---|---|
+| **ME synths** | Processed through slot FX and Master FX | Processed through slot FX and Master FX |
+| **Native Move tracks** | Routed through ME slot FX per track | Stay on Move's native path |
+| **Move's native Master FX** | Bypassed — ME rebuilds the mix from per-track streams | Active — applied to Move tracks normally |
+| **ME Master FX** | Processes everything (Move tracks + ME synths) | Processes everything (Move post-native-FX + ME synths) |
+| **Play delay** | Brief delay when pressing Play (Link quantum sync) | No delay |
+
+### How It Works
+
+**Link Audio On:** Move streams each track's audio separately via the Link protocol. Move Everything intercepts these per-track streams, runs them through the corresponding slot's audio FX (combined with any ME synth in that slot), and reconstructs the final mix. Because ME is working with pre-mix audio, Move's native Master FX is bypassed entirely.
+
+```
+Move Track 1 → Slot 1 FX → ┐
+Move Track 2 → Slot 2 FX → ├→ ME Master FX → Output
+Move Track 3 → Slot 3 FX → │
+Move Track 4 → Slot 4 FX → ┘
+(+ ME synths mixed in per slot)
+```
+
+**Link Audio Off:** Move's audio goes through its normal path including native Master FX. ME synths are processed through their slot FX and mixed in. Everything combined runs through ME Master FX.
+
+```
+Move (all tracks + native Master FX) → ┐
+ME Slot 1 (synth → FX) ────────────────├→ ME Master FX → Output
+ME Slot 2 (synth → FX) ────────────────│
+...                                     ┘
+```
 
 ### Setup
 
 1. **Enable Link on Move**: Go to Move's Settings > Link and toggle it on. This runs entirely on-device — no WiFi or USB connection is needed.
-2. **Install or update Move Everything** — the installer enables Link Audio automatically.
+2. **Install or update Move Everything** — the installer enables Link Audio support, but routing is off by default.
+3. **Enable routing**: In Master FX Settings (**Shift+Vol + Menu**, scroll to Settings), toggle **Link Audio** on. This routes Move's per-track audio through ME's slot FX.
 
-### How It Works
-
-When Link Audio is enabled, Move streams each track's audio separately. Move Everything intercepts these streams and routes them through the audio FX in the corresponding slot:
-
-```
-Move Track 1 audio → Slot 1 Audio FX 1 → Audio FX 2 → mixed output
-Move Track 2 audio → Slot 2 Audio FX 1 → Audio FX 2 → mixed output
-...
-```
-
-This means you can set up a slot with just audio effects (no synth) and it will process that Move track's audio.
+**Note:** A restart of Move is sometimes required for the Link Audio subscriber to begin capturing audio. If you don't hear Move tracks being processed after enabling routing, restart Move.
 
 ### Example: Adding Reverb to a Move Track
 
-1. Open Slot 1 (**Shift+Vol + Track 1**)
-2. Navigate to **Audio FX 1** and load CloudSeed (or any audio effect)
-3. Optionally load a second effect in **Audio FX 2**
-4. Play Move Track 1 — you'll hear it processed through your effects
+1. Make sure Link Audio is enabled (see Setup above)
+2. Open Slot 1 (**Shift+Vol + Track 1**)
+3. Navigate to **Audio FX 1** and load CloudSeed (or any audio effect)
+4. Optionally load a second effect in **Audio FX 2**
+5. Play Move Track 1 — you'll hear it processed through your effects
 
 ### Notes
 
 - Move must be on firmware **2.0.0 or later** for Link Audio support
 - Each Move track maps to the matching slot number (Track 1 → Slot 1, etc.)
 - A slot can have both a synth (triggered by MIDI) and audio FX (processing Move's track audio) simultaneously
+- When pressing Play, Move syncs to the Link quantum, which introduces a brief delay before playback starts
 
 ---
 
@@ -315,6 +345,28 @@ Settings:
 - **Volume**: 0-100
 
 Can be enabled during installation with `--enable-screen-reader`.
+
+---
+
+## Display Mirror
+
+Stream Move's 128x64 OLED display to any browser on your network in real time. Useful for remote monitoring, screen capture, or development.
+
+### Setup
+
+1. Open **Master FX > Settings** (Shift+Vol + Menu, then scroll to Settings)
+2. Toggle **Mirror Display** to **On**
+3. Open `http://move.local:7681` in a browser
+
+The display updates at ~30 fps and shows whatever is on screen - both normal Move UI and Shadow UI.
+
+### Notes
+
+- Mirror Display is **off by default** and must be enabled via the settings toggle
+- The setting persists across reboots
+- The display server runs on port 7681 and starts automatically at boot
+- When mirroring is off, the server is running but idle (no overhead from the shim)
+- Multiple browsers can connect simultaneously (up to 8 clients)
 
 ---
 

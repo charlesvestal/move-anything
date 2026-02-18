@@ -51,8 +51,6 @@
 unsigned char *global_mmap_addr = NULL;  /* Points to shadow_mailbox (what Move sees) */
 unsigned char *hardware_mmap_addr = NULL; /* Points to real hardware mailbox */
 static unsigned char shadow_mailbox[4096] __attribute__((aligned(64))); /* Shadow buffer for Move */
-FILE *output_file;
-int frame_counter = 0;
 
 /* ============================================================================
  * SHADOW INSTRUMENT SUPPORT
@@ -122,12 +120,16 @@ static volatile float shadow_master_volume;  /* Defined later */
 /* Feature flags from config/features.json */
 static bool shadow_ui_enabled = true;      /* Shadow UI enabled by default */
 static bool standalone_enabled = true;     /* Standalone mode enabled by default */
+static bool display_mirror_enabled = false; /* Display mirror off by default */
 
 /* Link Audio interception and publishing state */
 static link_audio_state_t link_audio;
+static uint32_t la_prev_intercepted = 0;  /* previous packets_intercepted (stale tracking) */
+static uint32_t la_stale_frames = 0;      /* blocks since last new packet */
 static int16_t shadow_slot_capture[SHADOW_CHAIN_INSTANCES][FRAMES_PER_BLOCK * 2];
 
 static void launch_shadow_ui(void);
+static void launch_link_subscriber(void);
 static void load_feature_config(void);
 
 static uint32_t shadow_checksum(const uint8_t *buf, size_t len)
@@ -808,6 +810,18 @@ static int shadow_deferred_dsp_valid = 0;
 static int16_t shadow_slot_deferred[SHADOW_CHAIN_INSTANCES][FRAMES_PER_BLOCK * 2];
 static int shadow_slot_deferred_valid[SHADOW_CHAIN_INSTANCES];
 
+/* Per-slot idle detection: skip render_block when output has been silent.
+ * Wakes on MIDI dispatch with one-frame latency (2.9ms, inaudible). */
+#define DSP_IDLE_THRESHOLD 344       /* ~1 second of silence before sleeping */
+#define DSP_SILENCE_LEVEL 4          /* abs(sample) below this = silence */
+static int shadow_slot_silence_frames[SHADOW_CHAIN_INSTANCES];
+static int shadow_slot_idle[SHADOW_CHAIN_INSTANCES];
+/* Phase 2: track FX output silence to skip FX processing too.
+ * FX keeps running while reverb/delay tails decay (synth idle, FX active).
+ * Once FX output is also silent, skip FX entirely. */
+static int shadow_slot_fx_silence_frames[SHADOW_CHAIN_INSTANCES];
+static int shadow_slot_fx_idle[SHADOW_CHAIN_INSTANCES];
+
 /* ==========================================================================
  * Shadow Capture Rules - Allow slots to capture specific MIDI controls
  * ========================================================================== */
@@ -1183,12 +1197,11 @@ static volatile int shadow_dbus_running = 0;
 /* Move's D-Bus socket FD (ORIGINAL, for send() hook to recognize) */
 static int move_dbus_socket_fd = -1;
 static sd_bus *move_sdbus_conn = NULL;
-static DBusConnection *shadow_dbus_conn_old = NULL; /* Old libdbus listener (keep for compatibility) */
 static pthread_mutex_t move_dbus_conn_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Shadow buffer for pending screen reader announcements */
-#define MAX_PENDING_ANNOUNCEMENTS 16
-#define MAX_ANNOUNCEMENT_LEN 256
+#define MAX_PENDING_ANNOUNCEMENTS 4
+#define MAX_ANNOUNCEMENT_LEN 8192
 static char pending_announcements[MAX_PENDING_ANNOUNCEMENTS][MAX_ANNOUNCEMENT_LEN];
 static int pending_announcement_count = 0;
 static pthread_mutex_t pending_announcements_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -1250,6 +1263,10 @@ typedef enum {
     NATIVE_RESAMPLE_BRIDGE_OVERWRITE
 } native_resample_bridge_mode_t;
 static volatile native_resample_bridge_mode_t native_resample_bridge_mode = NATIVE_RESAMPLE_BRIDGE_OFF;
+
+/* Link Audio routing: when enabled, per-track Link Audio streams are routed through
+ * shadow slot FX chains (zero-rebuild path).  Off by default — user enables in MFX settings. */
+static volatile int link_audio_routing_enabled = 0;
 
 /* Snapshot of final mixed output (AUDIO_OUT) at pre-master tap for native resample bridge. */
 static int16_t native_total_mix_snapshot[FRAMES_PER_BLOCK * 2];
@@ -1407,41 +1424,52 @@ static void native_resample_bridge_load_mode_from_shadow_config(void)
     json[nread] = '\0';
 
     char *mode_key = strstr(json, "\"resample_bridge_mode\"");
-    if (!mode_key) {
-        free(json);
-        return;
-    }
-
-    char *colon = strchr(mode_key, ':');
-    if (!colon) {
-        free(json);
-        return;
-    }
-    colon++;
-    while (*colon == ' ' || *colon == '\t' || *colon == '"') colon++;
-
-    char token[32];
-    size_t idx = 0;
-    while (*colon && idx + 1 < sizeof(token)) {
-        char c = *colon;
-        if (c == '"' || c == ',' || c == '}' || c == '\n' || c == '\r' || c == ' ' || c == '\t') {
-            break;
+    if (mode_key) {
+        char *colon = strchr(mode_key, ':');
+        if (colon) {
+            colon++;
+            while (*colon == ' ' || *colon == '\t' || *colon == '"') colon++;
+            char token[32];
+            size_t idx = 0;
+            while (*colon && idx + 1 < sizeof(token)) {
+                char c = *colon;
+                if (c == '"' || c == ',' || c == '}' || c == '\n' || c == '\r' || c == ' ' || c == '\t')
+                    break;
+                token[idx++] = c;
+                colon++;
+            }
+            token[idx] = '\0';
+            if (token[0]) {
+                native_resample_bridge_mode_t new_mode = native_resample_bridge_mode_from_text(token);
+                native_resample_bridge_mode = new_mode;
+                char msg[128];
+                snprintf(msg, sizeof(msg), "Native resample bridge mode: %s (from config)",
+                         native_resample_bridge_mode_name(new_mode));
+                shadow_log(msg);
+            }
         }
-        token[idx++] = c;
-        colon++;
     }
-    token[idx] = '\0';
+
+    /* Load Link Audio routing setting */
+    char *la_key = strstr(json, "\"link_audio_routing\"");
+    if (la_key) {
+        char *colon = strchr(la_key, ':');
+        if (colon) {
+            colon++;
+            while (*colon == ' ' || *colon == '\t') colon++;
+            if (strncmp(colon, "true", 4) == 0 || *colon == '1') {
+                link_audio_routing_enabled = 1;
+            } else {
+                link_audio_routing_enabled = 0;
+            }
+            char msg[64];
+            snprintf(msg, sizeof(msg), "Link Audio routing: %s (from config)",
+                     link_audio_routing_enabled ? "ON" : "OFF");
+            shadow_log(msg);
+        }
+    }
+
     free(json);
-
-    if (!token[0]) return;
-
-    native_resample_bridge_mode_t new_mode = native_resample_bridge_mode_from_text(token);
-    native_resample_bridge_mode = new_mode;
-
-    char msg[128];
-    snprintf(msg, sizeof(msg), "Native resample bridge mode: %s (from config)",
-             native_resample_bridge_mode_name(new_mode));
-    shadow_log(msg);
 }
 
 static native_sampler_source_t native_sampler_source_from_text(const char *text)
@@ -1539,36 +1567,13 @@ static void native_resample_bridge_apply_overwrite_makeup(const int16_t *src,
         native_bridge_makeup_applied_gain = native_gain;
         native_bridge_makeup_limited = limiter_hit;
     } else if (shadow_master_fx_chain_active()) {
-        /* MFX-active case: snapshot is already post-FX.
-         * Compensate by inverse master volume so playback through Move's
-         * master volume lands at live level, then cap by available headroom
-         * to avoid hard clipping. */
-        float applied_gain = (inv_mv < max_makeup) ? inv_mv : max_makeup;
-        float peak = 0.0f;
-        for (size_t i = 0; i < samples; i++) {
-            float a = fabsf((float)src[i]);
-            if (a > peak) peak = a;
-        }
-
-        int limiter_hit = 0;
-        if (peak > 1.0f) {
-            float safe_gain = 32760.0f / peak;
-            if (applied_gain > safe_gain) {
-                applied_gain = safe_gain;
-                limiter_hit = 1;
-            }
-        }
-
-        for (size_t i = 0; i < samples; i++) {
-            float scaled = (float)src[i] * applied_gain;
-            if (scaled > 32767.0f) scaled = 32767.0f;
-            if (scaled < -32768.0f) scaled = -32768.0f;
-            dst[i] = (int16_t)lroundf(scaled);
-        }
-
-        native_bridge_makeup_desired_gain = inv_mv;
-        native_bridge_makeup_applied_gain = applied_gain;
-        native_bridge_makeup_limited = limiter_hit;
+        /* MFX-active case: snapshot is at unity level (MFX processes at unity,
+         * mv applied afterward).  Pass through as-is — Move applies master
+         * volume on the resampling path, landing at the correct live level. */
+        memcpy(dst, src, samples * sizeof(int16_t));
+        native_bridge_makeup_desired_gain = 1.0f;
+        native_bridge_makeup_applied_gain = 1.0f;
+        native_bridge_makeup_limited = 0;
     } else {
         /* Split not valid and no MFX path available — unity copy */
         memcpy(dst, src, samples * sizeof(int16_t));
@@ -2581,65 +2586,8 @@ ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags)
 
 static void link_audio_start_publisher(void)
 {
-    /* Publisher disabled: raw chnnlsv packets aren't discoverable by Live.
-     * Needs proper Link SDK integration to appear as a peer. */
+    /* Publisher disabled on main: needs Link SDK integration (see link-audio-publish branch) */
     return;
-
-    if (link_audio.publisher_running) return;
-    link_audio.publisher_running = 1;
-
-    /* Generate publisher PeerID and session ID */
-    FILE *urandom = fopen("/dev/urandom", "r");
-    if (urandom) {
-        fread(link_audio.publisher_peer_id, 1, 8, urandom);
-        fread(link_audio.publisher_session_id, 1, 8, urandom);
-        fclose(urandom);
-    } else {
-        uint64_t t = (uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32);
-        memcpy(link_audio.publisher_peer_id, &t, 8);
-        t ^= 0xDEADBEEFCAFE1234ULL;
-        memcpy(link_audio.publisher_session_id, &t, 8);
-    }
-
-    /* Initialize publisher channels */
-    for (int i = 0; i < LINK_AUDIO_SHADOW_CHANNELS; i++) {
-        link_audio_pub_channel_t *pc = &link_audio.pub_channels[i];
-        memset(pc, 0, sizeof(*pc));
-        snprintf(pc->name, sizeof(pc->name), "Shadow-%d", i + 1);
-        /* Generate unique channel IDs */
-        memcpy(pc->channel_id, link_audio.publisher_peer_id, 8);
-        pc->channel_id[0] ^= (uint8_t)(i + 1);  /* make each unique */
-    }
-
-    /* Create publisher socket */
-    link_audio.publisher_socket_fd = socket(AF_INET6, SOCK_DGRAM, 0);
-    if (link_audio.publisher_socket_fd < 0) {
-        shadow_log("Link Audio: publisher failed to create socket");
-        link_audio.publisher_running = 0;
-        return;
-    }
-
-    /* Allow address reuse */
-    int reuse = 1;
-    setsockopt(link_audio.publisher_socket_fd, SOL_SOCKET, SO_REUSEADDR,
-               &reuse, sizeof(reuse));
-
-    /* Set non-blocking for recvfrom */
-    int fl = fcntl(link_audio.publisher_socket_fd, F_GETFL, 0);
-    fcntl(link_audio.publisher_socket_fd, F_SETFL, fl | O_NONBLOCK);
-
-    /* Bind to same interface as Move */
-    struct sockaddr_in6 bind_addr;
-    memset(&bind_addr, 0, sizeof(bind_addr));
-    bind_addr.sin6_family = AF_INET6;
-    bind_addr.sin6_addr = in6addr_any;
-    bind_addr.sin6_port = 0;  /* ephemeral port */
-    bind(link_audio.publisher_socket_fd, (struct sockaddr *)&bind_addr,
-         sizeof(bind_addr));
-
-    pthread_create(&link_audio.publisher_thread, NULL,
-                   link_audio_publisher_thread, NULL);
-    shadow_log("Link Audio: publisher thread started");
 }
 
 /* Build a session announcement packet for the shadow publisher */
@@ -2978,6 +2926,24 @@ static DBusHandlerResult shadow_dbus_filter(DBusConnection *conn, DBusMessage *m
         const char *sender = dbus_message_get_sender(msg);
         int msg_type = dbus_message_get_type(msg);
 
+        /* Log WebServiceAuthentication method calls (challenge/PIN flow) */
+        if (msg_type == DBUS_MESSAGE_TYPE_METHOD_CALL &&
+            iface && strcmp(iface, "com.ableton.move.WebServiceAuthentication") == 0) {
+            char arg_preview[128] = "";
+            DBusMessageIter iter;
+            if (dbus_message_iter_init(msg, &iter) &&
+                dbus_message_iter_get_arg_type(&iter) == DBUS_TYPE_STRING) {
+                const char *s = NULL;
+                dbus_message_iter_get_basic(&iter, &s);
+                if (s) snprintf(arg_preview, sizeof(arg_preview), " arg0=\"%.60s\"", s);
+            }
+            char logbuf[512];
+            snprintf(logbuf, sizeof(logbuf), "D-Bus AUTH: %s.%s path=%s sender=%s%s",
+                     iface, member ? member : "?", path ? path : "?",
+                     sender ? sender : "?", arg_preview);
+            shadow_log(logbuf);
+        }
+
         if (msg_type == DBUS_MESSAGE_TYPE_SIGNAL) {
             /* Extract first string arg if present */
             char arg_preview[128] = "";
@@ -3103,6 +3069,19 @@ static void *shadow_dbus_thread_func(void *arg)
     const char *rule_all = "type='signal'";
     dbus_bus_add_match(shadow_dbus_conn, rule_all, &err);
     dbus_connection_flush(shadow_dbus_conn);
+
+    /* Also try to eavesdrop on WebServiceAuthentication method calls (PIN flow) */
+    if (!dbus_error_is_set(&err)) {
+        const char *rule_auth = "type='method_call',interface='com.ableton.move.WebServiceAuthentication'";
+        dbus_bus_add_match(shadow_dbus_conn, rule_auth, &err);
+        if (dbus_error_is_set(&err)) {
+            shadow_log("D-Bus: Auth eavesdrop match failed (expected - may need display-based PIN detection)");
+            dbus_error_free(&err);
+        } else {
+            shadow_log("D-Bus: Auth eavesdrop match added - will monitor setSecret calls");
+            dbus_connection_flush(shadow_dbus_conn);
+        }
+    }
 
     if (dbus_error_is_set(&err)) {
         shadow_log("D-Bus: Failed to add match rule");
@@ -3716,6 +3695,13 @@ static void shift_knob_update_overlay(int slot, int knob_num, uint8_t cc_value)
         strncpy(shift_knob_overlay_value, "Unmapped", sizeof(shift_knob_overlay_value) - 1);
         shift_knob_overlay_value[sizeof(shift_knob_overlay_value) - 1] = '\0';
     }
+
+    /* Screen reader: announce param and value */
+    {
+        char sr_buf[192];
+        snprintf(sr_buf, sizeof(sr_buf), "%s, %s", shift_knob_overlay_param, shift_knob_overlay_value);
+        send_screenreader_announcement(sr_buf);
+    }
 }
 
 /* ==========================================================================
@@ -3989,6 +3975,24 @@ static float sampler_get_bpm(tempo_source_t *source) {
     return 120.0f;
 }
 
+/* Build a screen reader string describing current sampler menu item */
+static void sampler_announce_menu_item(void) {
+    char sr_buf[128];
+    if (sampler_menu_cursor == SAMPLER_MENU_SOURCE) {
+        snprintf(sr_buf, sizeof(sr_buf), "Source, %s",
+                 sampler_source == SAMPLER_SOURCE_RESAMPLE ? "Resample" : "Move Input");
+    } else if (sampler_menu_cursor == SAMPLER_MENU_DURATION) {
+        int bars = sampler_duration_options[sampler_duration_index];
+        if (bars == 0)
+            snprintf(sr_buf, sizeof(sr_buf), "Duration, Until stop");
+        else
+            snprintf(sr_buf, sizeof(sr_buf), "Duration, %d bar%s", bars, bars > 1 ? "s" : "");
+    } else {
+        return;
+    }
+    send_screenreader_announcement(sr_buf);
+}
+
 static void sampler_start_recording(void) {
     if (sampler_writer_running) return;
 
@@ -4076,6 +4080,7 @@ static void sampler_start_recording(void) {
     sampler_state = SAMPLER_RECORDING;
     sampler_overlay_active = 1;
     sampler_overlay_timeout = 0;  /* Stay active while recording */
+    send_screenreader_announcement("Recording");
 
     char msg[256];
     if (bars > 0)
@@ -4123,6 +4128,8 @@ static void sampler_stop_recording(void) {
 
     sampler_current_recording[0] = '\0';
     sampler_state = SAMPLER_IDLE;
+
+    send_screenreader_announcement("Sample saved");
 
     /* Keep fullscreen active for "saved" message, then timeout */
     sampler_overlay_active = 1;
@@ -4345,6 +4352,7 @@ static void *skipback_writer_func(void *arg) {
     shadow_log(msg);
 
     skipback_overlay_timeout = SKIPBACK_OVERLAY_FRAMES;
+    send_screenreader_announcement("Skipback saved");
     __atomic_store_n(&skipback_saving, 0, __ATOMIC_RELEASE);
     return NULL;
 }
@@ -4628,12 +4636,26 @@ static void load_feature_config(void)
         }
     }
 
+    /* Parse display_mirror_enabled (defaults to false) */
+    const char *display_mirror_key = strstr(config_buf, "\"display_mirror_enabled\"");
+    if (display_mirror_key) {
+        const char *colon = strchr(display_mirror_key, ':');
+        if (colon) {
+            colon++;
+            while (*colon == ' ' || *colon == '\t') colon++;
+            if (strncmp(colon, "true", 4) == 0) {
+                display_mirror_enabled = true;
+            }
+        }
+    }
+
     char log_msg[256];
     snprintf(log_msg, sizeof(log_msg),
-             "Features: shadow_ui=%s, standalone=%s, link_audio=%s",
+             "Features: shadow_ui=%s, standalone=%s, link_audio=%s, display_mirror=%s",
              shadow_ui_enabled ? "enabled" : "disabled",
              standalone_enabled ? "enabled" : "disabled",
-             link_audio.enabled ? "enabled" : "disabled");
+             link_audio.enabled ? "enabled" : "disabled",
+             display_mirror_enabled ? "enabled" : "disabled");
     shadow_log(log_msg);
 }
 
@@ -4718,6 +4740,7 @@ static void shadow_save_state(void)
     char master_fx_chain_buf[2048] = "";
     int overlay_knobs_mode = -1;
     int resample_bridge_mode = -1;
+    int link_audio_routing_saved = -1;
 
     if (f) {
         fseek(f, 0, SEEK_END);
@@ -4826,6 +4849,17 @@ static void shadow_save_state(void)
                     }
                 }
 
+                /* Extract link_audio_routing boolean */
+                char *lar = strstr(json, "\"link_audio_routing\":");
+                if (lar) {
+                    lar = strchr(lar, ':');
+                    if (lar) {
+                        lar++;
+                        while (*lar == ' ') lar++;
+                        link_audio_routing_saved = (strncmp(lar, "true", 4) == 0) ? 1 : 0;
+                    }
+                }
+
                 free(json);
             }
         }
@@ -4855,6 +4889,9 @@ static void shadow_save_state(void)
     }
     if (resample_bridge_mode >= 0) {
         fprintf(f, "  \"resample_bridge_mode\": %d,\n", resample_bridge_mode);
+    }
+    if (link_audio_routing_saved >= 0) {
+        fprintf(f, "  \"link_audio_routing\": %s,\n", link_audio_routing_saved ? "true" : "false");
     }
     fprintf(f, "  \"slot_volumes\": [%.3f, %.3f, %.3f, %.3f],\n",
             shadow_chain_slots[0].volume,
@@ -5844,6 +5881,14 @@ static void shadow_chain_dispatch_midi_to_slots(const uint8_t *pkt, int log_on, 
             if (!shadow_chain_slots[i].active) continue;
         }
 
+        /* Wake slot from idle on any MIDI dispatch */
+        if (shadow_slot_idle[i] || shadow_slot_fx_idle[i]) {
+            shadow_slot_idle[i] = 0;
+            shadow_slot_silence_frames[i] = 0;
+            shadow_slot_fx_idle[i] = 0;
+            shadow_slot_fx_silence_frames[i] = 0;
+        }
+
         /* Send MIDI to this slot */
         if (shadow_plugin_v2 && shadow_plugin_v2->on_midi) {
             uint8_t msg[3] = { shadow_chain_remap_channel(i, pkt[1]), pkt[2], pkt[3] };
@@ -6176,6 +6221,17 @@ static void shadow_inprocess_handle_param_request(void) {
                 native_resample_bridge_mode = new_mode;
                 shadow_param->error = 0;
                 shadow_param->result_len = 0;
+            } else if (!has_slot_prefix && strcmp(param_key, "link_audio_routing") == 0) {
+                int val = atoi(shadow_param->value);
+                link_audio_routing_enabled = val ? 1 : 0;
+                {
+                    char msg[64];
+                    snprintf(msg, sizeof(msg), "Link Audio routing: %s",
+                             link_audio_routing_enabled ? "ON" : "OFF");
+                    shadow_log(msg);
+                }
+                shadow_param->error = 0;
+                shadow_param->result_len = 0;
             } else if (strcmp(param_key, "module") == 0) {
                 /* Load or unload master FX slot */
                 int result = shadow_master_fx_slot_load(mfx_slot, shadow_param->value);
@@ -6207,6 +6263,10 @@ static void shadow_inprocess_handle_param_request(void) {
                 int mode = (int)native_resample_bridge_mode;
                 if (mode < 0 || mode > 2) mode = 0;
                 shadow_param->result_len = snprintf(shadow_param->value, SHADOW_PARAM_VALUE_LEN, "%d", mode);
+                shadow_param->error = 0;
+            } else if (!has_slot_prefix && strcmp(param_key, "link_audio_routing") == 0) {
+                shadow_param->result_len = snprintf(shadow_param->value, SHADOW_PARAM_VALUE_LEN, "%d",
+                                                    link_audio_routing_enabled);
                 shadow_param->error = 0;
             } else if (strcmp(param_key, "module") == 0) {
                 strncpy(shadow_param->value, mfx->module_path, SHADOW_PARAM_VALUE_LEN - 1);
@@ -6724,8 +6784,6 @@ static void shadow_inprocess_process_midi(void) {
                 overtake_dsp_fx->on_midi(overtake_dsp_fx_inst, msg, 3, MOVE_MIDI_SOURCE_EXTERNAL);
             }
         }
-        /* Raw MIDI format fallback removed - was matching garbage/stale data.
-         * USB MIDI format (with CIN validation) is the proper format for this buffer. */
     }
 }
 
@@ -6734,8 +6792,28 @@ static void shadow_inprocess_mix_audio(void) {
 
     int16_t *mailbox_audio = (int16_t *)(global_mmap_addr + AUDIO_OUT_OFFSET);
     float mv = shadow_master_volume;
-    /* Use one gain topology for all cases: pre-scale ME input by current master factor. */
-    float me_input_scale = (mv < 1.0f) ? mv : 1.0f;
+    int mfx_active = shadow_master_fx_chain_active();
+
+    /* When MFX is active, build the mix at unity level so FX see a consistent
+     * signal regardless of master volume.  Apply mv AFTER MFX instead.
+     * When MFX is off, pre-scale ME by master volume (current behavior). */
+    float me_input_scale;
+    float move_prescale;
+    float link_sub_scale;
+    if (mfx_active) {
+        me_input_scale = 1.0f;
+        link_sub_scale = 1.0f;
+        if (mv > 0.001f) {
+            move_prescale = 1.0f / mv;
+            if (move_prescale > 20.0f) move_prescale = 20.0f;
+        } else {
+            move_prescale = 1.0f;
+        }
+    } else {
+        me_input_scale = (mv < 1.0f) ? mv : 1.0f;
+        move_prescale = 1.0f;
+        link_sub_scale = mv;
+    }
 
     /* Save Move's audio for bridge split component (before mixing ME). */
     memcpy(native_bridge_move_component, mailbox_audio, sizeof(native_bridge_move_component));
@@ -6743,7 +6821,7 @@ static void shadow_inprocess_mix_audio(void) {
     int32_t mix[FRAMES_PER_BLOCK * 2];
     int32_t me_full[FRAMES_PER_BLOCK * 2];  /* ME at full gain for bridge */
     for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++) {
-        mix[i] = mailbox_audio[i];
+        mix[i] = (int32_t)lroundf((float)mailbox_audio[i] * move_prescale);
         me_full[i] = 0;
     }
 
@@ -6759,7 +6837,8 @@ static void shadow_inprocess_mix_audio(void) {
             /* Inject Move track audio from Link Audio into chain before FX */
             int16_t move_track[FRAMES_PER_BLOCK * 2];
             int have_move_track = 0;
-            if (link_audio.enabled && shadow_chain_set_inject_audio &&
+            if (link_audio.enabled && link_audio_routing_enabled &&
+                shadow_chain_set_inject_audio &&
                 s < link_audio.move_channel_count) {
                 have_move_track = link_audio_read_channel(s, move_track, FRAMES_PER_BLOCK);
                 if (have_move_track) {
@@ -6800,10 +6879,11 @@ static void shadow_inprocess_mix_audio(void) {
 
     /* Subtract Move track audio from mix to avoid doubling.
      * Link Audio per-track streams are pre-fader; mailbox is post-fader.
-     * Scale subtraction by Move's volume so the levels match. */
+     * When MFX active: mailbox was prescaled to unity, subtract at unity.
+     * Otherwise: scale subtraction by Move's volume so the levels match. */
     if (any_injected) {
         for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++)
-            mix[i] -= (int32_t)lroundf((float)move_injected[i] * mv);
+            mix[i] -= (int32_t)lroundf((float)move_injected[i] * link_sub_scale);
     }
 
     /* Save ME full-gain component for bridge split */
@@ -6836,6 +6916,15 @@ static void shadow_inprocess_mix_audio(void) {
      * capture independent of master-volume attenuation. */
     native_capture_total_mix_snapshot_from_buffer(output_buffer);
 
+    /* Apply master volume AFTER MFX.  When MFX is active the mix was built
+     * at unity level; scale down now so the DAC output respects master volume.
+     * When MFX is off the mix is already at mv level — no extra scaling. */
+    if (mfx_active && mv < 0.9999f) {
+        for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++) {
+            output_buffer[i] = (int16_t)lroundf((float)output_buffer[i] * mv);
+        }
+    }
+
     /* Write final output to mailbox */
     memcpy(mailbox_audio, output_buffer, sizeof(output_buffer));
 }
@@ -6848,7 +6937,7 @@ static void shadow_inprocess_mix_audio(void) {
 
 /* MIDI send callback for overtake DSP → chain slots */
 static int overtake_midi_send_internal(const uint8_t *msg, int len) {
-    if (!msg || len < 3) return 0;
+    if (!msg || len < 4) return 0;
     /* Build USB-MIDI packet: [CIN, status, d1, d2] */
     uint8_t cin = (msg[1] >> 4) & 0x0F;
     uint8_t pkt[4] = { cin, msg[1], msg[2], msg[3] };
@@ -7033,6 +7122,20 @@ static void shadow_inprocess_render_to_buffer(void) {
         for (int s = 0; s < SHADOW_CHAIN_INSTANCES; s++) {
             if (!shadow_chain_slots[s].active || !shadow_chain_slots[s].instance) continue;
 
+            /* Idle gate: skip render_block if synth output has been silent.
+             * Buffer is already zeroed, so FX chain in mix_from_buffer still runs
+             * on zeros to let reverb/delay tails decay naturally.
+             * Probe every ~0.5s to detect self-generating audio (LFOs, arps). */
+            if (shadow_slot_idle[s]) {
+                shadow_slot_silence_frames[s]++;
+                if (shadow_slot_silence_frames[s] % 172 != 0) {
+                    /* Not a probe frame — skip render, mark valid so FX still runs */
+                    shadow_slot_deferred_valid[s] = 1;
+                    continue;
+                }
+                /* Probe frame: fall through to render and check output */
+            }
+
             if (same_frame_fx) {
                 /* New path: synth only → per-slot buffer. FX in mix_from_buffer. */
                 shadow_chain_set_external_fx_mode(shadow_chain_slots[s].instance, 1);
@@ -7059,6 +7162,26 @@ static void shadow_inprocess_render_to_buffer(void) {
                     if (mixed < -32768) mixed = -32768;
                     shadow_deferred_dsp_buffer[i] = (int16_t)mixed;
                 }
+            }
+
+            /* Check if synth render output is silent */
+            int16_t *slot_out = same_frame_fx ? shadow_slot_deferred[s] : shadow_deferred_dsp_buffer;
+            int is_silent = 1;
+            for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++) {
+                if (slot_out[i] > DSP_SILENCE_LEVEL || slot_out[i] < -DSP_SILENCE_LEVEL) {
+                    is_silent = 0;
+                    break;
+                }
+            }
+
+            if (is_silent) {
+                shadow_slot_silence_frames[s]++;
+                if (shadow_slot_silence_frames[s] >= DSP_IDLE_THRESHOLD) {
+                    shadow_slot_idle[s] = 1;
+                }
+            } else {
+                shadow_slot_silence_frames[s] = 0;
+                shadow_slot_idle[s] = 0;
             }
         }
     }
@@ -7093,8 +7216,10 @@ static void shadow_inprocess_mix_from_buffer(void) {
 
     int16_t *mailbox_audio = (int16_t *)(global_mmap_addr + AUDIO_OUT_OFFSET);
     float mv = shadow_master_volume;
-    /* Use one gain topology for all cases: pre-scale ME input by current master factor. */
-    float me_input_scale = (mv < 1.0f) ? mv : 1.0f;
+    int mfx_active = shadow_master_fx_chain_active();
+    /* When MFX is active, build the mix at unity level so FX see a consistent
+     * signal regardless of master volume.  Apply mv AFTER MFX instead. */
+    float me_input_scale = mfx_active ? 1.0f : ((mv < 1.0f) ? mv : 1.0f);
 
     /* Save Move's audio for bridge split (before zeroing) */
     memcpy(native_bridge_move_component, mailbox_audio, sizeof(native_bridge_move_component));
@@ -7111,8 +7236,6 @@ static void shadow_inprocess_mix_from_buffer(void) {
      * Session announcements set move_channel_count but don't mean audio
      * is streaming.  Without a subscriber triggering ChannelRequests,
      * the ring buffers are empty and zeroing the mailbox kills all audio. */
-    static uint32_t la_prev_intercepted = 0;
-    static uint32_t la_stale_frames = 0;
     uint32_t la_cur = link_audio.packets_intercepted;
     if (la_cur > la_prev_intercepted) {
         la_stale_frames = 0;
@@ -7123,9 +7246,23 @@ static void shadow_inprocess_mix_from_buffer(void) {
     /* Consider Link Audio active if packets arrived within the last ~290ms */
     int la_receiving = (la_cur > 0 && la_stale_frames < 100);
 
-    int rebuild_from_la = (link_audio.enabled && shadow_chain_process_fx &&
+    int rebuild_from_la = (link_audio.enabled && link_audio_routing_enabled &&
+                           shadow_chain_process_fx &&
                            link_audio.move_channel_count >= 4 &&
                            la_receiving);
+
+    /* When MFX active and NOT rebuilding from Link Audio, the mailbox has
+     * Move's audio at mv level.  Prescale to unity for consistent MFX input. */
+    if (mfx_active && !rebuild_from_la && mv > 0.001f) {
+        float inv = 1.0f / mv;
+        if (inv > 20.0f) inv = 20.0f;
+        for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++) {
+            float scaled = (float)mailbox_audio[i] * inv;
+            if (scaled > 32767.0f) scaled = 32767.0f;
+            if (scaled < -32768.0f) scaled = -32768.0f;
+            mailbox_audio[i] = (int16_t)lroundf(scaled);
+        }
+    }
 
     if (rebuild_from_la) {
         /* Zero the mailbox — all audio reconstructed from Link Audio */
@@ -7144,6 +7281,10 @@ static void shadow_inprocess_mix_from_buffer(void) {
                                shadow_slot_deferred_valid[s]);
 
             if (slot_active) {
+                /* Phase 2 idle gate: skip FX when synth AND FX output are silent
+                 * AND no Link Audio track data is flowing for this slot */
+                if (shadow_slot_fx_idle[s] && shadow_slot_idle[s] && !have_move_track) continue;
+
                 /* Active slot: combine synth + Link Audio, run through FX */
                 int16_t fx_buf[FRAMES_PER_BLOCK * 2];
                 for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++) {
@@ -7158,6 +7299,24 @@ static void shadow_inprocess_mix_from_buffer(void) {
                 /* Run FX chain */
                 shadow_chain_process_fx(shadow_chain_slots[s].instance,
                                         fx_buf, MOVE_FRAMES_PER_BLOCK);
+
+                /* Track FX output silence for phase 2 idle */
+                int fx_silent = 1;
+                for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++) {
+                    if (fx_buf[i] > DSP_SILENCE_LEVEL || fx_buf[i] < -DSP_SILENCE_LEVEL) {
+                        fx_silent = 0;
+                        break;
+                    }
+                }
+                if (fx_silent) {
+                    shadow_slot_fx_silence_frames[s]++;
+                    if (shadow_slot_fx_silence_frames[s] >= DSP_IDLE_THRESHOLD) {
+                        shadow_slot_fx_idle[s] = 1;
+                    }
+                } else {
+                    shadow_slot_fx_silence_frames[s] = 0;
+                    shadow_slot_fx_idle[s] = 0;
+                }
 
                 /* Capture for Link Audio publisher */
                 if (s < LINK_AUDIO_SHADOW_CHANNELS) {
@@ -7177,9 +7336,12 @@ static void shadow_inprocess_mix_from_buffer(void) {
                     me_full[i] += (int32_t)lroundf((float)fx_buf[i] * vol);
                 }
             } else if (have_move_track) {
-                /* Inactive slot: pass Link Audio through at Move's volume level */
+                /* Inactive slot: pass Link Audio through.
+                 * When MFX active: unity level (mv applied after MFX).
+                 * Otherwise: at Move's volume level. */
+                float la_scale = mfx_active ? 1.0f : mv;
                 for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++) {
-                    int32_t scaled = (int32_t)lroundf((float)move_track[i] * mv);
+                    int32_t scaled = (int32_t)lroundf((float)move_track[i] * la_scale);
                     int32_t mixed = (int32_t)mailbox_audio[i] + scaled;
                     if (mixed > 32767) mixed = 32767;
                     if (mixed < -32768) mixed = -32768;
@@ -7192,10 +7354,31 @@ static void shadow_inprocess_mix_from_buffer(void) {
         for (int s = 0; s < SHADOW_CHAIN_INSTANCES; s++) {
             if (!shadow_slot_deferred_valid[s] || !shadow_chain_slots[s].instance) continue;
 
+            /* Phase 2 idle gate: skip FX when both synth AND FX output are silent */
+            if (shadow_slot_fx_idle[s] && shadow_slot_idle[s]) continue;
+
             int16_t fx_buf[FRAMES_PER_BLOCK * 2];
             memcpy(fx_buf, shadow_slot_deferred[s], sizeof(fx_buf));
             shadow_chain_process_fx(shadow_chain_slots[s].instance,
                                     fx_buf, MOVE_FRAMES_PER_BLOCK);
+
+            /* Track FX output silence for phase 2 idle */
+            int fx_silent = 1;
+            for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++) {
+                if (fx_buf[i] > DSP_SILENCE_LEVEL || fx_buf[i] < -DSP_SILENCE_LEVEL) {
+                    fx_silent = 0;
+                    break;
+                }
+            }
+            if (fx_silent) {
+                shadow_slot_fx_silence_frames[s]++;
+                if (shadow_slot_fx_silence_frames[s] >= DSP_IDLE_THRESHOLD) {
+                    shadow_slot_fx_idle[s] = 1;
+                }
+            } else {
+                shadow_slot_fx_silence_frames[s] = 0;
+                shadow_slot_fx_idle[s] = 0;
+            }
 
             float vol = shadow_chain_slots[s].volume;
             float gain = vol * me_input_scale;
@@ -7256,7 +7439,17 @@ static void shadow_inprocess_mix_from_buffer(void) {
         skipback_capture(mailbox_audio);
     }
 
-    /* No extra post-scale here: live path and bridge tap must share the same gain topology. */
+    /* Apply master volume AFTER MFX.  When MFX is active the mix was built
+     * at unity level; scale down now so the DAC output respects master volume.
+     * When MFX is off the mix is already at mv level — no extra scaling. */
+    if (mfx_active && mv < 0.9999f) {
+        for (int i = 0; i < FRAMES_PER_BLOCK * 2; i++) {
+            float scaled = (float)mailbox_audio[i] * mv;
+            if (scaled > 32767.0f) scaled = 32767.0f;
+            if (scaled < -32768.0f) scaled = -32768.0f;
+            mailbox_audio[i] = (int16_t)lroundf(scaled);
+        }
+    }
 }
 
 /* Shared memory segment names from shadow_constants.h */
@@ -7269,6 +7462,7 @@ static int16_t *shadow_movein_shm = NULL;   /* Move's audio for shadow to read *
 static uint8_t *shadow_midi_shm = NULL;
 static uint8_t *shadow_ui_midi_shm = NULL;
 static uint8_t *shadow_display_shm = NULL;
+static uint8_t *display_live_shm = NULL;
 static shadow_midi_out_t *shadow_midi_out_shm = NULL;  /* MIDI output from shadow UI */
 static uint8_t last_shadow_midi_out_ready = 0;
 static shadow_midi_dsp_t *shadow_midi_dsp_shm = NULL;  /* MIDI to DSP from shadow UI */
@@ -7450,6 +7644,23 @@ static void init_shadow_shm(void)
         printf("Shadow: Failed to create display shm\n");
     }
 
+    /* Create/open live display shared memory (for remote display server) */
+    int shm_display_live_fd = shm_open(SHM_DISPLAY_LIVE, O_CREAT | O_RDWR, 0666);
+    if (shm_display_live_fd >= 0) {
+        ftruncate(shm_display_live_fd, DISPLAY_BUFFER_SIZE);
+        display_live_shm = (uint8_t *)mmap(NULL, DISPLAY_BUFFER_SIZE,
+                                            PROT_READ | PROT_WRITE,
+                                            MAP_SHARED, shm_display_live_fd, 0);
+        if (display_live_shm == MAP_FAILED) {
+            display_live_shm = NULL;
+            printf("Shadow: Failed to mmap live display shm\n");
+        } else {
+            memset(display_live_shm, 0, DISPLAY_BUFFER_SIZE);
+        }
+    } else {
+        printf("Shadow: Failed to create live display shm\n");
+    }
+
     /* Create/open control shared memory - DON'T zero it, shadow_poc owns the state */
     shm_control_fd = shm_open(SHM_SHADOW_CONTROL, O_CREAT | O_RDWR, 0666);
     if (shm_control_fd >= 0) {
@@ -7478,6 +7689,7 @@ static void init_shadow_shm(void)
             shadow_control->tts_volume = 70;    /* 70% volume */
             shadow_control->tts_pitch = 110;    /* 110 Hz */
             shadow_control->tts_speed = 1.0f;   /* Normal speed */
+            shadow_control->tts_engine = 0;     /* 0=espeak-ng, 1=flite */
         }
     } else {
         printf("Shadow: Failed to create control shm\n");
@@ -7634,7 +7846,7 @@ static void debug_audio_offset(void) {
 
 /* Monitor screen reader messages and speak them with TTS (debounced) */
 #define TTS_DEBOUNCE_MS 300  /* Wait 300ms of silence before speaking */
-static char pending_tts_message[256] = {0};
+static char pending_tts_message[SHADOW_SCREENREADER_TEXT_LEN] = {0};
 static uint64_t last_message_time_ms = 0;
 static bool has_pending_message = false;
 
@@ -7666,6 +7878,13 @@ static void shadow_check_screenreader(void)
     if (has_pending_message && (now_ms - last_message_time_ms >= TTS_DEBOUNCE_MS)) {
         /* Apply TTS settings from shared memory before speaking */
         if (shadow_control) {
+            /* Check for engine switch (must happen before other settings) */
+            const char *current_engine = tts_get_engine();
+            const char *requested_engine = shadow_control->tts_engine == 1 ? "flite" : "espeak";
+            if (strcmp(current_engine, requested_engine) != 0) {
+                tts_set_engine(requested_engine);
+            }
+
             tts_set_enabled(shadow_control->tts_enabled != 0);
             tts_set_volume(shadow_control->tts_volume);
             tts_set_speed(shadow_control->tts_speed);
@@ -7679,6 +7898,340 @@ static void shadow_check_screenreader(void)
         }
         has_pending_message = false;
         pending_tts_message[0] = '\0';
+    }
+}
+
+/* ==========================================================================
+ * PIN Challenge Display Scanner
+ *
+ * Monitors the pin_challenge_active flag set by the web shim when a browser
+ * connects to move.local and triggers a PIN challenge. When detected, we
+ * wait for the PIN to render on the display, extract the 6 digits, and
+ * speak them via TTS.
+ *
+ * Display format: 128x64 @ 1bpp, column-major (8 pages of 128 bytes).
+ * PIN digits appear on pages 3-4 only, all other pages are blank.
+ * ========================================================================== */
+
+/* PIN scanner state machine */
+#define PIN_STATE_IDLE     0
+#define PIN_STATE_WAITING  1  /* Waiting for PIN to render (~500ms) */
+#define PIN_STATE_SCANNING 2  /* Scanning display for digits */
+#define PIN_STATE_COOLDOWN 3  /* PIN spoken, cooling down before accepting new */
+
+static int pin_state = PIN_STATE_IDLE;
+static uint64_t pin_state_entered_ms = 0;
+static char pin_last_spoken[8] = {0};  /* Last PIN we spoke, to avoid repeats */
+
+/* File-scope display buffer for PIN scanning, accumulated from slices */
+static uint8_t pin_display_buf[DISPLAY_BUFFER_SIZE];
+static int pin_display_slices_seen[6] = {0};
+static int pin_display_complete = 0;
+
+/* Shift+Menu double-click detection state */
+static uint64_t shift_menu_pending_ms = 0;
+static int shift_menu_pending = 0;
+
+/* Accumulate a display slice into the PIN display buffer.
+ * Called from the ioctl handler's slice capture section. */
+static void pin_accumulate_slice(int idx, const uint8_t *data, int bytes)
+{
+    if (idx < 0 || idx >= 6) return;
+    memcpy(pin_display_buf + idx * 172, data, bytes);
+    pin_display_slices_seen[idx] = 1;
+
+    /* Check if all slices received */
+    int all = 1;
+    for (int i = 0; i < 6; i++) {
+        if (!pin_display_slices_seen[i]) { all = 0; break; }
+    }
+    if (all) {
+        pin_display_complete = 1;
+        memset(pin_display_slices_seen, 0, sizeof(pin_display_slices_seen));
+
+        /* File-triggered display dump: touch /tmp/dump_display to capture */
+        if (access("/tmp/dump_display", F_OK) == 0) {
+            unlink("/tmp/dump_display");
+            FILE *f = fopen("/tmp/pin_display.bin", "w");
+            if (f) {
+                fwrite(pin_display_buf, 1, 1024, f);
+                fclose(f);
+                shadow_log("PIN: display buffer dumped to /tmp/pin_display.bin");
+            }
+        }
+    }
+}
+
+/* Digit template hash table.
+ * Each digit (0-9) maps to a polynomial hash of its column bytes in pages 3-4.
+ * These are populated from actual display captures during testing.
+ * A value of 0 means "not yet captured". */
+static uint32_t pin_digit_hashes[10] = {
+    0x8abc24d1,   /* 0 */
+    0xa8721e5e,   /* 1 */
+    0x3eeaf9a2,   /* 2 */
+    0xb680019e,   /* 3 */
+    0xc751c4ad,   /* 4 */
+    0xf7a9c384,   /* 5 */
+    0xc9805ffb,   /* 6 */
+    0x538e156e,   /* 7 */
+    0xf35f5d11,   /* 8 */
+    0xa061c01d,   /* 9 */
+};
+
+/* Compute hash for a digit group spanning columns [start, end) in pages 3-4 */
+static uint32_t pin_digit_hash(const uint8_t *display, int start, int end)
+{
+    uint32_t hash = 5381;
+    for (int c = start; c < end; c++) {
+        hash = hash * 33 + display[3 * 128 + c];
+        hash = hash * 33 + display[4 * 128 + c];
+    }
+    return hash;
+}
+
+/* Check if the display looks like a PIN screen:
+ * Pages 3-4 have content, other pages are mostly blank. */
+static int pin_display_is_pin_screen(const uint8_t *display)
+{
+    /* Count non-zero bytes in pages 3-4 */
+    int active = 0;
+    for (int i = 3 * 128; i < 5 * 128; i++) {
+        if (display[i]) active++;
+    }
+    if (active < 10) return 0;  /* Too few lit pixels */
+
+    /* Check that other pages are mostly blank */
+    int other = 0;
+    for (int page = 0; page < 8; page++) {
+        if (page == 3 || page == 4) continue;
+        for (int col = 0; col < 128; col++) {
+            if (display[page * 128 + col]) other++;
+        }
+    }
+    return other < 20;  /* Allow a few stray pixels */
+}
+
+/* Extract digits from display and build TTS string.
+ * Returns 1 on success with pin_text and raw_digits filled, 0 on failure.
+ * raw_digits must be at least 7 bytes (6 digits + NUL). */
+static int pin_extract_digits(const uint8_t *display, char *pin_text, int text_len, char *raw_digits)
+{
+    char logbuf[512];
+
+    if (!pin_display_is_pin_screen(display)) {
+        shadow_log("PIN: display doesn't look like PIN screen");
+        return 0;
+    }
+
+    /* Segment digits: find groups of consecutive non-zero columns in pages 3-4 */
+    typedef struct { int start; int end; } digit_span_t;
+    digit_span_t spans[8];
+    int span_count = 0;
+    int in_digit = 0;
+    int digit_start = 0;
+
+    for (int col = 0; col < 128; col++) {
+        int has_content = display[3 * 128 + col] || display[4 * 128 + col];
+        if (has_content && !in_digit) {
+            digit_start = col;
+            in_digit = 1;
+        } else if (!has_content && in_digit) {
+            if (span_count < 8) {
+                spans[span_count].start = digit_start;
+                spans[span_count].end = col;
+                span_count++;
+            }
+            in_digit = 0;
+        }
+    }
+    if (in_digit && span_count < 8) {
+        spans[span_count].start = digit_start;
+        spans[span_count].end = 128;
+        span_count++;
+    }
+
+    /* Expect exactly 6 digit groups */
+    if (span_count != 6) {
+        snprintf(logbuf, sizeof(logbuf), "PIN: expected 6 digit groups, found %d", span_count);
+        shadow_log(logbuf);
+        /* Log digit group info for debugging */
+        for (int i = 0; i < span_count; i++) {
+            snprintf(logbuf, sizeof(logbuf), "PIN: group %d: cols %d-%d (width %d)",
+                     i, spans[i].start, spans[i].end,
+                     spans[i].end - spans[i].start);
+            shadow_log(logbuf);
+        }
+        return 0;
+    }
+
+    /* Match each digit group */
+    char digits[7] = {0};
+    int all_matched = 1;
+
+    for (int i = 0; i < 6; i++) {
+        uint32_t hash = pin_digit_hash(display, spans[i].start, spans[i].end);
+        int matched = -1;
+
+        /* Look up in hash table */
+        for (int d = 0; d < 10; d++) {
+            if (pin_digit_hashes[d] != 0 && pin_digit_hashes[d] == hash) {
+                matched = d;
+                break;
+            }
+        }
+
+        if (matched >= 0) {
+            digits[i] = '0' + matched;
+        } else {
+            digits[i] = '?';
+            all_matched = 0;
+
+            /* Log the hash and raw column data for template creation */
+            snprintf(logbuf, sizeof(logbuf), "PIN: digit %d (cols %d-%d) hash=0x%08x UNMATCHED",
+                     i, spans[i].start, spans[i].end, hash);
+            shadow_log(logbuf);
+
+            /* Dump column bytes for pages 3-4 */
+            int pos = 0;
+            pos += snprintf(logbuf + pos, sizeof(logbuf) - pos, "PIN: digit %d p3:", i);
+            for (int c = spans[i].start; c < spans[i].end && pos < 300; c++) {
+                pos += snprintf(logbuf + pos, sizeof(logbuf) - pos,
+                               " %02x", display[3 * 128 + c]);
+            }
+            pos += snprintf(logbuf + pos, sizeof(logbuf) - pos, " p4:");
+            for (int c = spans[i].start; c < spans[i].end && pos < 480; c++) {
+                pos += snprintf(logbuf + pos, sizeof(logbuf) - pos,
+                               " %02x", display[4 * 128 + c]);
+            }
+            shadow_log(logbuf);
+        }
+    }
+    digits[6] = '\0';
+
+    /* Copy raw digits to output parameter for dedup */
+    memcpy(raw_digits, digits, 7);
+
+    if (!all_matched) {
+        snprintf(logbuf, sizeof(logbuf), "PIN: some digits unmatched, raw string: %s", digits);
+        shadow_log(logbuf);
+        /* Still try to speak what we have - the user may recognize partial info */
+    }
+
+    /* Build TTS string: repeat 2 times with a pause.
+     * "Pairing pin displayed: 1, 2, 3, 4, 5, 6. (pause) (repeat)"
+     * Keep under 12 seconds of audio to fit in ring buffer. */
+    int n = 0;
+    for (int rep = 0; rep < 2; rep++) {
+        if (rep > 0) n += snprintf(pin_text + n, text_len - n, ".... ");
+        n += snprintf(pin_text + n, text_len - n, "Pairing pin displayed: ");
+        for (int i = 0; i < 6 && n < text_len - 4; i++) {
+            if (i > 0) n += snprintf(pin_text + n, text_len - n, ", ");
+            n += snprintf(pin_text + n, text_len - n, "%c", digits[i]);
+        }
+        n += snprintf(pin_text + n, text_len - n, ". ");
+    }
+
+    snprintf(logbuf, sizeof(logbuf), "PIN: extracted digits: %s", digits);
+    shadow_log(logbuf);
+    return 1;
+}
+
+/* Main PIN scanner - called from the display section of the tick loop.
+ *
+ * State machine: IDLE → WAITING → SCANNING → COOLDOWN → IDLE
+ *
+ * Key design: we never clear pin_challenge_active from the shim side because
+ * the web shim will immediately re-set it on the browser's next HTTP poll.
+ * Instead, after speaking we enter COOLDOWN which ignores the flag until it
+ * naturally clears (user enters PIN or navigates away) or a timeout expires. */
+static void pin_check_and_speak(void)
+{
+    if (!shadow_control) return;
+
+    /* Get current time */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now_ms = (uint64_t)(ts.tv_sec * 1000) + (ts.tv_nsec / 1000000);
+
+    uint8_t challenge = shadow_control->pin_challenge_active;
+
+    /* If challenge-response submitted (2), cancel any active scan */
+    if (challenge == 2 && pin_state != PIN_STATE_IDLE && pin_state != PIN_STATE_COOLDOWN) {
+        shadow_log("PIN: challenge-response submitted, cancelling scan");
+        pin_state = PIN_STATE_COOLDOWN;
+        pin_state_entered_ms = now_ms;
+        return;
+    }
+
+    /* State machine */
+    switch (pin_state) {
+    case PIN_STATE_IDLE:
+        /* Only trigger on challenge=1 from IDLE */
+        if (challenge == 1) {
+            pin_state = PIN_STATE_WAITING;
+            pin_state_entered_ms = now_ms;
+            pin_display_complete = 0;
+            memset(pin_display_slices_seen, 0, sizeof(pin_display_slices_seen));
+            shadow_log("PIN: challenge detected, waiting for display render");
+        }
+        break;
+
+    case PIN_STATE_WAITING:
+        /* Wait 500ms for the PIN to render on the display */
+        if (now_ms - pin_state_entered_ms > 500) {
+            pin_state = PIN_STATE_SCANNING;
+            pin_display_complete = 0;
+            memset(pin_display_slices_seen, 0, sizeof(pin_display_slices_seen));
+            shadow_log("PIN: entering scan mode");
+        }
+        break;
+
+    case PIN_STATE_SCANNING:
+        if (pin_display_complete) {
+            char pin_text[512];
+            char raw_digits[8] = {0};
+            if (pin_extract_digits(pin_display_buf, pin_text, sizeof(pin_text), raw_digits)) {
+                if (strcmp(raw_digits, pin_last_spoken) == 0) {
+                    /* Same PIN as last time — skip to avoid repeating */
+                    pin_state = PIN_STATE_COOLDOWN;
+                    pin_state_entered_ms = now_ms;
+                } else {
+                    { char lb[128]; snprintf(lb, sizeof(lb), "PIN: speaking '%s'", pin_text); shadow_log(lb); }
+                    tts_speak(pin_text);
+                    strncpy(pin_last_spoken, raw_digits, sizeof(pin_last_spoken) - 1);
+                    pin_state = PIN_STATE_COOLDOWN;
+                    pin_state_entered_ms = now_ms;
+                }
+            } else {
+                /* Try again on next full frame */
+                pin_display_complete = 0;
+            }
+        }
+        /* Timeout after 10 seconds of scanning */
+        if (now_ms - pin_state_entered_ms > 10000) {
+            shadow_log("PIN: scan timeout");
+            pin_state = PIN_STATE_COOLDOWN;
+            pin_state_entered_ms = now_ms;
+        }
+        break;
+
+    case PIN_STATE_COOLDOWN:
+        /* Wait for the challenge flag to clear naturally (user entered PIN
+         * or browser navigated away), then return to IDLE.
+         * Safety timeout after 60s to avoid being stuck forever. */
+        if (challenge == 0 || challenge == 2) {
+            pin_state = PIN_STATE_IDLE;
+            pin_last_spoken[0] = '\0';  /* Clear dedup so new session can repeat */
+            shadow_log("PIN: challenge cleared, returning to idle");
+        } else if (now_ms - pin_state_entered_ms > 5000) {
+            pin_state = PIN_STATE_IDLE;
+            shadow_log("PIN: cooldown timeout, returning to idle");
+        }
+        break;
+
+    default:
+        break;
     }
 }
 
@@ -7701,6 +8254,13 @@ static void shadow_mix_audio(void)
         if (tts_test_frame_count == 1035) {  /* ~3 seconds at 44.1kHz, 128 frames/block */
             printf("TTS test: Speaking test phrase...\n");
             /* Apply TTS settings before test phrase */
+            {
+                const char *current_engine = tts_get_engine();
+                const char *requested_engine = shadow_control->tts_engine == 1 ? "flite" : "espeak";
+                if (strcmp(current_engine, requested_engine) != 0) {
+                    tts_set_engine(requested_engine);
+                }
+            }
             tts_set_enabled(shadow_control->tts_enabled != 0);
             tts_set_volume(shadow_control->tts_volume);
             tts_set_speed(shadow_control->tts_speed);
@@ -7749,19 +8309,32 @@ static void shadow_mix_audio(void)
     }
     #endif
 
-    /* Mix TTS audio on top */
-    if (tts_is_speaking()) {
-        static int16_t tts_buffer[FRAMES_PER_BLOCK * 2];  /* Stereo interleaved */
-        int frames_read = tts_get_audio(tts_buffer, FRAMES_PER_BLOCK);
+    /* NOTE: TTS mixing moved to shadow_mix_tts() which runs AFTER
+     * shadow_inprocess_mix_from_buffer(). That function zeros the mailbox
+     * when Link Audio is active, so TTS must be mixed in afterward. */
+}
 
-        if (frames_read > 0) {
-            for (int i = 0; i < frames_read * 2; i++) {
-                int32_t mixed = (int32_t)mailbox_audio[i] + (int32_t)tts_buffer[i];
-                /* Clip to int16 range */
-                if (mixed > 32767) mixed = 32767;
-                if (mixed < -32768) mixed = -32768;
-                mailbox_audio[i] = (int16_t)mixed;
-            }
+/* Mix TTS audio into mailbox.  Called AFTER shadow_inprocess_mix_from_buffer()
+ * because that function may zero-and-rebuild the mailbox when Link Audio is
+ * active.  Mixing TTS here ensures it is never wiped by the rebuild. */
+static void shadow_mix_tts(void)
+{
+    if (!global_mmap_addr) return;
+    if (!tts_is_speaking()) return;
+
+    int16_t *mailbox_audio = (int16_t *)(global_mmap_addr + AUDIO_OUT_OFFSET);
+    static int16_t tts_buffer[FRAMES_PER_BLOCK * 2];  /* Stereo interleaved */
+    int frames_read = tts_get_audio(tts_buffer, FRAMES_PER_BLOCK);
+
+    if (frames_read > 0) {
+        float mv = shadow_master_volume;
+        for (int i = 0; i < frames_read * 2; i++) {
+            int32_t scaled_tts = (int32_t)lroundf((float)tts_buffer[i] * mv);
+            int32_t mixed = (int32_t)mailbox_audio[i] + scaled_tts;
+            /* Clip to int16 range */
+            if (mixed > 32767) mixed = 32767;
+            if (mixed < -32768) mixed = -32768;
+            mailbox_audio[i] = (int16_t)mixed;
         }
     }
 }
@@ -7944,17 +8517,18 @@ static void shadow_inject_ui_midi_out(void) {
     last_shadow_midi_out_ready = shadow_midi_out_shm->ready;
     shadow_init_led_queue();
 
-    /* Snapshot write_idx and buffer, then reset immediately.
-     * This avoids a race where the JS process writes new data between
-     * our read loop and the clear at the end. */
+    /* Snapshot buffer first, then reset write_idx.
+     * Copy before resetting to avoid a race where the JS process writes
+     * new data between our reset and memcpy. */
     int snapshot_len = shadow_midi_out_shm->write_idx;
-    shadow_midi_out_shm->write_idx = 0;
     uint8_t local_buf[SHADOW_MIDI_OUT_BUFFER_SIZE];
     int copy_len = snapshot_len < (int)SHADOW_MIDI_OUT_BUFFER_SIZE
                  ? snapshot_len : (int)SHADOW_MIDI_OUT_BUFFER_SIZE;
     if (copy_len > 0) {
         memcpy(local_buf, shadow_midi_out_shm->buffer, copy_len);
     }
+    __sync_synchronize();
+    shadow_midi_out_shm->write_idx = 0;
     memset(shadow_midi_out_shm->buffer, 0, SHADOW_MIDI_OUT_BUFFER_SIZE);
 
     /* Inject into shadow_mailbox at MIDI_OUT_OFFSET */
@@ -8643,64 +9217,6 @@ static void shadow_swap_display(void)
     display_phase = (display_phase + 1) % 7;  /* Cycle 0,1,2,3,4,5,6,0,... */
 }
 
-void print_mem()
-{
-    printf("\033[H\033[J");
-    for (int i = 0; i < 4096; ++i)
-    {
-        printf("%02x ", (unsigned char)global_mmap_addr[i]);
-        if (i == 2048 - 1)
-        {
-            printf("\n\n");
-        }
-
-        if (i == 2048 + 256 - 1)
-        {
-            printf("\n\n");
-        }
-
-        if (i == 2048 + 256 + 512 - 1)
-        {
-            printf("\n\n");
-        }
-    }
-    printf("\n\n");
-}
-
-void write_mem()
-{
-    if (!output_file)
-    {
-        return;
-    }
-
-    // printf("\033[H\033[J");
-    fprintf(output_file, "--------------------------------------------------------------------------------------------------------------");
-    fprintf(output_file, "Frame: %d\n", frame_counter);
-    for (int i = 0; i < 4096; ++i)
-    {
-        fprintf(output_file, "%02x ", (unsigned char)global_mmap_addr[i]);
-        if (i == 2048 - 1)
-        {
-            fprintf(output_file, "\n\n");
-        }
-
-        if (i == 2048 + 256 - 1)
-        {
-            fprintf(output_file, "\n\n");
-        }
-
-        if (i == 2048 + 256 + 512 - 1)
-        {
-            fprintf(output_file, "\n\n");
-        }
-    }
-    fprintf(output_file, "\n\n");
-
-    sync();
-
-    frame_counter++;
-}
 
 void *(*real_mmap)(void *, size_t, int, int, int, off_t) = NULL;
 static int (*real_open)(const char *pathname, int flags, ...) = NULL;
@@ -8742,6 +9258,13 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
         /* Initialize shadow shared memory when we detect the SPI mailbox */
         init_shadow_shm();
         load_feature_config();  /* Load feature flags from config */
+        if (shadow_control) {
+            shadow_control->display_mirror = display_mirror_enabled ? 1 : 0;
+        }
+        /* Launch Link Audio subscriber if feature is enabled */
+        if (link_audio.enabled) {
+            launch_link_subscriber();
+        }
         native_resample_bridge_load_mode_from_shadow_config();  /* Restore bridge mode on Move restart */
 #if SHADOW_INPROCESS_POC
         shadow_inprocess_load_chain();
@@ -8756,6 +9279,7 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
             shadow_control->tts_volume = tts_get_volume();
             shadow_control->tts_speed = tts_get_speed();
             shadow_control->tts_pitch = (uint16_t)tts_get_pitch();
+            shadow_control->tts_engine = (strcmp(tts_get_engine(), "flite") == 0) ? 1 : 0;
             unified_log("shim", LOG_LEVEL_INFO,
                        "TTS initialized, synced to shared memory: enabled=%s speed=%.2f pitch=%.1f volume=%d",
                        shadow_control->tts_enabled ? "ON" : "OFF",
@@ -8984,6 +9508,21 @@ static int shadow_ui_started = 0;
 static pid_t shadow_ui_pid = -1;
 static const char *shadow_ui_pid_path = "/data/UserData/move-anything/shadow_ui.pid";
 
+/* Link Audio subscriber process management */
+static int link_sub_started = 0;
+static pid_t link_sub_pid = -1;
+static uint32_t link_sub_ever_received = 0;  /* high-water mark of packets_intercepted */
+static int link_sub_kill_pending = 0;        /* kill-wait-restart state machine */
+static int link_sub_wait_countdown = 0;
+static int link_sub_restart_cooldown = 0;    /* rate limiting countdown */
+static int link_sub_restart_count = 0;       /* total restarts for logging */
+
+/* Recovery constants (in ioctl blocks @ ~345/sec) */
+#define LINK_SUB_STALE_THRESHOLD  1725   /* ~5s of no new packets */
+#define LINK_SUB_WAIT_BLOCKS      1035   /* ~3s wait after kill for SDK cleanup */
+#define LINK_SUB_COOLDOWN_BLOCKS  3450   /* ~10s between restarts */
+#define LINK_SUB_ALIVE_CHECK      1725   /* ~5s between alive checks */
+
 static int shadow_ui_pid_alive(pid_t pid)
 {
     if (pid <= 0) return 0;
@@ -9048,9 +9587,12 @@ static void shadow_ui_reap(void)
 
 static void launch_shadow_ui(void)
 {
+    /* Quick check before reap/refresh — if we just forked, trust the state
+     * even if /proc hasn't appeared yet (avoids double-fork race). */
+    if (shadow_ui_started && shadow_ui_pid > 0) return;
     shadow_ui_reap();
     shadow_ui_refresh_pid();
-    if (shadow_ui_started && shadow_ui_pid_alive(shadow_ui_pid)) return;
+    if (shadow_ui_started && shadow_ui_pid > 0) return;
     if (access("/data/UserData/move-anything/shadow/shadow_ui", X_OK) != 0) {
         return;
     }
@@ -9070,6 +9612,94 @@ static void launch_shadow_ui(void)
     }
     shadow_ui_started = 1;
     shadow_ui_pid = pid;
+}
+
+/* --- Link Audio subscriber process management --- */
+
+static int link_sub_pid_alive(pid_t pid)
+{
+    if (pid <= 0) return 0;
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    int rpid = 0;
+    char comm[64] = {0};
+    char state = 0;
+    int matched = fscanf(f, "%d %63s %c", &rpid, comm, &state);
+    fclose(f);
+    if (matched != 3) return 0;
+    if (rpid != (int)pid) return 0;
+    if (state == 'Z') return 0;
+    if (!strstr(comm, "link-sub")) return 0;
+    return 1;
+}
+
+static void link_sub_reap(void)
+{
+    if (link_sub_pid <= 0) return;
+    int status = 0;
+    pid_t res = waitpid(link_sub_pid, &status, WNOHANG);
+    if (res == link_sub_pid) {
+        link_sub_pid = -1;
+        link_sub_started = 0;
+    }
+}
+
+static void link_sub_kill(void)
+{
+    if (link_sub_pid > 0) {
+        kill(link_sub_pid, SIGTERM);
+    }
+}
+
+static void launch_link_subscriber(void)
+{
+    if (link_sub_started && link_sub_pid > 0) return;
+    link_sub_reap();
+    if (link_sub_started && link_sub_pid > 0) return;
+
+    const char *sub_path = "/data/UserData/move-anything/link-subscriber";
+    if (access(sub_path, X_OK) != 0) return;
+
+    int pid = fork();
+    if (pid < 0) return;
+    if (pid == 0) {
+        setsid();
+        /* Redirect stdout/stderr to log file before closing fds */
+        freopen("/tmp/link-subscriber.log", "w", stdout);
+        freopen("/tmp/link-subscriber.log", "a", stderr);
+        int fdlimit = (int)sysconf(_SC_OPEN_MAX);
+        for (int i = STDERR_FILENO + 1; i < fdlimit; i++) {
+            close(i);
+        }
+        execl(sub_path, "link-subscriber", (char *)0);
+        _exit(1);
+    }
+    link_sub_started = 1;
+    link_sub_pid = pid;
+    unified_log("shim", LOG_LEVEL_INFO,
+                "Link subscriber launched: pid=%d", pid);
+}
+
+static void link_sub_reset_state(void)
+{
+    /* Reset Link Audio state so fresh subscriber can rediscover everything */
+    link_audio.packets_intercepted = 0;
+    link_audio.session_parsed = 0;
+    link_audio.move_channel_count = 0;
+    link_sub_ever_received = 0;
+    la_prev_intercepted = 0;
+    la_stale_frames = 0;
+
+    /* Clear ring buffers */
+    for (int i = 0; i < LINK_AUDIO_MOVE_CHANNELS; i++) {
+        link_audio.channels[i].write_pos = 0;
+        link_audio.channels[i].read_pos = 0;
+        link_audio.channels[i].active = 0;
+        link_audio.channels[i].pkt_count = 0;
+        link_audio.channels[i].peak = 0;
+    }
 }
 
 int (*real_ioctl)(int, unsigned long, ...) = NULL;
@@ -9379,14 +10009,85 @@ int ioctl(int fd, unsigned long request, ...)
 
                 int ui_alive = shadow_ui_pid_alive(shadow_ui_pid);
                 unified_log("shim", LOG_LEVEL_DEBUG,
-                    "Heartbeat: pid=%d rss=%ldKB overruns=%d shadow_ui_pid=%d(alive=%d) display_mode=%d la_pkts=%u la_ch=%d"
-                    " bb_filter=%d bb_nodeid=%d bb_disc=%u bb_rewr=%u bb_recvfrom=%u bb_recvmsg=%u",
+                    "Heartbeat: pid=%d rss=%ldKB overruns=%d shadow_ui_pid=%d(alive=%d) display_mode=%d la_pkts=%u la_ch=%d la_stale=%u la_sub_pid=%d la_restarts=%d pin=%d/%d"
+                    " bb_filter=%d bb_disc=%u bb_rewr=%u",
                     getpid(), rss_kb, consecutive_overruns,
                     (int)shadow_ui_pid, ui_alive, shadow_display_mode,
                     link_audio.packets_intercepted, link_audio.move_channel_count,
-                    link_audio.filter_subscriber_alive, link_audio.subscriber_node_id_known,
-                    link_audio.discovery_packets_seen, link_audio.alive_packets_rewritten,
-                    link_audio.recvfrom_calls, link_audio.recvmsg_calls);
+                    la_stale_frames, (int)link_sub_pid, link_sub_restart_count,
+                    shadow_control ? shadow_control->pin_challenge_active : -1, pin_state,
+                    link_audio.filter_subscriber_alive,
+                    link_audio.discovery_packets_seen, link_audio.alive_packets_rewritten);
+            }
+        }
+    }
+
+    /* === LINK AUDIO SUBSCRIBER RECOVERY === */
+    if (link_audio.enabled) {
+        /* Track high-water mark of packets received */
+        uint32_t la_pkts_now = link_audio.packets_intercepted;
+        if (la_pkts_now > link_sub_ever_received) {
+            link_sub_ever_received = la_pkts_now;
+        }
+
+        /* Decrement cooldown */
+        if (link_sub_restart_cooldown > 0) {
+            link_sub_restart_cooldown--;
+        }
+
+        /* State machine: kill-wait-restart */
+        if (link_sub_kill_pending) {
+            link_sub_wait_countdown--;
+            if (link_sub_wait_countdown <= 0) {
+                /* Wait period over: reap zombie, reset state, launch fresh */
+                link_sub_reap();
+                /* Force-reap if still around */
+                if (link_sub_pid > 0) {
+                    kill(link_sub_pid, SIGKILL);
+                    waitpid(link_sub_pid, NULL, 0);
+                    link_sub_pid = -1;
+                    link_sub_started = 0;
+                }
+                link_sub_kill_pending = 0;
+                link_sub_reset_state();
+                launch_link_subscriber();
+                link_sub_restart_count++;
+                link_sub_restart_cooldown = LINK_SUB_COOLDOWN_BLOCKS;
+                unified_log("shim", LOG_LEVEL_INFO,
+                    "Link subscriber restarted after stale detection (restart #%d)",
+                    link_sub_restart_count);
+            }
+        } else if (link_sub_ever_received > 0 &&
+                   la_stale_frames > LINK_SUB_STALE_THRESHOLD &&
+                   link_sub_restart_cooldown == 0) {
+            /* Audio was flowing but stopped for ~5s — trigger recovery */
+            unified_log("shim", LOG_LEVEL_INFO,
+                "Link audio stale detected: la_stale=%u la_ever=%u, killing subscriber pid=%d",
+                la_stale_frames, link_sub_ever_received, (int)link_sub_pid);
+            link_sub_kill();
+            link_sub_kill_pending = 1;
+            link_sub_wait_countdown = LINK_SUB_WAIT_BLOCKS;
+        } else {
+            /* Periodic alive check (~every 5s) */
+            static uint32_t alive_check_counter = 0;
+            alive_check_counter++;
+            if (alive_check_counter >= LINK_SUB_ALIVE_CHECK) {
+                alive_check_counter = 0;
+                link_sub_reap();
+                if (link_sub_started && !link_sub_pid_alive(link_sub_pid)) {
+                    /* Subscriber crashed — restart if not in cooldown */
+                    if (link_sub_restart_cooldown == 0) {
+                        unified_log("shim", LOG_LEVEL_INFO,
+                            "Link subscriber died (pid=%d), restarting",
+                            (int)link_sub_pid);
+                        link_sub_pid = -1;
+                        link_sub_started = 0;
+                        link_sub_reset_state();
+                        launch_link_subscriber();
+                        link_sub_restart_count++;
+                        link_sub_restart_cooldown = LINK_SUB_COOLDOWN_BLOCKS;
+                    }
+                }
             }
         }
     }
@@ -9415,9 +10116,6 @@ int ioctl(int fd, unsigned long request, ...)
 
     /* Skip all processing in baseline mode to measure pure Move ioctl time */
     if (baseline_mode) goto do_ioctl;
-
-    // print_mem();
-    // write_mem();
 
     // TODO: Consider using move-anything host code and quickjs for flexibility
     TIME_SECTION_START();
@@ -9505,6 +10203,9 @@ int ioctl(int fd, unsigned long request, ...)
         if (mix_us > inproc_mix_max) inproc_mix_max = mix_us;
     }
 
+    /* Mix TTS audio AFTER inprocess mix (which may zero-rebuild mailbox for Link Audio) */
+    shadow_mix_tts();
+
     /* Signal Link Audio publisher thread to drain accumulated audio */
     if (link_audio.publisher_running) {
         link_audio.publisher_tick = 1;
@@ -9551,8 +10252,12 @@ int ioctl(int fd, unsigned long request, ...)
         /* Always capture incoming slices */
         if (slice_num >= 1 && slice_num <= 6) {
             int idx = slice_num - 1;
+            int bytes = (idx == 5) ? 164 : 172;
             memcpy(captured_slices[idx], mem + 84, 172);
             slice_fresh[idx] = 1;
+
+            /* Always accumulate into PIN display buffer for dump trigger */
+            pin_accumulate_slice(idx, mem + 84, bytes);
         }
 
         /* When volume knob touched (and no track held), start capturing */
@@ -9739,6 +10444,38 @@ int ioctl(int fd, unsigned long request, ...)
     shadow_swap_display();
     TIME_SECTION_END(display_sum, display_max);  /* End timing display section */
 
+    /* Capture final display to live shm for remote viewer.
+     * Shadow mode: copy from shadow display shm (full composited frame).
+     * Native mode: reconstruct from captured slices (written above). */
+    if (display_live_shm && shadow_control && shadow_control->display_mirror) {
+        if (shadow_display_mode && shadow_display_shm) {
+            memcpy(display_live_shm, shadow_display_shm, DISPLAY_BUFFER_SIZE);
+        } else {
+            static uint8_t live_native[DISPLAY_BUFFER_SIZE];
+            static int live_slice_seen[6] = {0};
+            uint8_t cur_slice = global_mmap_addr ? ((uint8_t *)global_mmap_addr)[80] : 0;
+            if (cur_slice >= 1 && cur_slice <= 6) {
+                int idx = cur_slice - 1;
+                int bytes = (idx == 5) ? 164 : 172;
+                memcpy(live_native + idx * 172, (uint8_t *)global_mmap_addr + 84, bytes);
+                live_slice_seen[idx] = 1;
+                /* On last slice, push full frame */
+                if (cur_slice == 6) {
+                    int all = 1;
+                    for (int i = 0; i < 6; i++) { if (!live_slice_seen[i]) all = 0; }
+                    if (all) {
+                        memcpy(display_live_shm, live_native, DISPLAY_BUFFER_SIZE);
+                        memset(live_slice_seen, 0, sizeof(live_slice_seen));
+                    }
+                }
+            }
+        }
+    }
+
+    /* === PIN CHALLENGE SCANNER ===
+     * Check if a web PIN challenge is active and speak the digits. */
+    pin_check_and_speak();
+
     /* Mark end of pre-ioctl processing */
     clock_gettime(CLOCK_MONOTONIC, &pre_end);
 
@@ -9884,57 +10621,29 @@ do_ioctl:
                 uint8_t d1 = hw_midi[j + 2];
                 uint8_t d2 = hw_midi[j + 3];
 
-                /* Shift + Menu = jump to Master FX view (or toggle screen reader if shadow UI disabled) */
+                /* Shift + Menu: single press = Master FX / screen reader settings
+                 *                double press = toggle screen reader on/off
+                 * First press is deferred 400ms to detect double-click. */
                 /* Block Menu CC entirely when Shift is held (both press and release) */
                 if (d1 == CC_MENU && shadow_shift_held) {
-                    /* Only process action on button press (d2 > 0), but block both press and release */
                     if (d2 > 0 && shadow_control) {
-                        char log_msg[128];
-                        snprintf(log_msg, sizeof(log_msg), "Shift+Menu detected (POST-IOCTL), shadow_ui_enabled=%s",
-                                 shadow_ui_enabled ? "true" : "false");
-                        shadow_log(log_msg);
+                        struct timespec sm_ts;
+                        clock_gettime(CLOCK_MONOTONIC, &sm_ts);
+                        uint64_t sm_now = (uint64_t)(sm_ts.tv_sec * 1000) + (sm_ts.tv_nsec / 1000000);
 
-                        if (shadow_ui_enabled) {
-                            /* Shadow UI enabled: launch/navigate to Master FX */
-                            snprintf(log_msg, sizeof(log_msg), "Shadow UI enabled path: shadow_display_mode=%d", shadow_display_mode);
-                            shadow_log(log_msg);
-                            if (!shadow_display_mode) {
-                                /* From Move mode: launch shadow UI and jump to Master FX */
-                                shadow_log("Setting jump flag and launching shadow UI");
-                                shadow_control->ui_flags |= SHADOW_UI_FLAG_JUMP_TO_MASTER_FX;
-                                shadow_display_mode = 1;
-                                shadow_control->display_mode = 1;
-                                shadow_log("Calling launch_shadow_ui()...");
-                                launch_shadow_ui();
-                                shadow_log("launch_shadow_ui() returned");
-                            } else {
-                                /* Already in shadow mode: set flag */
-                                shadow_log("Already in shadow mode, setting jump flag");
-                                shadow_control->ui_flags |= SHADOW_UI_FLAG_JUMP_TO_MASTER_FX;
-                            }
+                        if (shift_menu_pending && (sm_now - shift_menu_pending_ms) < 300) {
+                            /* Double-click: toggle screen reader */
+                            shift_menu_pending = 0;
+                            uint8_t was_on = shadow_control->tts_enabled;
+                            shadow_control->tts_enabled = was_on ? 0 : 1;
+                            tts_set_enabled(!was_on);
+                            tts_speak(was_on ? "Screen reader off" : "Screen reader on");
+                            shadow_log(was_on ? "Shift+Menu double-click: screen reader OFF"
+                                              : "Shift+Menu double-click: screen reader ON");
                         } else {
-                            /* Shadow UI disabled: toggle screen reader */
-                            bool current_state = tts_get_enabled();
-                            snprintf(log_msg, sizeof(log_msg), "Toggling screen reader: %s -> %s",
-                                     current_state ? "ON" : "OFF",
-                                     !current_state ? "ON" : "OFF");
-                            shadow_log(log_msg);
-
-                            /* Set priority flag to block D-Bus messages during toggle announcement */
-                            struct timespec ts;
-                            clock_gettime(CLOCK_MONOTONIC, &ts);
-                            tts_priority_announcement_time_ms = (uint64_t)(ts.tv_sec * 1000) + (ts.tv_nsec / 1000000);
-                            tts_priority_announcement_active = true;
-
-                            tts_set_enabled(!current_state);
-                            /* Update shared memory so D-Bus handler doesn't re-sync stale value */
-                            if (shadow_control) {
-                                shadow_control->tts_enabled = !current_state ? 1 : 0;
-                            }
-                            if (!current_state) {
-                                /* Just enabled - announce it */
-                                tts_speak("screen reader on");
-                            }
+                            /* First press: defer action */
+                            shift_menu_pending = 1;
+                            shift_menu_pending_ms = sm_now;
                         }
                     }
                     /* Block Menu CC from reaching Move by zeroing in shadow buffer */
@@ -9949,6 +10658,36 @@ do_ioctl:
             }
         }
         skip_shift_menu:
+
+        /* Deferred Shift+Menu single-press action (fires 400ms after first press if no double-click) */
+        if (shift_menu_pending && shadow_control) {
+            struct timespec sm_ts2;
+            clock_gettime(CLOCK_MONOTONIC, &sm_ts2);
+            uint64_t sm_now2 = (uint64_t)(sm_ts2.tv_sec * 1000) + (sm_ts2.tv_nsec / 1000000);
+            if (sm_now2 - shift_menu_pending_ms >= 300) {
+                shift_menu_pending = 0;
+                char log_msg[128];
+                snprintf(log_msg, sizeof(log_msg), "Shift+Menu single-press (deferred), shadow_ui_enabled=%s",
+                         shadow_ui_enabled ? "true" : "false");
+                shadow_log(log_msg);
+
+                if (shadow_ui_enabled) {
+                    if (!shadow_display_mode) {
+                        shadow_control->ui_flags |= SHADOW_UI_FLAG_JUMP_TO_MASTER_FX;
+                        shadow_display_mode = 1;
+                        shadow_control->display_mode = 1;
+                        launch_shadow_ui();
+                    } else {
+                        shadow_control->ui_flags |= SHADOW_UI_FLAG_JUMP_TO_MASTER_FX;
+                    }
+                } else {
+                    shadow_control->ui_flags |= SHADOW_UI_FLAG_JUMP_TO_SCREENREADER;
+                    shadow_display_mode = 1;
+                    shadow_control->display_mode = 1;
+                    launch_shadow_ui();
+                }
+            }
+        }
 
         /* === SAMPLER MIDI FILTERING ===
          * Block events from reaching Move for sampler use.
@@ -10103,11 +10842,14 @@ do_ioctl:
                             sampler_fullscreen_active = 1;
                             sampler_menu_cursor = SAMPLER_MENU_SOURCE;
                             shadow_log("Sampler: ARMED");
+                            send_screenreader_announcement("Quantized Sampler");
+                            sampler_announce_menu_item();
                         } else if (sampler_state == SAMPLER_ARMED) {
                             sampler_state = SAMPLER_IDLE;
                             sampler_overlay_active = 0;
                             sampler_fullscreen_active = 0;
                             shadow_log("Sampler: cancelled");
+                            send_screenreader_announcement("Sampler cancelled");
                         } else if (sampler_state == SAMPLER_RECORDING) {
                             shadow_log("Sampler: force stop via Shift+Sample");
                             sampler_stop_recording();
@@ -10127,6 +10869,7 @@ do_ioctl:
                     sampler_overlay_active = 0;
                     sampler_fullscreen_active = 0;
                     shadow_log("Sampler: cancelled via Back");
+                    send_screenreader_announcement("Sampler cancelled");
                     src[j] = 0; src[j+1] = 0; src[j+2] = 0; src[j+3] = 0;
                 }
 
@@ -10140,6 +10883,7 @@ do_ioctl:
                         if (sampler_menu_cursor > 0)
                             sampler_menu_cursor--;
                     }
+                    sampler_announce_menu_item();
                     /* Block jog from reaching Move/shadow UI */
                     src[j] = 0; src[j + 1] = 0; src[j + 2] = 0; src[j + 3] = 0;
                 }
@@ -10152,6 +10896,7 @@ do_ioctl:
                     } else if (sampler_menu_cursor == SAMPLER_MENU_DURATION) {
                         sampler_duration_index = (sampler_duration_index + 1) % SAMPLER_DURATION_COUNT;
                     }
+                    sampler_announce_menu_item();
                     src[j] = 0; src[j + 1] = 0; src[j + 2] = 0; src[j + 3] = 0;
                 }
             }
