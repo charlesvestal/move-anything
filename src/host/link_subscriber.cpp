@@ -6,9 +6,10 @@
  * chnnlsv, which the shim's sendto() hook intercepts.
  *
  * The subscriber stays always active — audio flows continuously.
- * The shim handles quantum avoidance by rewriting the subscriber's
- * ALIVE packets to ByeBye in its recvfrom hook, so Move never counts
- * the subscriber as a Link peer (numPeers stays 0).
+ * The shim handles quantum avoidance by filtering incoming discovery
+ * ALIVEs in its recvfrom hook, so Move sees numPeers=0 while stopped.
+ * On Play, the shim lifts the filter and sends SIGUSR1 here to force
+ * an immediate Link Audio re-announcement (enableLinkAudio toggle).
  *
  * Running as a standalone process (not inside Move's LD_PRELOAD shim)
  * avoids the hook conflicts that caused SIGSEGV in the in-shim approach.
@@ -31,6 +32,7 @@
 #include <vector>
 
 static std::atomic<bool> g_running{true};
+static std::atomic<bool> g_reconnect_requested{false};
 
 static const char *TEMPO_FILE = "/data/UserData/move-anything/link-audio-tempo";
 
@@ -50,21 +52,33 @@ static const char *PID_FILE = "/data/UserData/move-anything/link-subscriber-pid"
 
 static void signal_handler(int sig)
 {
-    const char *msg = "link-subscriber: caught signal\n";
     switch (sig) {
-        case SIGSEGV: msg = "link-subscriber: SIGSEGV\n"; break;
-        case SIGBUS:  msg = "link-subscriber: SIGBUS\n"; break;
-        case SIGABRT: msg = "link-subscriber: SIGABRT\n"; break;
-        case SIGTERM: msg = "link-subscriber: SIGTERM\n"; break;
-        case SIGINT:  msg = "link-subscriber: SIGINT\n"; break;
-        case SIGUSR1: return;
-        case SIGUSR2: return;
+        case SIGUSR1:
+            /* Shim requests immediate re-announcement (Play pressed) */
+            g_reconnect_requested.store(true, std::memory_order_release);
+            return;
+        case SIGUSR2:
+            return;
+        case SIGSEGV: {
+            const char *m = "link-subscriber: SIGSEGV\n";
+            (void)write(STDOUT_FILENO, m, strlen(m));
+            _exit(128 + sig);
+        }
+        case SIGBUS: {
+            const char *m = "link-subscriber: SIGBUS\n";
+            (void)write(STDOUT_FILENO, m, strlen(m));
+            _exit(128 + sig);
+        }
+        case SIGABRT: {
+            const char *m = "link-subscriber: SIGABRT\n";
+            (void)write(STDOUT_FILENO, m, strlen(m));
+            _exit(128 + sig);
+        }
+        default:
+            break;
     }
-    (void)write(STDOUT_FILENO, msg, strlen(msg));
-
-    if (sig == SIGSEGV || sig == SIGBUS || sig == SIGABRT) {
-        _exit(128 + sig);
-    }
+    const char *m = "link-subscriber: caught signal, shutting down\n";
+    (void)write(STDOUT_FILENO, m, strlen(m));
     g_running = false;
 }
 
@@ -156,7 +170,7 @@ int main()
     printf("link-subscriber: initial tempo = %.1f BPM\n", initial_tempo);
 
     /* Create Link instance — always enabled, shim handles quantum avoidance
-     * by rewriting our ALIVE packets to ByeBye in its recvfrom hook */
+     * by filtering ALIVEs in its recvfrom hook while transport is stopped */
     ableton::LinkAudio link(initial_tempo, "ME-Sub");
     link.enable(true);
     link.enableLinkAudio(true);
@@ -195,8 +209,21 @@ int main()
     int tick = 0;
 
     while (g_running) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        /* 100ms poll — SIGUSR1 interrupts sleep_for via EINTR on Linux,
+         * giving us ~100ms worst-case response to reconnect requests */
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
         tick++;
+
+        /* Handle SIGUSR1 reconnect request from shim (Play pressed).
+         * Toggle enableLinkAudio off/on to force immediate re-broadcast
+         * of PeerAnnouncements on the Link Audio discovery socket.
+         * The base Link ALIVE is sent on its own schedule (~1s interval). */
+        if (g_reconnect_requested.exchange(false, std::memory_order_acquire)) {
+            printf("link-subscriber: SIGUSR1 → toggling Link Audio for re-announce\n");
+            link.enableLinkAudio(false);
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            link.enableLinkAudio(true);
+        }
 
         /* Create sources when channels change */
         if (g_channels_changed.exchange(false)) {
@@ -238,14 +265,10 @@ int main()
             printf("link-subscriber: %zu sources active\n", sources.size());
         }
 
-        if (tick % 60 == 0) {
-            uint64_t count = g_buffers_received.load(std::memory_order_relaxed);
-            if (count != last_count) {
-                printf("link-subscriber: %llu buffers (peers=%zu)\n",
-                       (unsigned long long)count,
-                       link.numPeers());
-                last_count = count;
-            }
+        /* Log numPeers every 50 ticks (5 seconds at 100ms interval) */
+        if (tick % 50 == 0) {
+            printf("link-subscriber: tick=%d peers=%zu sources=%zu\n",
+                   tick, link.numPeers(), sources.size());
         }
     }
 
