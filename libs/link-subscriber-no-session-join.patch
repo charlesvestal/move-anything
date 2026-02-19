@@ -1,0 +1,223 @@
+diff --git a/include/ableton/link/MeasurementService.hpp b/include/ableton/link/MeasurementService.hpp
+index 35c933d..8151a46 100644
+--- a/include/ableton/link/MeasurementService.hpp
++++ b/include/ableton/link/MeasurementService.hpp
+@@ -30,6 +30,13 @@
+ #include <map>
+ #include <memory>
+ 
++#ifdef LINK_SUBSCRIBER_NO_SESSION_JOIN
++#include <atomic>
++namespace ableton { namespace link { namespace detail {
++  inline std::atomic<unsigned> g_blockedPings{0};
++}}}
++#endif
++
+ namespace ableton
+ {
+ namespace link
+@@ -121,7 +128,11 @@ public:
+                     const It messageBegin,
+                     const It messageEnd)
+     {
++#ifdef LINK_SUBSCRIBER_NO_SESSION_JOIN
++      detail::g_blockedPings.fetch_add(1, std::memory_order_relaxed);
++#else
+       mPingResponder(from, messageBegin, messageEnd);
++#endif
+ 
+       for (auto it = mMeasurementMap.begin(); it != mMeasurementMap.end(); ++it)
+       {
+diff --git a/include/ableton/link/Sessions.hpp b/include/ableton/link/Sessions.hpp
+index a80e89b..40a014d 100644
+--- a/include/ableton/link/Sessions.hpp
++++ b/include/ableton/link/Sessions.hpp
+@@ -23,6 +23,14 @@
+ #include <ableton/link/SessionId.hpp>
+ #include <ableton/link/Timeline.hpp>
+ 
++#ifdef LINK_SUBSCRIBER_NO_SESSION_JOIN
++#include <atomic>
++namespace ableton { namespace link { namespace detail {
++  inline std::atomic<unsigned> g_measureOk{0};
++  inline std::atomic<unsigned> g_measureFail{0};
++}}}
++#endif
++
+ namespace ableton
+ {
+ namespace link
+@@ -131,6 +139,10 @@ private:
+   void handleSuccessfulMeasurement(const SessionId& id, GhostXForm xform)
+   {
+     using namespace std;
++#ifdef LINK_SUBSCRIBER_NO_SESSION_JOIN
++    detail::g_measureOk.fetch_add(1, std::memory_order_relaxed);
++    printf("SUB: handleSuccessfulMeasurement (blocked join)\n");
++#endif
+ 
+     debug(mIo->log()) << "Session " << id << " measurement completed with result "
+                       << "(" << xform.slope << ", " << xform.intercept.count() << ")";
+@@ -158,6 +170,7 @@ private:
+         range.first->measurement = std::move(measurement);
+         // If session times too close - fall back to session id order
+         const auto ghostDiff = newGhost - curGhost;
++#ifndef LINK_SUBSCRIBER_NO_SESSION_JOIN
+         if (ghostDiff > SESSION_EPS
+             || (std::abs(ghostDiff.count()) < SESSION_EPS.count()
+                 && id < mCurrent.sessionId))
+@@ -176,6 +189,7 @@ private:
+           mCallback(mCurrent);
+           scheduleRemeasurement();
+         }
++#endif
+       }
+     }
+   }
+@@ -198,6 +212,10 @@ private:
+   void handleFailedMeasurement(const SessionId& id)
+   {
+     using namespace std;
++#ifdef LINK_SUBSCRIBER_NO_SESSION_JOIN
++    detail::g_measureFail.fetch_add(1, std::memory_order_relaxed);
++    printf("SUB: handleFailedMeasurement\n");
++#endif
+ 
+     debug(mIo->log()) << "Session " << id << " measurement failed.";
+ 
+diff --git a/include/ableton/link_audio/Channels.hpp b/include/ableton/link_audio/Channels.hpp
+index f4a4f75..a87d1b4 100644
+--- a/include/ableton/link_audio/Channels.hpp
++++ b/include/ableton/link_audio/Channels.hpp
+@@ -147,6 +147,21 @@ public:
+     return {begin(channels), it};
+   }
+ 
++#ifdef LINK_SUBSCRIBER_NO_SESSION_JOIN
++  std::vector<Channel> allUniqueChannels() const
++  {
++    std::vector<Channel> result;
++    for (const auto& info : mpImpl->mChannels)
++    {
++      result.push_back(info.channel);
++    }
++    auto it = std::unique(begin(result),
++                          end(result),
++                          [](const auto& a, const auto& b) { return a.id == b.id; });
++    return {begin(result), it};
++  }
++#endif
++
+   std::optional<SendHandler> peerSendHandler(const Id peerId) const
+   {
+     auto it = mpImpl->mPeerSendHandlers.find(peerId);
+@@ -379,6 +394,9 @@ private:
+     void prunePeerChannels(PeerIdIt connectedPeersBegin, PeerIdIt connectedPeersEnd)
+     {
+       using namespace std;
++#ifdef LINK_SUBSCRIBER_NO_SESSION_JOIN
++      printf("SUB: prunePeerChannels called! mChannels=%zu\n", mChannels.size());
++#endif
+ 
+       vector<Id> removedChannelIds;
+       for (const auto& info : mChannels)
+@@ -430,6 +448,9 @@ private:
+                              It channelsEnd)
+     {
+       using namespace std;
++#ifdef LINK_SUBSCRIBER_NO_SESSION_JOIN
++      printf("SUB: channelsLeftGateway mChannels=%zu\n", mChannels.size());
++#endif
+ 
+       auto channelsChanged = false;
+ 
+@@ -468,6 +489,9 @@ private:
+     void gatewayClosed(const discovery::IpAddress& gatewayAddr)
+     {
+       using namespace std;
++#ifdef LINK_SUBSCRIBER_NO_SESSION_JOIN
++      printf("SUB: gatewayClosed mChannels=%zu\n", mChannels.size());
++#endif
+       auto it =
+         remove_if(begin(mChannels),
+                   end(mChannels),
+@@ -497,6 +521,9 @@ private:
+     void pruneExpiredChannels()
+     {
+       using namespace std;
++#ifdef LINK_SUBSCRIBER_NO_SESSION_JOIN
++      printf("SUB: pruneExpiredChannels mChannels=%zu\n", mChannels.size());
++#endif
+ 
+       const auto test = make_tuple(mPruneTimer.now(), discovery::IpAddress{}, Id{});
+ 
+diff --git a/include/ableton/link_audio/Controller.hpp b/include/ableton/link_audio/Controller.hpp
+index 79d2348..3b79947 100644
+--- a/include/ableton/link_audio/Controller.hpp
++++ b/include/ableton/link_audio/Controller.hpp
+@@ -176,6 +176,11 @@ protected:
+ 
+   void updateLinkAudio()
+   {
++#ifdef LINK_SUBSCRIBER_NO_SESSION_JOIN
++    // In subscriber mode, skip session-based pruning entirely.
++    // We want audio from ALL discovered peers, not just same-session peers.
++    printf("SUB: updateLinkAudio (skip prune)\n");
++#else
+     auto peers = std::set<link::NodeId>();
+ 
+     for (const auto& sessionPeer : this->mPeers.sessionPeers(this->mSessionId))
+@@ -187,6 +192,7 @@ protected:
+ 
+     // Remove channels for peers that are no longer in the session
+     mChannels.prunePeerChannels(peers.begin(), peers.end());
++#endif
+ 
+     updateApiChannels();
+   }
+@@ -200,6 +206,9 @@ protected:
+ 
+   void updateLinkAudioGateways()
+   {
++#ifdef LINK_SUBSCRIBER_NO_SESSION_JOIN
++    printf("SUB: updateLinkAudioGateways called\n");
++#endif
+     auto gateways = std::vector<discovery::IpAddress>();
+     this->mDiscovery.withGateways(
+       [&](auto begin, auto end)
+@@ -245,7 +254,12 @@ protected:
+   void updateApiChannels()
+   {
+     auto channelsChanged = false;
++#ifdef LINK_SUBSCRIBER_NO_SESSION_JOIN
++    auto currentChannels = mChannels.allUniqueChannels();
++    printf("SUB: updateApiChannels channels=%zu\n", currentChannels.size());
++#else
+     auto currentChannels = mChannels.uniqueSessionChannels(this->mSessionId);
++#endif
+ 
+     std::sort(currentChannels.begin(),
+               currentChannels.end(),
+diff --git a/include/ableton/link_audio/SessionController.hpp b/include/ableton/link_audio/SessionController.hpp
+index 6f611aa..56adc63 100644
+--- a/include/ableton/link_audio/SessionController.hpp
++++ b/include/ableton/link_audio/SessionController.hpp
+@@ -80,11 +80,18 @@ public:
+   void sessionMembershipCallback()
+   {
+     this->mSessionPeerCounter();
++#ifdef LINK_SUBSCRIBER_NO_SESSION_JOIN
++    printf("SUB: sessionMembershipCallback peers=%zu\n",
++           this->mPeers.uniqueSessionPeerCount(this->mSessionId));
++#endif
+     this->updateLinkAudio();
+   }
+ 
+   void joinSessionCallback(const link::Session& session)
+   {
++#ifdef LINK_SUBSCRIBER_NO_SESSION_JOIN
++    printf("SUB: joinSessionCallback (session change!)\n");
++#endif
+     this->joinSession(session);
+     this->updateLinkAudio();
+   }
