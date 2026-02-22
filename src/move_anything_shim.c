@@ -294,6 +294,83 @@ static void log_fd_bytes(const char *tag, int fd, const char *path,
 }
 
 /* ============================================================================
+ * ALSA SEQ TRACE (BINARY PATH DISCOVERY)
+ * ============================================================================
+ * Trace ALSA sequencer events from Move's own libasound calls to locate
+ * post-layout note flow. Enabled by creating shadow_seq_trace_on.
+ * ============================================================================ */
+
+static FILE *shadow_seq_trace_log = NULL;
+
+static int shadow_seq_trace_enabled(void)
+{
+    static int enabled = -1;
+    static int check_counter = 0;
+    if (check_counter++ % 200 == 0 || enabled < 0) {
+        enabled = (access("/data/UserData/move-anything/shadow_seq_trace_on", F_OK) == 0);
+        if (!enabled && shadow_seq_trace_log) {
+            fclose(shadow_seq_trace_log);
+            shadow_seq_trace_log = NULL;
+        }
+    }
+    return enabled;
+}
+
+static void shadow_seq_trace_log_open(void)
+{
+    if (!shadow_seq_trace_log) {
+        shadow_seq_trace_log = fopen("/data/UserData/move-anything/shadow_seq_trace.log", "a");
+    }
+}
+
+/* Best-effort decode of snd_seq_event_t without ALSA headers:
+ * type/flags/tag/queue in bytes 0..3, source/dest in 12..15, note data in 16..19. */
+static void shadow_seq_trace_event(const char *tag, const void *ev, long ret)
+{
+    if (!shadow_seq_trace_enabled() || !ev) return;
+    shadow_seq_trace_log_open();
+    if (!shadow_seq_trace_log) return;
+
+    const uint8_t *b = (const uint8_t *)ev;
+    uint8_t type = b[0];
+    uint8_t flags = b[1];
+    uint8_t src_client = b[12];
+    uint8_t src_port = b[13];
+    uint8_t dst_client = b[14];
+    uint8_t dst_port = b[15];
+    uint8_t note_ch = b[16];
+    uint8_t note = b[17];
+    uint8_t vel = b[18];
+    uint8_t off_vel = b[19];
+
+    fprintf(shadow_seq_trace_log,
+            "%s ret=%ld type=%u flags=0x%02x src=%u:%u dst=%u:%u ch=%u note=%u vel=%u off=%u raw:",
+            tag, ret, type, flags, src_client, src_port, dst_client, dst_port,
+            note_ch, note, vel, off_vel);
+    for (int i = 0; i < 28; i++) {
+        fprintf(shadow_seq_trace_log, " %02x", b[i]);
+    }
+    fprintf(shadow_seq_trace_log, "\n");
+    fflush(shadow_seq_trace_log);
+}
+
+static void shadow_seq_trace_bytes(const char *tag, const unsigned char *buf, size_t len, long ret)
+{
+    if (!shadow_seq_trace_enabled() || !buf || len == 0) return;
+    shadow_seq_trace_log_open();
+    if (!shadow_seq_trace_log) return;
+
+    size_t max = len > 24 ? 24 : len;
+    fprintf(shadow_seq_trace_log, "%s ret=%ld len=%zu bytes:", tag, ret, len);
+    for (size_t i = 0; i < max; i++) {
+        fprintf(shadow_seq_trace_log, " %02x", buf[i]);
+    }
+    if (len > max) fprintf(shadow_seq_trace_log, " ...");
+    fprintf(shadow_seq_trace_log, "\n");
+    fflush(shadow_seq_trace_log);
+}
+
+/* ============================================================================
  * MAILBOX DIFF PROBE (XMOS PATH DISCOVERY)
  * ============================================================================
  * Compare mailbox snapshots to find where MIDI-like bytes appear when playing.
@@ -6330,6 +6407,252 @@ static int shadow_is_internal_control_note(uint8_t note)
     return (note < 10) || (note >= 40 && note <= 43);
 }
 
+/* Experimental path: apply focused-slot Chord MIDI FX expansion to Move's
+ * musical note stream and feed extras back via external MIDI_IN (cable 2)
+ * so native Move synths receive transformed notes without mutating raw pad IDs. */
+#define SHADOW_MOVE_CHORD_MAX_EXTRAS 32
+#define SHADOW_MOVE_CHORD_INTERVAL_MAX 4
+#define SHADOW_MOVE_CHORD_ECHO_GUARD 64
+
+typedef struct {
+    uint8_t in_use;
+    uint8_t status;
+    uint8_t note;
+    uint8_t vel;
+} shadow_move_chord_echo_t;
+
+static shadow_move_chord_echo_t shadow_move_chord_echo_guard[SHADOW_MOVE_CHORD_ECHO_GUARD];
+static int shadow_move_chord_echo_wr = 0;
+
+static int shadow_move_transform_slot(void)
+{
+    int slot = shadow_selected_slot;
+    if (shadow_control && shadow_control->ui_slot >= 0 &&
+        shadow_control->ui_slot < SHADOW_CHAIN_INSTANCES) {
+        slot = shadow_control->ui_slot;
+    }
+    if (slot < 0 || slot >= SHADOW_CHAIN_INSTANCES) return -1;
+    return slot;
+}
+
+static int shadow_slot_get_param_string(int slot, const char *key, char *buf, int buf_len)
+{
+    if (!buf || buf_len < 2 || !key || !key[0]) return 0;
+    if (slot < 0 || slot >= SHADOW_CHAIN_INSTANCES) return 0;
+    if (!shadow_plugin_v2 || !shadow_plugin_v2->get_param) return 0;
+    if (!shadow_chain_slots[slot].instance) return 0;
+
+    int len = shadow_plugin_v2->get_param(shadow_chain_slots[slot].instance, key, buf, buf_len);
+    if (len <= 0) return 0;
+    if (len >= buf_len) len = buf_len - 1;
+    buf[len] = '\0';
+    return 1;
+}
+
+static int shadow_chord_extra_intervals(const char *type, int *intervals, int max_intervals)
+{
+    if (!type || !intervals || max_intervals <= 0) return 0;
+
+    if (strcmp(type, "major") == 0) {
+        if (max_intervals >= 2) { intervals[0] = 4; intervals[1] = 7; return 2; }
+        intervals[0] = 4; return 1;
+    }
+    if (strcmp(type, "minor") == 0) {
+        if (max_intervals >= 2) { intervals[0] = 3; intervals[1] = 7; return 2; }
+        intervals[0] = 3; return 1;
+    }
+    if (strcmp(type, "dim") == 0) {
+        if (max_intervals >= 2) { intervals[0] = 3; intervals[1] = 6; return 2; }
+        intervals[0] = 3; return 1;
+    }
+    if (strcmp(type, "aug") == 0) {
+        if (max_intervals >= 2) { intervals[0] = 4; intervals[1] = 8; return 2; }
+        intervals[0] = 4; return 1;
+    }
+    if (strcmp(type, "sus2") == 0) {
+        if (max_intervals >= 2) { intervals[0] = 2; intervals[1] = 7; return 2; }
+        intervals[0] = 2; return 1;
+    }
+    if (strcmp(type, "sus4") == 0) {
+        if (max_intervals >= 2) { intervals[0] = 5; intervals[1] = 7; return 2; }
+        intervals[0] = 5; return 1;
+    }
+    if (strcmp(type, "maj7") == 0) {
+        if (max_intervals >= 3) { intervals[0] = 4; intervals[1] = 7; intervals[2] = 11; return 3; }
+        if (max_intervals >= 2) { intervals[0] = 4; intervals[1] = 7; return 2; }
+        intervals[0] = 4; return 1;
+    }
+    if (strcmp(type, "min7") == 0) {
+        if (max_intervals >= 3) { intervals[0] = 3; intervals[1] = 7; intervals[2] = 10; return 3; }
+        if (max_intervals >= 2) { intervals[0] = 3; intervals[1] = 7; return 2; }
+        intervals[0] = 3; return 1;
+    }
+    if (strcmp(type, "dom7") == 0) {
+        if (max_intervals >= 3) { intervals[0] = 4; intervals[1] = 7; intervals[2] = 10; return 3; }
+        if (max_intervals >= 2) { intervals[0] = 4; intervals[1] = 7; return 2; }
+        intervals[0] = 4; return 1;
+    }
+    if (strcmp(type, "dim7") == 0) {
+        if (max_intervals >= 3) { intervals[0] = 3; intervals[1] = 6; intervals[2] = 9; return 3; }
+        if (max_intervals >= 2) { intervals[0] = 3; intervals[1] = 6; return 2; }
+        intervals[0] = 3; return 1;
+    }
+    if (strcmp(type, "power") == 0) {
+        intervals[0] = 7;
+        return 1;
+    }
+    if (strcmp(type, "5th") == 0) {
+        if (max_intervals >= 2) { intervals[0] = 7; intervals[1] = 12; return 2; }
+        intervals[0] = 7; return 1;
+    }
+    if (strcmp(type, "octave") == 0) {
+        intervals[0] = 12;
+        return 1;
+    }
+    if (strcmp(type, "add9") == 0) {
+        if (max_intervals >= 3) { intervals[0] = 4; intervals[1] = 7; intervals[2] = 14; return 3; }
+        if (max_intervals >= 2) { intervals[0] = 4; intervals[1] = 7; return 2; }
+        intervals[0] = 4; return 1;
+    }
+    return 0;
+}
+
+/* Resolve focused slot's chord interval set once per frame. */
+static int shadow_get_move_chord_intervals(int slot, int *intervals, int max_intervals)
+{
+    if (!intervals || max_intervals <= 0) return 0;
+    if (slot < 0 || slot >= SHADOW_CHAIN_INSTANCES) return 0;
+
+    char module_buf[64];
+    if (!shadow_slot_get_param_string(slot, "midi_fx1_module", module_buf, sizeof(module_buf))) {
+        return 0;
+    }
+    if (strcmp(module_buf, "chord") != 0) return 0;
+
+    char chord_type[32];
+    if (!shadow_slot_get_param_string(slot, "midi_fx1:type", chord_type, sizeof(chord_type))) {
+        return 0;
+    }
+    if (strcmp(chord_type, "none") == 0) return 0;
+
+    return shadow_chord_extra_intervals(chord_type, intervals, max_intervals);
+}
+
+static void shadow_move_chord_echo_record(uint8_t status, uint8_t note, uint8_t vel)
+{
+    shadow_move_chord_echo_guard[shadow_move_chord_echo_wr].in_use = 1;
+    shadow_move_chord_echo_guard[shadow_move_chord_echo_wr].status = status;
+    shadow_move_chord_echo_guard[shadow_move_chord_echo_wr].note = note;
+    shadow_move_chord_echo_guard[shadow_move_chord_echo_wr].vel = vel;
+    shadow_move_chord_echo_wr = (shadow_move_chord_echo_wr + 1) % SHADOW_MOVE_CHORD_ECHO_GUARD;
+}
+
+/* Consume one echoed packet match so transformed echoes are not transformed again. */
+static int shadow_move_chord_echo_consume(uint8_t status, uint8_t note, uint8_t vel)
+{
+    for (int i = 0; i < SHADOW_MOVE_CHORD_ECHO_GUARD; i++) {
+        if (!shadow_move_chord_echo_guard[i].in_use) continue;
+        if (shadow_move_chord_echo_guard[i].status == status &&
+            shadow_move_chord_echo_guard[i].note == note &&
+            shadow_move_chord_echo_guard[i].vel == vel) {
+            shadow_move_chord_echo_guard[i].in_use = 0;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int shadow_move_chord_log_enabled(void)
+{
+    static int enabled = -1;
+    static int check_counter = 0;
+    if (enabled < 0 || (check_counter++ % 200 == 0)) {
+        enabled = (access("/data/UserData/move-anything/shadow_move_chord_log_on", F_OK) == 0);
+    }
+    return enabled;
+}
+
+/* For one MIDI_OUT musical packet, emit transformed extras as MIDI_IN cable 2 packets. */
+static int shadow_transform_musical_note_for_move(
+    const uint8_t *pkt,
+    const int *intervals,
+    int interval_count,
+    uint8_t out_pkts[][4],
+    int max_out)
+{
+    if (!pkt || !out_pkts || !intervals || interval_count <= 0 || max_out <= 0) return 0;
+
+    uint8_t cin = pkt[0] & 0x0F;
+    uint8_t cable = (pkt[0] >> 4) & 0x0F;
+    uint8_t status = pkt[1];
+    uint8_t type = status & 0xF0;
+    uint8_t note = pkt[2];
+    uint8_t vel = pkt[3];
+
+    if (cable != 0x02) return 0;  /* Track MIDI stream */
+    if (cin != 0x08 && cin != 0x09) return 0;
+    if (type != 0x80 && type != 0x90) return 0;
+    if (shadow_move_chord_echo_consume(status, note, vel)) return 0;
+
+    int out_count = 0;
+    for (int i = 0; i < interval_count && out_count < max_out; i++) {
+        int transposed = (int)note + intervals[i];
+        if (transposed < 0 || transposed > 127) continue;
+        out_pkts[out_count][0] = (uint8_t)((0x02 << 4) | cin);  /* Feed back as external MIDI IN */
+        out_pkts[out_count][1] = status;
+        out_pkts[out_count][2] = (uint8_t)transposed;
+        out_pkts[out_count][3] = vel;
+        out_count++;
+    }
+    return out_count;
+}
+
+/* Pre-ioctl chord generation: capture MIDI_OUT notes before SPI destroys them.
+ * SPI is full-duplex — the TX region (MIDI_OUT) gets overwritten by RX data
+ * during the ioctl, so we must read it beforehand. Extras are injected into
+ * MIDI_IN post-ioctl for Move's internal synths to play as external USB MIDI. */
+static uint8_t shadow_pre_chord_extras[SHADOW_MOVE_CHORD_MAX_EXTRAS][4];
+static int shadow_pre_chord_extra_count = 0;
+static int shadow_pre_chord_log_on = 0;
+static int shadow_pre_chord_interval_count = 0;
+
+static void shadow_generate_chord_extras_pre_ioctl(void)
+{
+    shadow_pre_chord_extra_count = 0;
+    shadow_pre_chord_interval_count = 0;
+    if (!global_mmap_addr) return;
+    /* Only when NOT in shadow display mode — shadow mode has its own MIDI FX */
+    if (shadow_display_mode) return;
+
+    int transform_slot = shadow_move_transform_slot();
+    int intervals[SHADOW_MOVE_CHORD_INTERVAL_MAX];
+    int n_intervals = shadow_get_move_chord_intervals(
+        transform_slot, intervals, SHADOW_MOVE_CHORD_INTERVAL_MAX);
+    shadow_pre_chord_interval_count = n_intervals;
+    if (n_intervals <= 0) return;
+
+    shadow_pre_chord_log_on = shadow_move_chord_log_enabled();
+
+    /* Scan MIDI_OUT (still intact pre-ioctl) for cable-2 musical notes */
+    uint8_t *midi_out = global_mmap_addr + MIDI_OUT_OFFSET;
+    for (int j = 0; j < MIDI_BUFFER_SIZE; j += 4) {
+        if (shadow_pre_chord_extra_count >= SHADOW_MOVE_CHORD_MAX_EXTRAS) break;
+        int added = shadow_transform_musical_note_for_move(
+            &midi_out[j], intervals, n_intervals,
+            &shadow_pre_chord_extras[shadow_pre_chord_extra_count],
+            SHADOW_MOVE_CHORD_MAX_EXTRAS - shadow_pre_chord_extra_count);
+        shadow_pre_chord_extra_count += added;
+    }
+
+    if (shadow_pre_chord_log_on && shadow_pre_chord_extra_count > 0) {
+        char dbg[256];
+        snprintf(dbg, sizeof(dbg),
+                 "move-chord pre-ioctl: slot=%d intv=%d extras=%d",
+                 transform_slot, n_intervals, shadow_pre_chord_extra_count);
+        shadow_log(dbg);
+    }
+}
+
 /* Note: shadow_allow_midi_to_dsp and shadow_route_knob_cc_to_focused_slot removed.
  * MIDI_IN is no longer routed directly to DSP. Shadow UI handles knobs via set_param. */
 
@@ -9871,6 +10194,67 @@ ssize_t read(int fd, void *buf, size_t count)
     return ret;
 }
 
+/* ALSA seq wrappers for binary-level MIDI path tracing. */
+int snd_seq_event_output(void *seq, void *ev)
+{
+    static int (*real_snd_seq_event_output)(void *, void *) = NULL;
+    if (!real_snd_seq_event_output) {
+        real_snd_seq_event_output = (int (*)(void *, void *))dlsym(RTLD_NEXT, "snd_seq_event_output");
+    }
+    int ret = real_snd_seq_event_output ? real_snd_seq_event_output(seq, ev) : -1;
+    if (ev) shadow_seq_trace_event("SEQ_OUT", ev, (long)ret);
+    return ret;
+}
+
+int snd_seq_event_output_direct(void *seq, void *ev)
+{
+    static int (*real_snd_seq_event_output_direct)(void *, void *) = NULL;
+    if (!real_snd_seq_event_output_direct) {
+        real_snd_seq_event_output_direct =
+            (int (*)(void *, void *))dlsym(RTLD_NEXT, "snd_seq_event_output_direct");
+    }
+    int ret = real_snd_seq_event_output_direct ? real_snd_seq_event_output_direct(seq, ev) : -1;
+    if (ev) shadow_seq_trace_event("SEQ_OUT_DIRECT", ev, (long)ret);
+    return ret;
+}
+
+int snd_seq_event_input(void *seq, void **ev)
+{
+    static int (*real_snd_seq_event_input)(void *, void **) = NULL;
+    if (!real_snd_seq_event_input) {
+        real_snd_seq_event_input = (int (*)(void *, void **))dlsym(RTLD_NEXT, "snd_seq_event_input");
+    }
+    int ret = real_snd_seq_event_input ? real_snd_seq_event_input(seq, ev) : -1;
+    if (ret >= 0 && ev && *ev) shadow_seq_trace_event("SEQ_IN", *ev, (long)ret);
+    return ret;
+}
+
+long snd_midi_event_encode(void *dev, const unsigned char *buf, long count, void *ev)
+{
+    static long (*real_snd_midi_event_encode)(void *, const unsigned char *, long, void *) = NULL;
+    if (!real_snd_midi_event_encode) {
+        real_snd_midi_event_encode =
+            (long (*)(void *, const unsigned char *, long, void *))dlsym(RTLD_NEXT, "snd_midi_event_encode");
+    }
+    long ret = real_snd_midi_event_encode ? real_snd_midi_event_encode(dev, buf, count, ev) : -1;
+    if (buf && count > 0) shadow_seq_trace_bytes("MIDI_ENC_BYTES", buf, (size_t)count, ret);
+    if (ev) shadow_seq_trace_event("MIDI_ENC_EVENT", ev, ret);
+    return ret;
+}
+
+long snd_midi_event_decode(void *dev, unsigned char *buf, long count, const void *ev)
+{
+    static long (*real_snd_midi_event_decode)(void *, unsigned char *, long, const void *) = NULL;
+    if (!real_snd_midi_event_decode) {
+        real_snd_midi_event_decode =
+            (long (*)(void *, unsigned char *, long, const void *))dlsym(RTLD_NEXT, "snd_midi_event_decode");
+    }
+    long ret = real_snd_midi_event_decode ? real_snd_midi_event_decode(dev, buf, count, ev) : -1;
+    if (ev) shadow_seq_trace_event("MIDI_DEC_EVENT", ev, ret);
+    if (buf && ret > 0) shadow_seq_trace_bytes("MIDI_DEC_BYTES", buf, (size_t)ret, ret);
+    return ret;
+}
+
 void launchChildAndKillThisProcess(char *pBinPath, char*pBinName, char* pArgs)
 {
     int pid = fork();
@@ -10657,9 +11041,12 @@ int ioctl(int fd, unsigned long request, ...)
 
     /* NOTE: MIDI filtering moved to AFTER ioctl - see post-ioctl section below */
 
-#if SHADOW_TRACE_DEBUG
-    /* Discovery/probe functions - only needed during development */
+    /* SPI ioctl trace is runtime-gated by spi_trace_on and useful for
+     * reverse-engineering note transport even in normal builds. */
     spi_trace_ioctl(request, (char *)argp);
+
+#if SHADOW_TRACE_DEBUG
+    /* Additional discovery/probe functions - development only */
     shadow_capture_midi_probe();
     shadow_scan_mailbox_raw();
     mailbox_diff_probe();
@@ -10697,6 +11084,9 @@ int ioctl(int fd, unsigned long request, ...)
     TIME_SECTION_START();
     shadow_inprocess_process_midi();
     TIME_SECTION_END(proc_midi_sum, proc_midi_max);
+
+    /* Generate chord extras from MIDI_OUT before SPI destroys it */
+    shadow_generate_chord_extras_pre_ioctl();
 
     /* Drain MIDI-to-DSP from shadow UI (overtake modules sending to chain slots) */
     shadow_drain_ui_midi_dsp();
@@ -11076,6 +11466,7 @@ do_ioctl:
         uint8_t *hw_midi = hardware_mmap_addr + MIDI_IN_OFFSET;
         uint8_t *sh_midi = shadow_mailbox + MIDI_IN_OFFSET;
         int overtake_mode = shadow_control ? shadow_control->overtake_mode : 0;
+        int chord_injected_count = 0;
 
         if (shadow_display_mode && shadow_control) {
             /* Filter MIDI_IN: zero out jog/back/knobs */
@@ -11148,6 +11539,37 @@ do_ioctl:
         } else {
             /* Not in shadow mode - copy MIDI_IN directly */
             memcpy(sh_midi, hw_midi, MIDI_BUFFER_SIZE);
+        }
+
+        /* Inject pre-generated chord extras into MIDI_IN free slots.
+         * Extras were captured pre-ioctl from MIDI_OUT (before SPI destroyed it)
+         * and are injected as cable-2 external MIDI for Move's synths. */
+        if (shadow_pre_chord_extra_count > 0) {
+            int next_extra = 0;
+            for (int j = 0; j < MIDI_BUFFER_SIZE && next_extra < shadow_pre_chord_extra_count; j += 4) {
+                if (sh_midi[j] || sh_midi[j + 1] || sh_midi[j + 2] || sh_midi[j + 3]) {
+                    continue;
+                }
+                sh_midi[j] = shadow_pre_chord_extras[next_extra][0];
+                sh_midi[j + 1] = shadow_pre_chord_extras[next_extra][1];
+                sh_midi[j + 2] = shadow_pre_chord_extras[next_extra][2];
+                sh_midi[j + 3] = shadow_pre_chord_extras[next_extra][3];
+                shadow_move_chord_echo_record(
+                    shadow_pre_chord_extras[next_extra][1],
+                    shadow_pre_chord_extras[next_extra][2],
+                    shadow_pre_chord_extras[next_extra][3]);
+                next_extra++;
+                chord_injected_count++;
+            }
+
+            if (shadow_pre_chord_log_on) {
+                char chord_dbg[256];
+                snprintf(chord_dbg, sizeof(chord_dbg),
+                         "move-chord inject: intv=%d extras=%d injected=%d",
+                         shadow_pre_chord_interval_count,
+                         shadow_pre_chord_extra_count, chord_injected_count);
+                shadow_log(chord_dbg);
+            }
         }
 
         /* === SHIFT+MENU SHORTCUT DETECTION AND BLOCKING (POST-IOCTL) ===
