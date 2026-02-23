@@ -284,100 +284,77 @@ Font* load_font(char* filename, int charSpacing) {
   fclose(charListFP);
 
   int numChars = strlen(charList);
+  if (numChars > 0 && charList[numChars - 1] == '\n') {
+    charList[--numChars] = '\0';
+  }
 
-  uint32_t* data = (uint32_t*)stbi_load(filename, &width, &height, &comp, 4);
-  if(data == NULL) {
+  unsigned char* image = stbi_load(filename, &width, &height, &comp, 4);
+  if(image == NULL) {
     printf("ERROR loading font: %s\n", filename);
     return NULL;
   }
 
-  Font* font = calloc(1, sizeof(Font));
-
-  font->charSpacing = charSpacing;
-
-  comp = 4;
-  int x = 0;
-  int y = 0;
-
-  uint32_t borderColor = data[0];
-  uint32_t emptyColor = data[(height-1) * width];
-
-  printf("FONT DEBUG: file=%s, size=%dx%d, numChars=%d\n", filename, width, height, numChars);
-  printf("FONT DEBUG: borderColor=0x%08x, emptyColor=0x%08x\n", borderColor, emptyColor);
-
-  if (borderColor == emptyColor) {
-    printf("FONT ERROR: borderColor == emptyColor, font will not load correctly!\n");
+  /* Horizontal-strip atlas: each char occupies charW columns */
+  int charW = numChars > 0 ? width / numChars : 0;
+  if (charW <= 0) {
+    printf("ERROR: font atlas width %d < numChars %d\n", width, numChars);
+    stbi_image_free(image);
+    return NULL;
   }
 
-  x = 0;
+  Font* font = calloc(1, sizeof(Font));
+  font->charSpacing = charSpacing;
 
   for(int i = 0; i < numChars; i++) {
-    FontChar fc;
-    fc.width = 0;
-    fc.height = 0;
+    int cp = (unsigned char)charList[i];
+    if (cp >= 128) continue; /* skip non-ASCII */
 
-    while(x < width && data[x] == borderColor) {
-      x++;
-    }
+    int x0 = i * charW;
 
-    if(x >= width) {
-      break;
-    }
-
-    int bx = x;
-    int by = y;
-    for(int by = 0; by < height; by++) {
-        uint32_t color = data[by * width + x];
-        if(color == borderColor) {
-          fc.height = by;
+    /* Find actual pixel extent within this cell (auto-trim whitespace) */
+    int startX = -1, endX = -1;
+    for (int x = 0; x < charW; x++) {
+      for (int y = 0; y < height; y++) {
+        int idx = (y * width + x0 + x) * 4;
+        if (image[idx + 3] > 0) {
+          if (startX == -1) startX = x;
+          endX = x;
           break;
         }
-    }
-    for(int bx = x; bx < width; bx++) {
-        uint32_t color = data[bx];
-        if(color == borderColor) {
-          fc.width = bx - x;
-          break;
-        }
-    }
-
-    if(fc.width == 0 || fc.height == 0) {
-      printf("FONT ERROR [%d/%d] char '%c' (0x%02x) has zero dimension: %d x %d at x=%d\n",
-             i, numChars, charList[i], (unsigned char)charList[i], fc.width, fc.height, x);
-      printf("FONT DEBUG: x position may have exceeded width (%d)\n", width);
-      break;
-    }
-
-    if (i < 5 || i == numChars - 1) {
-      printf("FONT DEBUG [%d] char '%c': %dx%d at x=%d\n", i, charList[i], fc.width, fc.height, x);
-    }
-
-    fc.data = malloc(fc.width * fc.height);
-
-    int setPixels = 0;
-
-    for(int yi = 0; yi < fc.height; yi++) {
-      for(int xi = 0; xi < fc.width; xi++) {
-        uint32_t color = data[(y + yi) * width + (x + xi)];
-        int set = (color != borderColor && color != emptyColor);
-        if(set) {
-          setPixels++;
-        }
-        fc.data[yi * fc.width + xi] = set;
       }
     }
 
-    font->charData[(unsigned char)charList[i]] = fc;
+    FontChar fc;
+    memset(&fc, 0, sizeof(fc));
 
-    x += fc.width+1;
-    if(x >= width) {
-      break;
+    if (startX == -1) {
+      /* Blank glyph — insert a space-width entry so cursor advances */
+      fc.width = charW;
+      fc.height = height;
+      fc.data = calloc(charW * height, 1);
+      font->charData[cp] = fc;
+      continue;
     }
+
+    int glyphW = endX - startX + 1;
+    fc.width = glyphW;
+    fc.height = height;
+    fc.data = malloc(glyphW * height);
+    if (!fc.data) continue;
+
+    for (int y = 0; y < height; y++) {
+      for (int x = 0; x < glyphW; x++) {
+        int idx = (y * width + x0 + startX + x) * 4;
+        fc.data[y * glyphW + x] = image[idx + 3] > 0 ? 1 : 0;
+      }
+    }
+
+    font->charData[cp] = fc;
   }
 
-  stbi_image_free(data);
+  stbi_image_free(image);
 
-  printf("Loaded bitmap font: %s (%d chars)\n", filename, numChars);
+  printf("Loaded bitmap font: %s (%d chars, cell %dx%d)\n", filename, numChars, charW, height);
   return font;
 }
 
