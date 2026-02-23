@@ -44,6 +44,7 @@ Modules (src/modules/<id>/):
 - **src/host/plugin_api_v1.h**: DSP plugin C API
 - **src/host/module_manager.c**: Module loading
 - **src/host/menu_ui.js**: Host menu for module selection
+- **src/tools/move-inject.c**: CLI tool for injecting MIDI over SSH (see docs/API.md)
 
 ### Module Structure
 

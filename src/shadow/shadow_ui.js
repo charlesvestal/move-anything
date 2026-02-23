@@ -590,6 +590,12 @@ const GLOBAL_SETTINGS_SECTIONS = [
         ]
     },
     {
+        id: "midi", label: "MIDI",
+        items: [
+            { key: "usb_midi_bridge", label: "USB MIDI Bridge", type: "bool" }
+        ]
+    },
+    {
         id: "accessibility", label: "Screen Reader",
         items: [
             { key: "screen_reader_enabled", label: "Screen Reader", type: "bool" },
@@ -5495,6 +5501,9 @@ function getMasterFxSettingValue(setting) {
     if (setting.key === "display_mirror") {
         return (typeof display_mirror_get === "function" && display_mirror_get()) ? "On" : "Off";
     }
+    if (setting.key === "usb_midi_bridge") {
+        return (typeof usb_midi_bridge_get === "function" && usb_midi_bridge_get()) ? "On" : "Off";
+    }
     if (setting.key === "screen_reader_enabled") {
         return (typeof tts_get_enabled === "function" && tts_get_enabled()) ? "On" : "Off";
     }
@@ -5576,6 +5585,13 @@ function adjustMasterFxSetting(setting, delta) {
         /* Toggle boolean */
         const current = typeof display_mirror_get === "function" ? display_mirror_get() : false;
         display_mirror_set(!current ? 1 : 0);
+        return;
+    }
+
+    if (setting.key === "usb_midi_bridge" && typeof usb_midi_bridge_set === "function") {
+        /* Toggle boolean */
+        const current = typeof usb_midi_bridge_get === "function" ? usb_midi_bridge_get() : false;
+        usb_midi_bridge_set(!current ? 1 : 0);
         return;
     }
 

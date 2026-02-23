@@ -30,6 +30,7 @@
 #define SHM_SHADOW_SCREENREADER "/move-shadow-screenreader" /* Screen reader announcements */
 #define SHM_SHADOW_OVERLAY  "/move-shadow-overlay"  /* Overlay state (sampler/skipback) */
 #define SHM_DISPLAY_LIVE    "/move-display-live"    /* Live display for remote viewer */
+#define SHM_INJECT_MIDI     "/move-inject-midi"     /* External MIDI injection */
 
 /* ============================================================================
  * Buffer Sizes
@@ -44,6 +45,8 @@
 #define SHADOW_MIDI_DSP_BUFFER_SIZE 512  /* MIDI to DSP buffer from shadow UI (128 packets) */
 #define SHADOW_SCREENREADER_BUFFER_SIZE 8448  /* Screen reader message buffer */
 #define SHADOW_OVERLAY_BUFFER_SIZE 256        /* Overlay state buffer */
+#define INJECT_MIDI_MAX_PACKETS 32
+#define INJECT_MIDI_BUFFER_SIZE (INJECT_MIDI_MAX_PACKETS * 4 + 4)
 
 /* ============================================================================
  * Slot Configuration
@@ -112,7 +115,8 @@ typedef struct shadow_control_t {
     volatile uint8_t overlay_rect_y;      /* Overlay rect top edge (pixels, 0-63) */
     volatile uint8_t overlay_rect_w;      /* Overlay rect width (pixels) */
     volatile uint8_t overlay_rect_h;      /* Overlay rect height (pixels) */
-    volatile uint8_t reserved[23];
+    volatile uint8_t usb_midi_bridge;     /* 0=off, 1=on (re-stamp cable 2 as cable 0) */
+    volatile uint8_t reserved[22];
 } shadow_control_t;
 
 /*
@@ -232,6 +236,18 @@ typedef struct shadow_overlay_state_t {
 
     volatile uint8_t  reserved[256 - 208];  /* Pad to SHADOW_OVERLAY_BUFFER_SIZE */
 } shadow_overlay_state_t;
+
+/*
+ * MIDI injection ring buffer.
+ * External tools write USB-MIDI packets here; the shim consumes them each ioctl tick.
+ * USB-MIDI packet format: [CIN|cable, status, data1, data2]
+ */
+typedef struct inject_midi_t {
+    volatile uint8_t write_idx;   /* Producer increments after writing each packet */
+    volatile uint8_t read_idx;    /* Shim increments after consuming each packet */
+    volatile uint8_t reserved[2];
+    uint8_t buffer[INJECT_MIDI_MAX_PACKETS * 4];  /* Ring of 4-byte USB-MIDI packets */
+} inject_midi_t;
 
 /* Compile-time size checks */
 typedef char shadow_control_size_check[(sizeof(shadow_control_t) == CONTROL_BUFFER_SIZE) ? 1 : -1];

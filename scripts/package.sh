@@ -45,6 +45,11 @@ if [ -f "./display-server" ]; then
     ITEMS="$ITEMS ./display-server"
 fi
 
+# Add move-inject if it was built
+if [ -f "./move-inject" ]; then
+    ITEMS="$ITEMS ./move-inject"
+fi
+
 # Add web shim if it was built (PIN challenge TTS readout for MoveWebService)
 if [ -f "./move-anything-web-shim.so" ]; then
     ITEMS="$ITEMS ./move-anything-web-shim.so"

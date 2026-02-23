@@ -308,6 +308,74 @@ The host tracks these inputs locally (independent of the shim) to ensure escape 
 
 Modules receive full MIDI access and can send to both internal (LEDs) and external (USB-A) targets.
 
+## MIDI Injection (move-inject)
+
+`move-inject` is a command-line tool that injects MIDI events into Move's hardware input stream from outside the device (e.g. over SSH). Events appear to Move exactly as if they came from physical pads, knobs, or buttons.
+
+Requires move-anything to be running (the shim creates `/dev/shm/move-inject-midi` at startup).
+
+### Usage
+
+```bash
+move-inject note-on  <note 0-127> <velocity 0-127>
+move-inject note-off <note 0-127>
+move-inject cc       <cc 0-127>   <value 0-127>
+move-inject raw      <byte1>      <byte2>      <byte3>
+```
+
+All events are sent on channel 1, cable 0 (Move's internal hardware cable).
+
+### Examples
+
+```bash
+# Hit pad 68 (bottom-left)
+move-inject note-on 68 100
+move-inject note-off 68
+
+# Turn knob 1 clockwise by one step
+move-inject cc 71 1
+
+# Sweep knob 1 from 0 to 127
+for v in $(seq 0 10 127); do
+    move-inject cc 71 $v
+    sleep 0.05
+done
+
+# Simulate jog wheel turn (CW)
+move-inject cc 14 1
+
+# Raw USB-MIDI packet (Note On ch1 note 60 vel 127)
+move-inject raw 0x90 0x3C 0x7F
+```
+
+### MIDI Reference
+
+| Action | Command |
+|--------|---------|
+| Pad hit (notes 68-99) | `note-on <note> <vel>` |
+| Knob 1-8 (CCs 71-78) | `cc <71-78> <1-63 CW, 65-127 CCW>` |
+| Jog wheel rotate (CC 14) | `cc 14 <1-63 CW, 65-127 CCW>` |
+| Jog wheel click (CC 3) | `cc 3 127` |
+| Shift button (CC 49) | `cc 49 127` / `cc 49 0` |
+| Menu button (CC 50) | `cc 50 127` |
+| Back button (CC 51) | `cc 51 127` |
+
+### How It Works
+
+The shim maintains a 32-packet SPSC ring buffer in `/dev/shm/move-inject-midi`. On each ioctl tick (~347 Hz), the shim drains pending packets from the ring into empty slots of Move's hardware MIDI input buffer. Move processes them identically to physical input, including quantization and channel filtering.
+
+### Location on Device
+
+```
+/data/UserData/move-anything/move-inject
+```
+
+### Limitations
+
+- Single writer only — concurrent invocations from multiple processes are not safe (no lock on the ring).
+- Injected events go through Move's normal MIDI processing, so channel and cable filtering applies.
+- In overtake mode, cable 0 events are blocked from reaching Move (same as physical hardware).
+
 ## Audio (DSP Modules Only)
 
 Audio is handled by native DSP plugins (`.so` files). See [MODULES.md](MODULES.md) for plugin API.

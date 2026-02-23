@@ -126,6 +126,7 @@ static volatile float shadow_master_volume;  /* Defined later */
 static bool shadow_ui_enabled = true;      /* Shadow UI enabled by default */
 static bool standalone_enabled = true;     /* Standalone mode enabled by default */
 static bool display_mirror_enabled = false; /* Display mirror off by default */
+static bool usb_midi_bridge_enabled = false; /* USB MIDI bridge off by default */
 
 /* Link Audio interception and publishing state */
 static link_audio_state_t link_audio;
@@ -5080,6 +5081,19 @@ static void load_feature_config(void)
         }
     }
 
+    /* Parse usb_midi_bridge (defaults to false) */
+    const char *bridge_key = strstr(config_buf, "\"usb_midi_bridge\"");
+    if (bridge_key) {
+        const char *colon = strchr(bridge_key, ':');
+        if (colon) {
+            colon++;
+            while (*colon == ' ' || *colon == '\t') colon++;
+            if (strncmp(colon, "true", 4) == 0) {
+                usb_midi_bridge_enabled = true;
+            }
+        }
+    }
+
     char log_msg[256];
     snprintf(log_msg, sizeof(log_msg),
              "Features: shadow_ui=%s, standalone=%s, link_audio=%s, display_mirror=%s",
@@ -8056,6 +8070,8 @@ static int shm_midi_out_fd = -1;
 static int shm_midi_dsp_fd = -1;
 static int shm_screenreader_fd = -1;
 static int shm_overlay_fd = -1;
+static int shm_inject_midi_fd = -1;
+static inject_midi_t *inject_midi_shm = NULL;
 
 /* Shadow initialization state */
 static int shadow_shm_initialized = 0;
@@ -8351,6 +8367,23 @@ static void init_shadow_shm(void)
         printf("Shadow: Failed to create overlay shm\n");
     }
 
+    /* Create/open inject MIDI shared memory (for external tools to inject MIDI events) */
+    shm_inject_midi_fd = shm_open(SHM_INJECT_MIDI, O_CREAT | O_RDWR, 0666);
+    if (shm_inject_midi_fd >= 0) {
+        ftruncate(shm_inject_midi_fd, INJECT_MIDI_BUFFER_SIZE);
+        inject_midi_shm = (inject_midi_t *)mmap(NULL, INJECT_MIDI_BUFFER_SIZE,
+                                                 PROT_READ | PROT_WRITE,
+                                                 MAP_SHARED, shm_inject_midi_fd, 0);
+        if (inject_midi_shm == MAP_FAILED) {
+            inject_midi_shm = NULL;
+            printf("Shadow: Failed to mmap inject MIDI shm\n");
+        } else {
+            memset(inject_midi_shm, 0, INJECT_MIDI_BUFFER_SIZE);
+        }
+    } else {
+        printf("Shadow: Failed to create inject MIDI shm\n");
+    }
+
     /* TTS engine uses lazy initialization - will init on first speak */
     tts_set_volume(70);  /* Set volume early (safe, doesn't require TTS init) */
     printf("Shadow: TTS engine configured (will init on first use)\n");
@@ -8362,9 +8395,9 @@ static void init_shadow_shm(void)
     memset(shadow_slot_capture, 0, sizeof(shadow_slot_capture));
 
     shadow_shm_initialized = 1;
-    printf("Shadow: Shared memory initialized (audio=%p, midi=%p, ui_midi=%p, display=%p, control=%p, ui=%p, param=%p, midi_out=%p, midi_dsp=%p, screenreader=%p, overlay=%p)\n",
+    printf("Shadow: Shared memory initialized (audio=%p, midi=%p, ui_midi=%p, display=%p, control=%p, ui=%p, param=%p, midi_out=%p, midi_dsp=%p, screenreader=%p, overlay=%p, inject_midi=%p)\n",
            shadow_audio_shm, shadow_midi_shm, shadow_ui_midi_shm,
-           shadow_display_shm, shadow_control, shadow_ui_state, shadow_param, shadow_midi_out_shm, shadow_midi_dsp_shm, shadow_screenreader_shm, shadow_overlay_shm);
+           shadow_display_shm, shadow_control, shadow_ui_state, shadow_param, shadow_midi_out_shm, shadow_midi_dsp_shm, shadow_screenreader_shm, shadow_overlay_shm, inject_midi_shm);
 }
 
 #if SHADOW_DEBUG
@@ -9827,6 +9860,7 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
         load_feature_config();  /* Load feature flags from config */
         if (shadow_control) {
             shadow_control->display_mirror = display_mirror_enabled ? 1 : 0;
+            shadow_control->usb_midi_bridge = usb_midi_bridge_enabled ? 1 : 0;
         }
         /* Launch Link Audio subscriber if feature is enabled */
         if (link_audio.enabled) {
@@ -11456,6 +11490,51 @@ do_ioctl:
                         if (s_d1 == CC_JOG_WHEEL || s_d1 == CC_JOG_CLICK || s_d1 == CC_BACK) {
                             sh_midi[j] = 0; sh_midi[j+1] = 0; sh_midi[j+2] = 0; sh_midi[j+3] = 0;
                         }
+                    }
+                }
+            }
+        }
+
+        /* === MIDI INJECT (from external tools via /move-inject-midi shm) ===
+         * Copy pending inject packets into empty slots of the shadow MIDI_IN buffer. */
+        if (inject_midi_shm) {
+            uint8_t widx = inject_midi_shm->write_idx;
+            uint8_t ridx = inject_midi_shm->read_idx;
+            while (ridx != widx) {
+                uint8_t *pkt = inject_midi_shm->buffer + ((ridx % INJECT_MIDI_MAX_PACKETS) * 4);
+                /* Find an empty slot in sh_midi */
+                for (int j = 0; j < MIDI_BUFFER_SIZE; j += 4) {
+                    if (sh_midi[j] == 0 && sh_midi[j+1] == 0 &&
+                        sh_midi[j+2] == 0 && sh_midi[j+3] == 0) {
+                        sh_midi[j]   = pkt[0];
+                        sh_midi[j+1] = pkt[1];
+                        sh_midi[j+2] = pkt[2];
+                        sh_midi[j+3] = pkt[3];
+                        break;
+                    }
+                }
+                ridx++;
+            }
+            inject_midi_shm->read_idx = ridx;
+        }
+
+        /* === USB MIDI BRIDGE ===
+         * Re-stamp cable 2 (external USB-A) packets as cable 0 so external
+         * MIDI controllers drive Move's instruments and sequencer. */
+        if (shadow_control && shadow_control->usb_midi_bridge) {
+            for (int j = 0; j < MIDI_BUFFER_SIZE; j += 4) {
+                uint8_t cin   = hw_midi[j] & 0x0F;
+                uint8_t cable = (hw_midi[j] >> 4) & 0x0F;
+                if (cable != 0x02) continue;
+                if (cin < 0x08 || cin > 0x0E) continue; /* standard 3-byte msgs only */
+                for (int k = 0; k < MIDI_BUFFER_SIZE; k += 4) {
+                    if (sh_midi[k] == 0 && sh_midi[k+1] == 0 &&
+                        sh_midi[k+2] == 0 && sh_midi[k+3] == 0) {
+                        sh_midi[k]   = cin;            /* cable 0, same CIN */
+                        sh_midi[k+1] = hw_midi[j+1];
+                        sh_midi[k+2] = hw_midi[j+2];
+                        sh_midi[k+3] = hw_midi[j+3];
+                        break;
                     }
                 }
             }
