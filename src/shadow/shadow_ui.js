@@ -7510,7 +7510,7 @@ function drawStorePickerCategories() {
         getValue: (item) => item.value || ''
     });
 
-    drawFooter('Back:return  Jog:browse');
+    drawFooter('Back: return  Jog: browse');
 }
 
 /* Draw store picker module list */
@@ -7922,11 +7922,11 @@ function drawChainSettings() {
         if (setting.type !== "action") {
             const value = getChainSettingValue(selectedSlot, setting);
             if (value) {
-                const valueX = SCREEN_WIDTH - value.length * 5 - 4;
+                const valueX = SCREEN_WIDTH - value.length * 6 - 10;
                 if (isSelected && editingChainSettingValue) {
-                    print(valueX - 8, y, "<", 0);
+                    print(valueX - 7, y, "<", 0);
                     print(valueX, y, value, 0);
-                    print(valueX + value.length * 5 + 2, y, ">", 0);
+                    print(valueX + value.length * 6 + 1, y, ">", 0);
                 } else {
                     print(valueX, y, value, labelColor);
                 }
