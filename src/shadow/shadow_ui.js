@@ -1778,7 +1778,7 @@ function drawOvertakeMenu() {
         });
     }
 
-    drawFooter("Jog: Select  Back: Exit");
+    drawFooter("Jog:select Bck:exit");
 }
 
 /* Handle input in overtake menu */
@@ -5311,7 +5311,7 @@ function drawHierarchyEditor() {
         }
 
         /* Footer hints - always push to edit (for swap/params) */
-        drawFooter("Jog: browse  Push: edit");
+        drawFooter("Jog:browse Clk:edit");
     } else {
         /* Draw param list */
         if (hierEditorParams.length === 0) {
@@ -5387,7 +5387,7 @@ function drawHierarchyEditor() {
         }
 
         /* Footer hints */
-        const hint = hierEditorEditMode ? "Jog: adjust  Push: done" : "Jog: scroll  Push: edit";
+        const hint = hierEditorEditMode ? "Jog:adjust Clk:done" : "Jog:scroll Clk:edit";
         drawFooter(hint);
     }
 }
@@ -7241,9 +7241,9 @@ function drawSlotSettings() {
     }
 
     if (editingSettingValue) {
-        drawFooter("Jog: adjust  Click: done");
+        drawFooter("Jog:adjust Clk:done");
     } else {
-        drawFooter("Click: edit  Back: slots");
+        drawFooter("Clk:edit Bck:slots");
     }
 }
 
@@ -7266,7 +7266,7 @@ function drawPatches() {
                 return isCurrent ? `* ${item.name}` : item.name;
             }
         });
-        drawFooter("Click: load  Back: settings");
+        drawFooter("Clk:load Bck:settings");
     }
 }
 
@@ -7309,7 +7309,7 @@ function drawPatchDetail() {
         }
     }
 
-    drawFooter("Click: edit  Back: list");
+    drawFooter("Clk:edit Bck:list");
 }
 
 function drawComponentParams() {
@@ -7361,9 +7361,9 @@ function drawComponentParams() {
     }
 
     if (editingValue) {
-        drawFooter("Jog: adjust  Click: done");
+        drawFooter("Jog:adjust Clk:done");
     } else {
-        drawFooter("Click: edit  Back: detail");
+        drawFooter("Clk:edit Bck:detail");
     }
 }
 
@@ -7510,7 +7510,7 @@ function drawStorePickerCategories() {
         getValue: (item) => item.value || ''
     });
 
-    drawFooter('Back: return  Jog: browse');
+    drawFooter('Bck:return Jog:browse');
 }
 
 /* Draw store picker module list */
@@ -7557,7 +7557,7 @@ function drawStorePickerList() {
         getValue: (item) => item.statusIcon
     });
 
-    drawFooter('Back: return  Jog: browse');
+    drawFooter('Bck:return Jog:browse');
 }
 
 /* Draw store picker loading screen */
@@ -7982,7 +7982,7 @@ function drawKnobEditor() {
         }
     }
 
-    drawFooter("Click: edit  Back: cancel");
+    drawFooter("Clk:edit Bck:cancel");
 }
 
 /* Draw param picker - select target then param for knob assignment */
@@ -8003,7 +8003,7 @@ function drawKnobParamPicker() {
             getValue: () => ""
         });
 
-        drawFooter("Click: select  Back: cancel");
+        drawFooter("Clk:select Bck:cancel");
     } else if (knobParamPickerHierarchy && knobParamPickerLevel) {
         /* Hierarchy mode - show current level */
         const levelDef = knobParamPickerHierarchy.levels[knobParamPickerLevel];
@@ -8019,7 +8019,7 @@ function drawKnobParamPicker() {
         });
 
         const hasNav = knobParamPickerParams.some(p => p.type === "nav");
-        drawFooter(hasNav ? "Click: select  Back: up" : "Click: assign  Back: up");
+        drawFooter(hasNav ? "Clk:select Bck:up" : "Clk:assign Bck:up");
     } else {
         /* Flat mode - show params for selected target */
         drawHeader(`Knob ${knobNum} Param`);
@@ -8037,7 +8037,7 @@ function drawKnobParamPicker() {
             getValue: () => ""
         });
 
-        drawFooter("Click: assign  Back: targets");
+        drawFooter("Clk:assign Bck:targets");
     }
 }
 
@@ -8363,7 +8363,7 @@ function drawMasterFxModuleSelect() {
             return item.id === currentModule ? "*" : "";
         }
     });
-    drawFooter("Click: apply  Back: cancel");
+    drawFooter("Clk:apply Bck:cancel");
 }
 
 globalThis.init = function() {
