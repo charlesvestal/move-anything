@@ -12,6 +12,8 @@ RUN apt-get update && apt-get install -y \
     binutils-aarch64-linux-gnu \
     make \
     file \
+    python3 \
+    python3-pillow \
     libdbus-1-dev:arm64 \
     libsystemd-dev:arm64 \
     libespeak-ng1:arm64 \
