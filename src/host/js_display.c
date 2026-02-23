@@ -178,7 +178,7 @@ Font* js_display_load_font(const char *filename, int charSpacing) {
 
     for (int i = 0; i < numChars; i++) {
         int cp = codepoints[i];
-        if (cp < 0 || cp >= 128 + 128) continue; /* skip out-of-range codepoints */
+        if (cp < 0 || cp >= 128) continue; /* skip non-ASCII codepoints */
 
         int x0 = i * charW;
 
