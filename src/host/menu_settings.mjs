@@ -177,8 +177,8 @@ export function drawSettings() {
     }
 
     const footer = settingsState.editing
-        ? 'Clk:Save Bck:Cancel'
-        : 'Clk:Edit </>:Change';
+        ? 'Clk: Save  Bck: Cancel'
+        : 'Clk: Edit  </>: Change';
 
     drawStackMenu({
         stack: settingsStack,
