@@ -1778,7 +1778,7 @@ function drawOvertakeMenu() {
         });
     }
 
-    drawFooter("Jog:Select  Back:Exit");
+    drawFooter("Jog: Select  Back: Exit");
 }
 
 /* Handle input in overtake menu */
@@ -5311,7 +5311,7 @@ function drawHierarchyEditor() {
         }
 
         /* Footer hints - always push to edit (for swap/params) */
-        drawFooter("Jog:browse  Push:edit");
+        drawFooter("Jog: browse  Push: edit");
     } else {
         /* Draw param list */
         if (hierEditorParams.length === 0) {
@@ -5387,7 +5387,7 @@ function drawHierarchyEditor() {
         }
 
         /* Footer hints */
-        const hint = hierEditorEditMode ? "Jog:adjust  Push:done" : "Jog:scroll  Push:edit";
+        const hint = hierEditorEditMode ? "Jog: adjust  Push: done" : "Jog: scroll  Push: edit";
         drawFooter(hint);
     }
 }
@@ -7557,7 +7557,7 @@ function drawStorePickerList() {
         getValue: (item) => item.statusIcon
     });
 
-    drawFooter('Back:return  Jog:browse');
+    drawFooter('Back: return  Jog: browse');
 }
 
 /* Draw store picker loading screen */
