@@ -1778,7 +1778,7 @@ function drawOvertakeMenu() {
         });
     }
 
-    drawFooter("Jog:select Bck:exit");
+    drawFooter("Jog: Select  Bck: Exit");
 }
 
 /* Handle input in overtake menu */
@@ -5311,7 +5311,7 @@ function drawHierarchyEditor() {
         }
 
         /* Footer hints - always push to edit (for swap/params) */
-        drawFooter("Jog:browse Clk:edit");
+        drawFooter("Jog: Browse  Clk: Edit");
     } else {
         /* Draw param list */
         if (hierEditorParams.length === 0) {
@@ -5387,7 +5387,7 @@ function drawHierarchyEditor() {
         }
 
         /* Footer hints */
-        const hint = hierEditorEditMode ? "Jog:adjust Clk:done" : "Jog:scroll Clk:edit";
+        const hint = hierEditorEditMode ? "Jog: Adjust  Clk: Done" : "Jog: Scroll  Clk: Edit";
         drawFooter(hint);
     }
 }
@@ -7241,9 +7241,9 @@ function drawSlotSettings() {
     }
 
     if (editingSettingValue) {
-        drawFooter("Jog:adjust Clk:done");
+        drawFooter("Jog: Adjust  Clk: Done");
     } else {
-        drawFooter("Clk:edit Bck:slots");
+        drawFooter("Clk: Edit  Bck: Slots");
     }
 }
 
@@ -7266,7 +7266,7 @@ function drawPatches() {
                 return isCurrent ? `* ${item.name}` : item.name;
             }
         });
-        drawFooter("Clk:load Bck:settings");
+        drawFooter("Clk: Load  Bck: Settings");
     }
 }
 
@@ -7309,7 +7309,7 @@ function drawPatchDetail() {
         }
     }
 
-    drawFooter("Clk:edit Bck:list");
+    drawFooter("Clk: Edit  Bck: List");
 }
 
 function drawComponentParams() {
@@ -7361,9 +7361,9 @@ function drawComponentParams() {
     }
 
     if (editingValue) {
-        drawFooter("Jog:adjust Clk:done");
+        drawFooter("Jog: Adjust  Clk: Done");
     } else {
-        drawFooter("Clk:edit Bck:detail");
+        drawFooter("Clk: Edit  Bck: Detail");
     }
 }
 
@@ -7510,7 +7510,7 @@ function drawStorePickerCategories() {
         getValue: (item) => item.value || ''
     });
 
-    drawFooter('Bck:return Jog:browse');
+    drawFooter("Bck: Return  Jog: Browse");
 }
 
 /* Draw store picker module list */
@@ -7557,7 +7557,7 @@ function drawStorePickerList() {
         getValue: (item) => item.statusIcon
     });
 
-    drawFooter('Bck:return Jog:browse');
+    drawFooter("Bck: Return  Jog: Browse");
 }
 
 /* Draw store picker loading screen */
@@ -7829,9 +7829,7 @@ function drawComponentEdit() {
     }
 
     /* Show hint at bottom */
-    const hint = "Jog: preset  Back: done";
-    const hintX = Math.floor((SCREEN_WIDTH - hint.length * 5) / 2);
-    print(hintX, 56, hint, 1);
+    drawFooter("Jog: Preset  Back: Done");
 }
 
 /* Draw chain settings view */
@@ -7982,7 +7980,7 @@ function drawKnobEditor() {
         }
     }
 
-    drawFooter("Clk:edit Bck:cancel");
+    drawFooter("Clk: Edit  Bck: Cancel");
 }
 
 /* Draw param picker - select target then param for knob assignment */
@@ -8003,7 +8001,7 @@ function drawKnobParamPicker() {
             getValue: () => ""
         });
 
-        drawFooter("Clk:select Bck:cancel");
+        drawFooter("Clk: Select  Bck: Cancel");
     } else if (knobParamPickerHierarchy && knobParamPickerLevel) {
         /* Hierarchy mode - show current level */
         const levelDef = knobParamPickerHierarchy.levels[knobParamPickerLevel];
@@ -8019,7 +8017,7 @@ function drawKnobParamPicker() {
         });
 
         const hasNav = knobParamPickerParams.some(p => p.type === "nav");
-        drawFooter(hasNav ? "Clk:select Bck:up" : "Clk:assign Bck:up");
+        drawFooter(hasNav ? "Clk: Select  Bck: Up" : "Clk: Assign  Bck: Up");
     } else {
         /* Flat mode - show params for selected target */
         drawHeader(`Knob ${knobNum} Param`);
@@ -8037,7 +8035,7 @@ function drawKnobParamPicker() {
             getValue: () => ""
         });
 
-        drawFooter("Clk:assign Bck:targets");
+        drawFooter("Clk: Assign  Bck: Targets");
     }
 }
 
@@ -8363,7 +8361,7 @@ function drawMasterFxModuleSelect() {
             return item.id === currentModule ? "*" : "";
         }
     });
-    drawFooter("Clk:apply Bck:cancel");
+    drawFooter("Clk: Apply  Bck: Cancel");
 }
 
 globalThis.init = function() {

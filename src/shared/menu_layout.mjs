@@ -48,8 +48,18 @@ export function drawMenuHeader(title, titleRight = "") {
 }
 
 export function drawMenuFooter(text, y = FOOTER_TEXT_Y) {
-    if (text) {
-        fill_rect(0, FOOTER_RULE_Y, SCREEN_WIDTH, 1, 1);
+    if (!text) return;
+    fill_rect(0, FOOTER_RULE_Y, SCREEN_WIDTH, 1, 1);
+
+    /* Split on double-space: left part stays left-aligned, right part is right-aligned */
+    const sep = text.indexOf('  ');
+    if (sep >= 0 && typeof text_width === 'function') {
+        const left = text.substring(0, sep);
+        const right = text.substring(sep + 2);
+        print(2, y, left, 1);
+        const rightW = text_width(right);
+        print(SCREEN_WIDTH - rightW - 2, y, right, 1);
+    } else {
         print(2, y, text, 1);
     }
 }
