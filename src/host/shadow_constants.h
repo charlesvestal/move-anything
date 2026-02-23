@@ -115,8 +115,9 @@ typedef struct shadow_control_t {
     volatile uint8_t overlay_rect_y;      /* Overlay rect top edge (pixels, 0-63) */
     volatile uint8_t overlay_rect_w;      /* Overlay rect width (pixels) */
     volatile uint8_t overlay_rect_h;      /* Overlay rect height (pixels) */
-    volatile uint8_t usb_midi_bridge;     /* 0=off, 1=on (re-stamp cable 2 as cable 0) */
-    volatile uint8_t reserved[22];
+    volatile uint8_t usb_midi_bridge;            /* 0=off, 1=on (re-stamp cable 2 as cable 0) */
+    volatile uint8_t usb_midi_bridge_relativize; /* 0=off, 1=on: convert abs CC to relative */
+    volatile uint8_t reserved[21];
 } shadow_control_t;
 
 /*
