@@ -14,8 +14,8 @@ export const LIST_LINE_HEIGHT = 9;
 export const LIST_HIGHLIGHT_HEIGHT = LIST_LINE_HEIGHT;
 export const LIST_LABEL_X = 4;
 export const LIST_VALUE_X = 92;
-export const FOOTER_TEXT_Y = SCREEN_HEIGHT - 11;
-export const FOOTER_RULE_Y = FOOTER_TEXT_Y - 1;
+export const FOOTER_TEXT_Y = SCREEN_HEIGHT - 7;
+export const FOOTER_RULE_Y = FOOTER_TEXT_Y - 2;
 
 /* Parameter type constants */
 export const PARAM_TYPE = {
