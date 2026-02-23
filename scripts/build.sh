@@ -337,6 +337,14 @@ echo "Building display server..."
     -o build/display-server \
     -lrt
 
+# Build move-inject tool (MIDI injection via shared memory)
+echo "Building move-inject tool..."
+"${CROSS_PREFIX}gcc" -g -O2 \
+    src/tools/move-inject.c \
+    -o build/move-inject \
+    -Isrc \
+    -lrt
+
 # Copy shadow UI files
 cp ./src/shadow/shadow_ui.js ./build/shadow/
 
