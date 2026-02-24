@@ -107,7 +107,7 @@ if [ "$SCREEN_READER_ENABLED" = "1" ]; then
     SHIM_TTS_SRC="src/host/tts_engine_dispatch.c src/host/tts_engine_espeak.c src/host/tts_engine_flite.c"
     SHIM_DEFINES="-DENABLE_SCREEN_READER=1"
     SHIM_INCLUDES="-Isrc -I/usr/include -I/usr/include/dbus-1.0 -I/usr/lib/aarch64-linux-gnu/dbus-1.0/include -I/usr/include/flite"
-    SHIM_LIBS="-L/usr/lib/aarch64-linux-gnu -ldl -lrt -lpthread -ldbus-1 -lsystemd -lm -lespeak-ng -lflite -lflite_cmu_us_kal -lflite_usenglish -lflite_cmulex"
+    SHIM_LIBS="-L/usr/lib/aarch64-linux-gnu -ldl -lrt -lpthread -ldbus-1 -lsystemd -lm -lespeak-ng -lflite -lflite_cmu_us_kal -lflite_usenglish -lflite_cmulex -Wl,--version-script=src/shim_version.lds"
 else
     echo "Screen reader build: disabled"
     SHIM_TTS_SRC="src/host/tts_engine_stub.c"
