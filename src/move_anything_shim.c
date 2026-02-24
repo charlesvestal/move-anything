@@ -1898,6 +1898,38 @@ static void shadow_dbus_handle_text(const char *text)
     /* Track native Move sampler source from stock announcements. */
     native_sampler_update_from_dbus_text(text);
 
+    /* Detect ME Slot preset loading from screen reader text.
+     * Browsing: "ME Slot 1. Menu item. 2 of 5"
+     * Selected: "ME Slot 1" (no "Menu item")
+     * When selected, mark the current track as having an ME preset. */
+    if (auto_hook_enabled && strncmp(text, "ME Slot ", 8) == 0) {
+        int slot_num = 0;
+        if (sscanf(text, "ME Slot %d", &slot_num) == 1 && slot_num >= 1 && slot_num <= 4) {
+            if (strstr(text, "Menu item") || strstr(text, "menu item")) {
+                /* Browsing — don't act yet */
+                unified_log("auto_hook", LOG_LEVEL_DEBUG,
+                            "ME preset browsing: \"%s\" (track=%d)", text, shadow_selected_slot);
+            } else {
+                /* Selected/loaded — mark this track as ME */
+                int track = shadow_selected_slot;
+                if (track >= 0 && track < 4 && !auto_me_tracks[track]) {
+                    auto_me_tracks[track] = 1;
+                    auto_me_track_count = 0;
+                    for (int i = 0; i < 4; i++) {
+                        if (auto_me_tracks[i]) auto_me_track_count++;
+                    }
+                    auto_map_ready = 0;
+                    auto_map_count = 0;
+                    unified_log("auto_hook", LOG_LEVEL_INFO,
+                                "ME preset loaded via D-Bus: \"%s\" on track=%d, ME tracks=[%d,%d,%d,%d] count=%d",
+                                text, track,
+                                auto_me_tracks[0], auto_me_tracks[1],
+                                auto_me_tracks[2], auto_me_tracks[3], auto_me_track_count);
+                }
+            }
+        }
+    }
+
     /* Native overlay knobs: parse "ME S<slot> Knob<n> <value>" from screen reader */
     if (shadow_control &&
         shadow_control->overlay_knobs_mode == OVERLAY_KNOBS_NATIVE &&
@@ -5704,30 +5736,49 @@ static void auto_hook_consume(void) {
         learn_mode = (access("/data/UserData/move-anything/auto_learn", F_OK) == 0) ? 1 : 0;
     }
 
-    /* Periodic re-detection of ME tracks from Song.abl.
-     * Handles the case where ME Slot presets are loaded AFTER the set was opened,
-     * so the initial parse found [0,0,0,0] but Song.abl has since been updated. */
+    /* Watch Song.abl mtime for changes — re-parse ME tracks when file is updated.
+     * This catches preset loads that happen after the set was initially opened.
+     * Check every ~3s to balance responsiveness with overhead. */
     {
-        static int redetect_counter = 0;
-        if (auto_me_track_count == 0 && auto_discovered_count > 0 &&
-            sampler_current_set_name[0] && ++redetect_counter >= 3000) {  /* ~10s */
-            redetect_counter = 0;
-            int me_tracks[4];
-            int me_count = shadow_read_set_me_tracks(sampler_current_set_name, me_tracks);
-            if (me_count > 0) {
-                int found = 0;
-                for (int i = 0; i < 4; i++) {
-                    if (me_tracks[i]) found++;
-                }
-                if (found > 0) {
-                    memcpy(auto_me_tracks, me_tracks, sizeof(auto_me_tracks));
-                    auto_me_track_count = found;
-                    auto_map_ready = 0;
-                    auto_map_count = 0;
+        static int mtime_check_counter = 0;
+        static time_t last_song_mtime = 0;
+        static char last_song_uuid[64] = "";
+        if (sampler_current_set_uuid[0] && sampler_current_set_name[0] &&
+            ++mtime_check_counter >= 1000) {  /* ~3s */
+            mtime_check_counter = 0;
+            /* Reset baseline when set changes */
+            if (strcmp(last_song_uuid, sampler_current_set_uuid) != 0) {
+                snprintf(last_song_uuid, sizeof(last_song_uuid), "%s", sampler_current_set_uuid);
+                last_song_mtime = 0;
+            }
+            char song_path[512];
+            snprintf(song_path, sizeof(song_path), "%s/%s/%s/Song.abl",
+                     SAMPLER_SETS_DIR, sampler_current_set_uuid, sampler_current_set_name);
+            struct stat st;
+            if (stat(song_path, &st) == 0) {
+                if (last_song_mtime == 0) {
+                    /* First check after set change — record baseline, don't re-parse */
+                    last_song_mtime = st.st_mtime;
+                } else if (st.st_mtime != last_song_mtime) {
+                    last_song_mtime = st.st_mtime;
                     unified_log("auto_hook", LOG_LEVEL_INFO,
-                                "Re-detected ME tracks=[%d,%d,%d,%d] count=%d",
-                                auto_me_tracks[0], auto_me_tracks[1],
-                                auto_me_tracks[2], auto_me_tracks[3], found);
+                                "Song.abl mtime changed, re-parsing ME tracks");
+                    int me_tracks[4];
+                    int me_count = shadow_read_set_me_tracks(sampler_current_set_name, me_tracks);
+                    if (me_count > 0) {
+                        int found = 0;
+                        for (int i = 0; i < 4; i++) {
+                            if (me_tracks[i]) found++;
+                        }
+                        memcpy(auto_me_tracks, me_tracks, sizeof(auto_me_tracks));
+                        auto_me_track_count = found;
+                        auto_map_ready = 0;
+                        auto_map_count = 0;
+                        unified_log("auto_hook", LOG_LEVEL_INFO,
+                                    "Re-detected ME tracks=[%d,%d,%d,%d] count=%d",
+                                    auto_me_tracks[0], auto_me_tracks[1],
+                                    auto_me_tracks[2], auto_me_tracks[3], found);
+                    }
                 }
             }
         }
