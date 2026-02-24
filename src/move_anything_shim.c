@@ -5704,6 +5704,35 @@ static void auto_hook_consume(void) {
         learn_mode = (access("/data/UserData/move-anything/auto_learn", F_OK) == 0) ? 1 : 0;
     }
 
+    /* Periodic re-detection of ME tracks from Song.abl.
+     * Handles the case where ME Slot presets are loaded AFTER the set was opened,
+     * so the initial parse found [0,0,0,0] but Song.abl has since been updated. */
+    {
+        static int redetect_counter = 0;
+        if (auto_me_track_count == 0 && auto_discovered_count > 0 &&
+            sampler_current_set_name[0] && ++redetect_counter >= 3000) {  /* ~10s */
+            redetect_counter = 0;
+            int me_tracks[4];
+            int me_count = shadow_read_set_me_tracks(sampler_current_set_name, me_tracks);
+            if (me_count > 0) {
+                int found = 0;
+                for (int i = 0; i < 4; i++) {
+                    if (me_tracks[i]) found++;
+                }
+                if (found > 0) {
+                    memcpy(auto_me_tracks, me_tracks, sizeof(auto_me_tracks));
+                    auto_me_track_count = found;
+                    auto_map_ready = 0;
+                    auto_map_count = 0;
+                    unified_log("auto_hook", LOG_LEVEL_INFO,
+                                "Re-detected ME tracks=[%d,%d,%d,%d] count=%d",
+                                auto_me_tracks[0], auto_me_tracks[1],
+                                auto_me_tracks[2], auto_me_tracks[3], found);
+                }
+            }
+        }
+    }
+
     /* Check mapping build BEFORE draining events — must run even when ring is empty,
      * since boot flood may finish before the build_delay timer reaches threshold. */
     {
