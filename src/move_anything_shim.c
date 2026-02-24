@@ -155,7 +155,7 @@ static int auto_me_tracks[4] = {0, 0, 0, 0};
 static int auto_me_track_count = 0;
 
 /* Automation mapping table: param_ptr -> (slot, knob) */
-#define AUTO_MAP_MAX 32  /* 4 tracks * 8 knobs = 32 max */
+#define AUTO_MAP_MAX 128  /* multiple param sets per track (boot + automation) */
 
 typedef struct {
     uint64_t param_ptr;
@@ -5502,8 +5502,8 @@ static int auto_hook_install(void) {
 }
 
 /* Discovery mode: track unique (queue_ptr, param_ptr) pairs and log new ones.
- * Supports up to 256 unique pointers (4 tracks * 8 macros + extras). */
-#define AUTO_DISCOVER_MAX 256
+ * Needs to hold both boot flood params AND automation params (different objects). */
+#define AUTO_DISCOVER_MAX 2048
 
 typedef struct {
     uint64_t queue_ptr;
@@ -5530,7 +5530,7 @@ static void auto_build_mapping(void) {
     if (auto_me_track_count == 0 || auto_discovered_count == 0) return;
 
     /* Step 1: Find unique queue_ptrs and group entries */
-    #define MAX_QUEUES 16
+    #define MAX_QUEUES 48
     struct {
         uint64_t queue_ptr;
         int entry_indices[16];  /* indices into auto_discovered[] */
@@ -5539,6 +5539,13 @@ static void auto_build_mapping(void) {
     int group_count = 0;
 
     for (int i = 0; i < auto_discovered_count; i++) {
+        /* Pre-filter: only group entries with ME macro low-byte pattern.
+         * This prevents non-macro queues from consuming group slots. */
+        uint8_t low = auto_discovered[i].param_ptr & 0xFF;
+        int is_macro = ((low & 0x07) == 0x07 && low >= 0x07 && low <= 0x3f);
+        int is_enable = (low == 0x02);
+        if (!is_macro && !is_enable) continue;
+
         uint64_t qp = auto_discovered[i].queue_ptr;
         int gidx = -1;
         for (int g = 0; g < group_count; g++) {
@@ -5556,20 +5563,27 @@ static void auto_build_mapping(void) {
     }
 
     unified_log("auto_hook", LOG_LEVEL_INFO,
-                "Mapping: %d discovered params in %d queue groups",
-                auto_discovered_count, group_count);
+                "Mapping: %d discovered params in %d queue groups (max %d)",
+                auto_discovered_count, group_count, MAX_QUEUES);
+    if (group_count >= MAX_QUEUES) {
+        unified_log("auto_hook", LOG_LEVEL_INFO,
+                    "WARNING: Queue group limit reached, some queues dropped");
+    }
 
     /* Step 2: Identify ME macro groups.
      * ME macro knobs have param_ptr low bytes: 0x07, 0x0f, 0x17, 0x1f, 0x27, 0x2f, 0x37, 0x3f
      * Pattern: (low_byte & 0x07) == 0x07 and low_byte range 0x07..0x3f (stride 8)
-     * Each ME group also has a "02" param (enable/volume) which we skip. */
+     * Each ME group also has a "02" param (enable/volume) which we skip.
+     * Boot flood AND automation create separate groups for the same track,
+     * so we need to map ALL groups (not just one per track). */
+    #define MAX_ME_GROUPS 16
     struct {
         int group_idx;       /* index into groups[] */
         uint64_t base_ptr;   /* lowest param_ptr & ~0xFF */
-    } me_groups[4];
+    } me_groups[MAX_ME_GROUPS];
     int me_group_count = 0;
 
-    for (int g = 0; g < group_count && me_group_count < 4; g++) {
+    for (int g = 0; g < group_count && me_group_count < MAX_ME_GROUPS; g++) {
         int macro_count = 0;
         for (int j = 0; j < groups[g].count; j++) {
             uint8_t low = auto_discovered[groups[g].entry_indices[j]].param_ptr & 0xFF;
@@ -5614,35 +5628,45 @@ static void auto_build_mapping(void) {
         }
     }
 
-    /* Step 4: Map Nth ME group -> Nth ME track position from Song.abl */
-    int me_idx = 0;  /* index into me_groups[] */
-    for (int track = 0; track < 4 && me_idx < me_group_count; track++) {
-        if (!auto_me_tracks[track]) continue;
+    /* Step 4: Map ME groups -> ME track positions from Song.abl.
+     * Boot flood and automation create separate groups for the same logical track.
+     * We map ALL groups by cycling through ME tracks. E.g. with 3 ME tracks and
+     * 6 ME groups: groups 0-2 -> tracks, groups 3-5 -> same tracks again.
+     * This ensures both boot flood ptrs AND automation ptrs are in the map. */
+    /* Build ordered list of ME track indices */
+    int me_track_list[4];
+    int me_track_list_count = 0;
+    for (int t = 0; t < 4; t++) {
+        if (auto_me_tracks[t]) me_track_list[me_track_list_count++] = t;
+    }
 
-        int g = me_groups[me_idx].group_idx;
-        me_idx++;
+    if (me_track_list_count > 0) {
+        for (int mi = 0; mi < me_group_count; mi++) {
+            int track = me_track_list[mi % me_track_list_count];
+            int g = me_groups[mi].group_idx;
 
-        /* For each macro param in this group, create a mapping entry */
-        for (int j = 0; j < groups[g].count && auto_map_count < AUTO_MAP_MAX; j++) {
-            int di = groups[g].entry_indices[j];
-            uint64_t pp = auto_discovered[di].param_ptr;
-            uint8_t low = pp & 0xFF;
+            /* For each macro param in this group, create a mapping entry */
+            for (int j = 0; j < groups[g].count && auto_map_count < AUTO_MAP_MAX; j++) {
+                int di = groups[g].entry_indices[j];
+                uint64_t pp = auto_discovered[di].param_ptr;
+                uint8_t low = pp & 0xFF;
 
-            /* Skip non-macro params (e.g. the 0x02 enable param) */
-            if ((low & 0x07) != 0x07 || low < 0x07 || low > 0x3f) continue;
+                /* Skip non-macro params (e.g. the 0x02 enable param) */
+                if ((low & 0x07) != 0x07 || low < 0x07 || low > 0x3f) continue;
 
-            /* knob number: (low_byte >> 3) + 1 -> maps 0x07->1, 0x0f->2, ..., 0x3f->8 */
-            int knob = (low >> 3) + 1;
-            if (knob < 1 || knob > 8) continue;
+                /* knob number: (low_byte >> 3) + 1 -> maps 0x07->1, 0x0f->2, ..., 0x3f->8 */
+                int knob = (low >> 3) + 1;
+                if (knob < 1 || knob > 8) continue;
 
-            auto_map[auto_map_count].param_ptr = pp;
-            auto_map[auto_map_count].slot = (uint8_t)track;
-            auto_map[auto_map_count].knob = (uint8_t)knob;
-            auto_map_count++;
+                auto_map[auto_map_count].param_ptr = pp;
+                auto_map[auto_map_count].slot = (uint8_t)track;
+                auto_map[auto_map_count].knob = (uint8_t)knob;
+                auto_map_count++;
 
-            unified_log("auto_hook", LOG_LEVEL_DEBUG,
-                        "Map: ptr=0x%lx -> slot=%d knob=%d",
-                        (unsigned long)pp, track, knob);
+                unified_log("auto_hook", LOG_LEVEL_DEBUG,
+                            "Map: ptr=0x%lx -> slot=%d knob=%d",
+                            (unsigned long)pp, track, knob);
+            }
         }
     }
 
@@ -5656,6 +5680,7 @@ static void auto_build_mapping(void) {
                     "Mapping empty: %d ME groups but no matching ME tracks", me_group_count);
     }
     #undef MAX_QUEUES
+    #undef MAX_ME_GROUPS
 }
 
 /* Drain automation ring buffer. Called every ioctl tick (~2.9ms). */
@@ -5679,6 +5704,32 @@ static void auto_hook_consume(void) {
         learn_mode = (access("/data/UserData/move-anything/auto_learn", F_OK) == 0) ? 1 : 0;
     }
 
+    /* Check mapping build BEFORE draining events — must run even when ring is empty,
+     * since boot flood may finish before the build_delay timer reaches threshold. */
+    {
+        static int build_delay = 0;
+        static int last_build_discovered = 0;
+        static int build_count = 0;
+        int need_build = 0;
+
+        if (auto_me_track_count > 0 && auto_discovered_count > 0) {
+            if (!auto_map_ready) {
+                need_build = 1;  /* initial build */
+            } else if (build_count < 5 && auto_discovered_count > last_build_discovered) {
+                need_build = 1;  /* rebuild — new params discovered */
+            }
+        }
+
+        if (need_build) {
+            if (++build_delay >= 500) {  /* ~1.5s delay — wait for params to settle */
+                last_build_discovered = auto_discovered_count;
+                auto_build_mapping();
+                build_count++;
+                build_delay = 0;
+            }
+        }
+    }
+
     uint32_t t = __atomic_load_n(&auto_ring_tail, __ATOMIC_RELAXED);
     uint32_t h = __atomic_load_n(&auto_ring_head, __ATOMIC_ACQUIRE);
     if (t == h) return;
@@ -5693,6 +5744,13 @@ static void auto_hook_consume(void) {
             unified_log("auto_hook", LOG_LEVEL_INFO,
                         "NEW PARAM #%d: q=0x%lx ptr=0x%lx val=%.4f",
                         idx, (unsigned long)e->queue_ptr, (unsigned long)e->param_ptr, e->value);
+        } else if (idx < 0) {
+            static int full_logged = 0;
+            if (!full_logged) {
+                unified_log("auto_hook", LOG_LEVEL_INFO,
+                            "Discovery table FULL at %d entries", AUTO_DISCOVER_MAX);
+                full_logged = 1;
+            }
         }
         if (learn_mode) {
             unified_log("auto_hook", LOG_LEVEL_DEBUG,
@@ -5702,10 +5760,24 @@ static void auto_hook_consume(void) {
 
         /* Route event to shadow slot if mapping is ready */
         if (auto_map_ready) {
+            int matched = 0;
             for (int m = 0; m < auto_map_count; m++) {
                 if (auto_map[m].param_ptr == e->param_ptr) {
                     int slot = auto_map[m].slot;
                     int knob = auto_map[m].knob;
+                    /* Diagnostic: log why slot can't be routed (rate-limited) */
+                    if (!shadow_plugin_v2 || !shadow_chain_slots[slot].active ||
+                        !shadow_chain_slots[slot].instance) {
+                        static int slot_diag_count = 0;
+                        if (slot_diag_count < 3) {
+                            slot_diag_count++;
+                            unified_log("auto_hook", LOG_LEVEL_INFO,
+                                        "MATCH but no slot: slot=%d v2=%d active=%d inst=%p",
+                                        slot, shadow_plugin_v2 ? 1 : 0,
+                                        shadow_chain_slots[slot].active,
+                                        shadow_chain_slots[slot].instance);
+                        }
+                    }
                     if (shadow_plugin_v2 && shadow_chain_slots[slot].active &&
                         shadow_chain_slots[slot].instance) {
                         char key[24], val[16];
@@ -5713,8 +5785,30 @@ static void auto_hook_consume(void) {
                         snprintf(val, sizeof(val), "%.4f", e->value);
                         shadow_plugin_v2->set_param(
                             shadow_chain_slots[slot].instance, key, val);
+                        /* Rate-limited routing log: first 5 matches per slot */
+                        static int route_log_count[4] = {0,0,0,0};
+                        if (route_log_count[slot] < 5) {
+                            route_log_count[slot]++;
+                            unified_log("auto_hook", LOG_LEVEL_INFO,
+                                        "ROUTE: ptr=0x%lx -> slot=%d knob=%d val=%.4f",
+                                        (unsigned long)e->param_ptr, slot, knob, e->value);
+                        }
                     }
+                    matched = 1;
                     break;
+                }
+            }
+            /* Log unmatched stride-8 params (rate-limited) */
+            if (!matched) {
+                uint8_t low = e->param_ptr & 0xFF;
+                if ((low & 0x07) == 0x07 && low >= 0x07 && low <= 0x3f) {
+                    static int miss_count = 0;
+                    if (miss_count < 10) {
+                        miss_count++;
+                        unified_log("auto_hook", LOG_LEVEL_DEBUG,
+                                    "MISS: stride-8 ptr=0x%lx low=0x%02x not in map",
+                                    (unsigned long)e->param_ptr, low);
+                    }
                 }
             }
         }
@@ -5724,14 +5818,7 @@ static void auto_hook_consume(void) {
 
     __atomic_store_n(&auto_ring_tail, t, __ATOMIC_RELEASE);
 
-    /* Try to build mapping once we have discovery data and ME track info */
-    if (!auto_map_ready && auto_me_track_count > 0 && auto_discovered_count > 0) {
-        static int build_delay = 0;
-        if (++build_delay >= 500) {  /* ~1.5s after first event — wait for boot flood */
-            auto_build_mapping();
-            build_delay = 0;
-        }
-    }
+    /* Build trigger moved to top of function (before ring buffer drain) */
 }
 
 /* Load feature configuration from config/features.json */
@@ -10621,6 +10708,23 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
                          boot_muted[0], boot_muted[1], boot_muted[2], boot_muted[3],
                          boot_soloed[0], boot_soloed[1], boot_soloed[2], boot_soloed[3]);
                 shadow_log(m);
+            }
+        }
+
+        /* Sync ME track detection from Song.abl at boot for automation routing */
+        if (auto_hook_enabled && sampler_current_set_name[0]) {
+            int me_tracks[4];
+            int me_count = shadow_read_set_me_tracks(sampler_current_set_name, me_tracks);
+            if (me_count > 0) {
+                memcpy(auto_me_tracks, me_tracks, sizeof(auto_me_tracks));
+                auto_me_track_count = 0;
+                for (int i = 0; i < 4; i++) {
+                    if (auto_me_tracks[i]) auto_me_track_count++;
+                }
+                unified_log("auto_hook", LOG_LEVEL_INFO,
+                            "Boot ME tracks: [%d,%d,%d,%d] count=%d",
+                            auto_me_tracks[0], auto_me_tracks[1],
+                            auto_me_tracks[2], auto_me_tracks[3], auto_me_track_count);
             }
         }
 

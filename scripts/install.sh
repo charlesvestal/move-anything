@@ -883,13 +883,15 @@ fi
 
 existing_link_audio=$(get_existing_feature "link_audio_enabled" "$link_audio_val")
 existing_display_mirror=$(get_existing_feature "display_mirror_enabled" "false")
+existing_auto_hook=$(get_existing_feature "automation_hook_enabled" "true")
 
 # Build features.json content
 features_json="{
   \"shadow_ui_enabled\": $shadow_ui_val,
   \"standalone_enabled\": $standalone_val,
   \"link_audio_enabled\": $existing_link_audio,
-  \"display_mirror_enabled\": $existing_display_mirror
+  \"display_mirror_enabled\": $existing_display_mirror,
+  \"automation_hook_enabled\": $existing_auto_hook
 }"
 
 # Write features.json
