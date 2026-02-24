@@ -126,6 +126,49 @@ static volatile float shadow_master_volume;  /* Defined later */
 static bool shadow_ui_enabled = true;      /* Shadow UI enabled by default */
 static bool standalone_enabled = true;     /* Standalone mode enabled by default */
 static bool display_mirror_enabled = false; /* Display mirror off by default */
+static int  auto_hook_enabled = 0;         /* Automation hook off by default */
+
+/* --- Automation hook: intercept Move's automation parameter changes --- */
+#define AUTO_RING_SIZE  256  /* power of 2 */
+#define AUTO_RING_MASK  (AUTO_RING_SIZE - 1)
+
+/* ELF virtual address of event_queue_push (ParameterControllerNode pipeline) */
+#define AUTO_HOOK_VADDR     0x11974b8
+/* Expected first instruction: stp x29, x30, [sp, #-0x30]! */
+#define AUTO_HOOK_EXPECTED  0xA9BD7BFD
+
+typedef struct {
+    uint64_t queue_ptr;   /* event queue pointer (x0) — identifies track's queue */
+    uint64_t param_ptr;   /* parameter identity pointer ([x2+0]) */
+    float    value;        /* interpolated float value ([x2+8]) */
+} auto_event_t;
+
+static auto_event_t auto_ring[AUTO_RING_SIZE];
+static volatile uint32_t auto_ring_head = 0;  /* written by hook (producer) */
+static volatile uint32_t auto_ring_tail = 0;  /* written by ioctl (consumer) */
+
+static uint8_t *auto_trampoline = NULL;   /* mmap'd RWX page for trampoline */
+static int      auto_hook_active = 0;
+
+/* ME track detection state — which Move tracks have ME Slot presets */
+static int auto_me_tracks[4] = {0, 0, 0, 0};
+static int auto_me_track_count = 0;
+
+/* Automation mapping table: param_ptr -> (slot, knob) */
+#define AUTO_MAP_MAX 32  /* 4 tracks * 8 knobs = 32 max */
+
+typedef struct {
+    uint64_t param_ptr;
+    uint8_t  slot;   /* shadow chain slot index 0-3 */
+    uint8_t  knob;   /* knob number 1-8 */
+} auto_map_entry_t;
+
+static auto_map_entry_t auto_map[AUTO_MAP_MAX];
+static int auto_map_count = 0;
+static int auto_map_ready = 0;  /* 1 = routing active */
+
+/* Forward declaration for Song.abl ME track parser (defined after mute parser) */
+static int shadow_read_set_me_tracks(const char *set_name, int me_out[4]);
 
 /* Link Audio interception and publishing state */
 static link_audio_state_t link_audio;
@@ -138,6 +181,9 @@ static void launch_link_subscriber(void);
 static void start_link_sub_monitor(void);
 static void link_sub_reset_state(void);
 static void load_feature_config(void);
+
+/* Forward declaration — defined later with other interposition function pointers */
+extern void *(*real_mmap)(void *, size_t, int, int, int, off_t);
 
 static uint32_t shadow_checksum(const uint8_t *buf, size_t len)
 {
@@ -3600,6 +3646,32 @@ static void shadow_handle_set_loaded(const char *set_name, const char *uuid) {
                  soloed[0], soloed[1], soloed[2], soloed[3]);
         shadow_log(m);
     }
+
+    /* Read ME Slot track positions from Song.abl for automation routing */
+    if (auto_hook_enabled) {
+        int me_tracks[4];
+        int me_count = shadow_read_set_me_tracks(set_name, me_tracks);
+        if (me_count > 0) {
+            memcpy(auto_me_tracks, me_tracks, sizeof(auto_me_tracks));
+            auto_me_track_count = 0;
+            for (int i = 0; i < 4; i++) {
+                if (auto_me_tracks[i]) auto_me_track_count++;
+            }
+            /* Reset mapping for fresh build from discovery data */
+            auto_map_ready = 0;
+            auto_map_count = 0;
+            unified_log("auto_hook", LOG_LEVEL_INFO,
+                        "Set loaded: ME tracks=[%d,%d,%d,%d] count=%d, reset mapping",
+                        auto_me_tracks[0], auto_me_tracks[1],
+                        auto_me_tracks[2], auto_me_tracks[3], auto_me_track_count);
+        } else {
+            /* No ME tracks — disable routing */
+            memset(auto_me_tracks, 0, sizeof(auto_me_tracks));
+            auto_me_track_count = 0;
+            auto_map_ready = 0;
+            auto_map_count = 0;
+        }
+    }
 }
 
 /* Poll Settings.json for currentSongIndex changes, then match via xattr.
@@ -4287,6 +4359,133 @@ static int shadow_read_set_mute_states(const char *set_name, int muted_out[4], i
         shadow_log(msg);
     }
     return mute_count;
+}
+
+/* Read which tracks have "ME Slot" presets from Song.abl.
+ * Follows the same set directory scanning and brace-depth parsing
+ * as shadow_read_set_mute_states().
+ * me_out[0..3]: 1 = ME Slot preset on this track, 0 = not.
+ * Returns number of tracks parsed (0 on failure). */
+static int shadow_read_set_me_tracks(const char *set_name, int me_out[4]) {
+    memset(me_out, 0, 4 * sizeof(int));
+    if (!set_name || !set_name[0]) return 0;
+
+    DIR *sets_dir = opendir(SAMPLER_SETS_DIR);
+    if (!sets_dir) return 0;
+
+    char best_path[512] = "";
+    time_t best_mtime = 0;
+    struct dirent *entry;
+
+    while ((entry = readdir(sets_dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s/%s/Song.abl",
+                 SAMPLER_SETS_DIR, entry->d_name, set_name);
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
+            if (st.st_mtime > best_mtime) {
+                best_mtime = st.st_mtime;
+                snprintf(best_path, sizeof(best_path), "%s", path);
+            }
+        }
+    }
+    closedir(sets_dir);
+
+    if (best_path[0] == '\0') return 0;
+
+    FILE *f = fopen(best_path, "r");
+    if (!f) return 0;
+
+    /* Parse character-by-character tracking brace depth.
+     * Song.abl structure (Move tracks):
+     *   depth 1: root object
+     *   depth 2: track objects (inside "tracks" array)
+     *   depth 3: track-level properties
+     *   depth 4+: devices and their properties
+     *
+     * We look for "name" keys containing "ME Slot" within tracks.
+     * The first "name" with "ME Slot" per track marks that track.
+     * We track which track we're in by counting depth-2 entries. */
+    int track_count = 0;
+    int brace_depth = 0;
+    int in_tracks = 0;
+    int track_has_me = 0;      /* seen ME Slot name in current track */
+    int prev_track_depth2 = 0; /* count of depth-2 opens seen */
+    char line[8192];
+
+    while (fgets(line, sizeof(line), f) && track_count < 4) {
+        for (char *p = line; *p; p++) {
+            if (*p == '{') {
+                brace_depth++;
+                /* Entering a new track object at depth 2 */
+                if (in_tracks && brace_depth == 2) {
+                    /* If we were in a previous track, record its result */
+                    if (prev_track_depth2 > 0 && track_count < 4) {
+                        me_out[track_count] = track_has_me;
+                        track_count++;
+                    }
+                    track_has_me = 0;
+                    prev_track_depth2++;
+                }
+            } else if (*p == '}') {
+                brace_depth--;
+                /* Leaving tracks array (back to depth 0 after root closes,
+                 * or if in_tracks and depth drops below 1) */
+            } else if (*p == '"') {
+                /* Detect "tracks" key at depth 1 */
+                if (!in_tracks && brace_depth == 1 && strncmp(p, "\"tracks\"", 8) == 0) {
+                    in_tracks = 1;
+                    p += 7;
+                    continue;
+                }
+                /* Look for "name" keys at depth 3-6 within tracks.
+                 * Device names can appear at various depths depending on
+                 * the Song.abl structure. We check broadly and filter by value. */
+                if (in_tracks && brace_depth >= 3 && brace_depth <= 6 &&
+                    strncmp(p, "\"name\"", 6) == 0 && !track_has_me) {
+                    /* Extract the value after the colon */
+                    char *colon = strchr(p + 6, ':');
+                    if (colon) {
+                        /* Find the opening quote of the value */
+                        char *vstart = strchr(colon + 1, '"');
+                        if (vstart) {
+                            vstart++; /* skip opening quote */
+                            char *vend = strchr(vstart, '"');
+                            if (vend && (vend - vstart) < 64) {
+                                /* Check if value contains "ME Slot" */
+                                char namebuf[64];
+                                int len = vend - vstart;
+                                memcpy(namebuf, vstart, len);
+                                namebuf[len] = '\0';
+                                if (strstr(namebuf, "ME Slot")) {
+                                    track_has_me = 1;
+                                    unified_log("auto_hook", LOG_LEVEL_INFO,
+                                                "ME track detected: track=%d name=\"%s\" depth=%d",
+                                                track_count, namebuf, brace_depth);
+                                }
+                            }
+                        }
+                    }
+                    p += 5; /* skip past "name" */
+                    continue;
+                }
+            }
+        }
+    }
+    /* Record last track if we were inside one */
+    if (prev_track_depth2 > 0 && track_count < 4) {
+        me_out[track_count] = track_has_me;
+        track_count++;
+    }
+    fclose(f);
+
+    if (track_count > 0) {
+        unified_log("auto_hook", LOG_LEVEL_INFO,
+                    "ME tracks from %s: [%d,%d,%d,%d] (%d tracks parsed)",
+                    set_name, me_out[0], me_out[1], me_out[2], me_out[3], track_count);
+    }
+    return track_count;
 }
 
 /* Read tempo_bpm from Move Anything settings file */
@@ -5030,6 +5229,511 @@ static void shadow_overlay_sync(void) {
     shadow_overlay_shm->sequence++;
 }
 
+/* ============================================================================
+ * AUTOMATION HOOK: ARM64 inline hook to intercept automation parameter changes
+ * ============================================================================
+ * Hooks event_queue_push in MoveOriginal to observe automation values in real
+ * time. Uses a lock-free SPSC ring buffer: the audio worker thread produces
+ * events via the trampoline; the ioctl thread consumes them for logging.
+ * ============================================================================ */
+
+/* Called from trampoline with: x0=queue_ptr, x1=param_data.
+   Must be fast — runs on Audio Worker thread. */
+__attribute__((used))
+static void auto_hook_handler(uint64_t queue_ptr, const uint8_t *param_data) {
+    uint32_t h = __atomic_load_n(&auto_ring_head, __ATOMIC_RELAXED);
+    uint32_t next = (h + 1) & AUTO_RING_MASK;
+    uint32_t t = __atomic_load_n(&auto_ring_tail, __ATOMIC_ACQUIRE);
+    if (next == t) return;  /* full — drop event */
+    auto_ring[h].queue_ptr = queue_ptr;
+    memcpy(&auto_ring[h].param_ptr, param_data, 8);      /* [x2+0]: param identity */
+    memcpy(&auto_ring[h].value, param_data + 8, 4);      /* [x2+8]: float value */
+    __atomic_store_n(&auto_ring_head, next, __ATOMIC_RELEASE);
+}
+
+/* Find the load address of MoveOriginal from /proc/self/maps.
+   Returns 0 on failure. */
+static uint64_t auto_find_move_base(void) {
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) return 0;
+    char line[512];
+    uint64_t base = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, "MoveOriginal")) {
+            /* Log all MoveOriginal mappings for diagnostics */
+            char trimmed[512];
+            strncpy(trimmed, line, sizeof(trimmed) - 1);
+            trimmed[sizeof(trimmed) - 1] = '\0';
+            char *nl = strchr(trimmed, '\n');
+            if (nl) *nl = '\0';
+            unified_log("auto_hook", LOG_LEVEL_DEBUG, "maps: %s", trimmed);
+
+            /* The first mapping (lowest address) with file_offset=0 is the
+             * true load base for PIE executables. For MoveOriginal:
+             *   base+0       = r--p (read-only data, ELF headers)
+             *   base+0x614000 = r-xp (executable code)
+             * ELF vaddrs are relative to this base. */
+            if (base == 0) {
+                /* Parse file offset from: "addr1-addr2 perms OFFSET ..." */
+                char *space1 = strchr(line, ' ');     /* after addr range */
+                char *space2 = space1 ? strchr(space1 + 1, ' ') : NULL;  /* after perms */
+                uint64_t foff = space2 ? strtoull(space2 + 1, NULL, 16) : (uint64_t)-1;
+                if (foff == 0) {
+                    base = strtoull(line, NULL, 16);
+                    unified_log("auto_hook", LOG_LEVEL_INFO,
+                                "PIE base (offset=0 mapping): 0x%lx", (unsigned long)base);
+                }
+            }
+        }
+    }
+    fclose(f);
+    return base;
+}
+
+/* Install the inline hook at event_queue_push.
+   Returns 0 on success, -1 on failure (non-fatal). */
+static int auto_hook_install(void) {
+    if (auto_hook_active) return 0;
+
+    /* 1. Find MoveOriginal base address */
+    uint64_t base = auto_find_move_base();
+    if (!base) {
+        unified_log("auto_hook", LOG_LEVEL_WARN, "Could not find MoveOriginal base in /proc/self/maps");
+        return -1;
+    }
+    unified_log("auto_hook", LOG_LEVEL_INFO, "MoveOriginal base: 0x%lx", (unsigned long)base);
+
+    /* 2. Compute runtime address of target function */
+    uint8_t *target = (uint8_t *)(base + AUTO_HOOK_VADDR);
+    unified_log("auto_hook", LOG_LEVEL_INFO, "Target function at: %p", target);
+
+    /* 3. Verify expected first instruction at target (firmware resilience) */
+    uint32_t prologue[4];
+    memcpy(prologue, target, 16);
+    unified_log("auto_hook", LOG_LEVEL_INFO,
+                "Prologue: [0]=%08X [1]=%08X [2]=%08X [3]=%08X",
+                prologue[0], prologue[1], prologue[2], prologue[3]);
+    if (prologue[0] != AUTO_HOOK_EXPECTED) {
+        unified_log("auto_hook", LOG_LEVEL_WARN,
+                    "Instruction mismatch: expected 0x%08X, got 0x%08X — skipping hook",
+                    AUTO_HOOK_EXPECTED, prologue[0]);
+        return -1;
+    }
+
+    /* 4. Allocate RWX page for trampoline NEAR the target.
+     * Must use real_mmap — the shim's mmap() intercepts length==4096.
+     * The B instruction has ±128MB range, so we try hint addresses nearby.
+     * MAP_FIXED is too risky; we use hints and verify the result. */
+    auto_trampoline = MAP_FAILED;
+    {
+        /* Try pages below the target first (within ~64MB), then above */
+        uintptr_t hint_offsets[] = {
+            0x1000000,   /* 16MB below */
+            0x2000000,   /* 32MB below */
+            0x4000000,   /* 64MB below */
+            0x100000,    /* 1MB below */
+            0x200000,    /* 2MB below */
+        };
+        for (int attempt = 0; attempt < 10 && auto_trampoline == MAP_FAILED; attempt++) {
+            uintptr_t hint;
+            if (attempt < 5) {
+                /* Try below target */
+                hint = ((uintptr_t)target - hint_offsets[attempt]) & ~(uintptr_t)0xFFF;
+            } else {
+                /* Try above target */
+                hint = ((uintptr_t)target + hint_offsets[attempt - 5]) & ~(uintptr_t)0xFFF;
+            }
+            auto_trampoline = real_mmap((void *)hint, 4096,
+                                        PROT_READ | PROT_WRITE | PROT_EXEC,
+                                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (auto_trampoline != MAP_FAILED) {
+                int64_t dist = (int64_t)((uintptr_t)auto_trampoline - (uintptr_t)target);
+                if (dist < -(1 << 27) || dist >= (1 << 27)) {
+                    /* Too far — unmap and try again */
+                    munmap(auto_trampoline, 4096);
+                    auto_trampoline = MAP_FAILED;
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    if (auto_trampoline == MAP_FAILED) {
+        unified_log("auto_hook", LOG_LEVEL_ERROR,
+                    "Could not allocate trampoline near target %p", target);
+        auto_trampoline = NULL;
+        return -1;
+    }
+    unified_log("auto_hook", LOG_LEVEL_INFO, "Trampoline page at: %p (dist=%ld)",
+                auto_trampoline, (long)((uintptr_t)auto_trampoline - (uintptr_t)target));
+
+    /* 5. Build the trampoline machine code.
+     *
+     * The trampoline does:
+     *   a) Save caller-saved regs we use (x0, x1, x2, x16)
+     *   b) x0 already holds queue_ptr — leave it as arg0
+     *   c) mov x1, x2 — pass param_data pointer as arg1
+     *   d) Call auto_hook_handler(x0, x1) via blr x16
+     *   e) Restore registers
+     *   f) Execute 4 displaced instructions (original prologue)
+     *   g) Branch back to target+16
+     *
+     * Layout (0x30 = 48-byte frame):
+     *   [0]   stp x29, x30, [sp, #-0x30]!    // save frame pair
+     *   [4]   stp x0, x1, [sp, #0x10]         // save x0, x1
+     *   [8]   stp x2, x16, [sp, #0x20]        // save x2, x16
+     *   [12]  mov x1, x2                      // param_data -> arg1
+     *   [16]  ldr x16, <handler_addr>          // literal pool load
+     *   [20]  blr x16                          // call handler(queue_ptr, param_data)
+     *   [24]  ldp x2, x16, [sp, #0x20]        // restore x2, x16
+     *   [28]  ldp x0, x1, [sp, #0x10]         // restore x0, x1
+     *   [32]  ldp x29, x30, [sp], #0x30       // restore frame
+     *   -- displaced prologue (4 instructions) --
+     *   [36-48] original prologue
+     *   -- branch back --
+     *   [52]  ldr x16, <return_addr>           // literal pool load
+     *   [56]  br x16
+     *   -- data (8-byte aligned) --
+     *   [60/64] handler_address (8 bytes)
+     *   [68/72] return_address (8 bytes)
+     */
+
+    uint32_t *t = (uint32_t *)auto_trampoline;
+    int i = 0;
+
+    /* Save registers — need x0, x1, x2 (args) and x16 (call scratch) */
+    t[i++] = 0xA9BD7BFD;  /* stp x29, x30, [sp, #-0x30]! */
+    t[i++] = 0xA90107E0;  /* stp x0, x1, [sp, #0x10] */
+    t[i++] = 0xA90243E2;  /* stp x2, x16, [sp, #0x20] */
+
+    /* Load args for handler: auto_hook_handler(x0=queue_ptr, x1=param_data)
+     * x0 is already the queue pointer — leave it.
+     * Move x2 (param_data) → x1 as second argument. */
+    t[i++] = 0xAA0203E1;  /* mov x1, x2 */
+
+    /* Load handler address from literal pool at end of trampoline */
+    int handler_ldr_idx = i;
+    t[i++] = 0;  /* placeholder: ldr x16, [pc, #offset_to_handler_addr] */
+
+    /* Call handler */
+    t[i++] = 0xD63F0200;  /* blr x16 */
+
+    /* Restore registers */
+    t[i++] = 0xA94243E2;  /* ldp x2, x16, [sp, #0x20] */
+    t[i++] = 0xA94107E0;  /* ldp x0, x1, [sp, #0x10] */
+    t[i++] = 0xA8C37BFD;  /* ldp x29, x30, [sp], #0x30 */
+
+    /* Displaced prologue — copy actual 4 instructions from target */
+    t[i++] = prologue[0];
+    t[i++] = prologue[1];
+    t[i++] = prologue[2];
+    t[i++] = prologue[3];
+
+    /* Branch back to target + 16 (after displaced instructions) */
+    int return_ldr_idx = i;
+    t[i++] = 0;  /* placeholder: ldr x16, [pc, #offset_to_return_addr] */
+    t[i++] = 0xD61F0200;  /* br x16 */
+
+    /* Data section (8-byte aligned) */
+    /* Ensure alignment: if i is odd, add a nop */
+    if (i & 1) t[i++] = 0xD503201F;  /* nop */
+
+    /* handler address (8 bytes) */
+    int handler_data_idx = i;
+    uint64_t handler_addr = (uint64_t)(uintptr_t)auto_hook_handler;
+    memcpy(&t[i], &handler_addr, 8);
+    i += 2;
+
+    /* return address (8 bytes) */
+    int return_data_idx = i;
+    uint64_t return_addr = (uint64_t)(uintptr_t)(target + 16);
+    memcpy(&t[i], &return_addr, 8);
+    i += 2;
+
+    /* Patch the ldr x16, [pc, #offset] instructions.
+     * LDR Xt, <label> encoding: 0x58000000 | (imm19 << 5) | Rt
+     * where imm19 = (offset_bytes / 4) and Rt = 16 */
+    {
+        int32_t handler_offset = (handler_data_idx - handler_ldr_idx) * 4;
+        uint32_t handler_imm19 = (handler_offset / 4) & 0x7FFFF;
+        t[handler_ldr_idx] = 0x58000000 | (handler_imm19 << 5) | 16;
+
+        int32_t return_offset = (return_data_idx - return_ldr_idx) * 4;
+        uint32_t return_imm19 = (return_offset / 4) & 0x7FFFF;
+        t[return_ldr_idx] = 0x58000000 | (return_imm19 << 5) | 16;
+    }
+
+    /* 6. Patch the target: overwrite first instruction with branch to trampoline */
+    int64_t branch_offset = (int64_t)(auto_trampoline - target);
+    if (branch_offset < -(1 << 27) || branch_offset >= (1 << 27)) {
+        unified_log("auto_hook", LOG_LEVEL_WARN,
+                    "Trampoline too far for B instruction (offset=%ld) — skipping", (long)branch_offset);
+        munmap(auto_trampoline, 4096);
+        auto_trampoline = NULL;
+        return -1;
+    }
+
+    /* Make target page writable */
+    uintptr_t page_addr = (uintptr_t)target & ~(uintptr_t)0xFFF;
+    if (mprotect((void *)page_addr, 4096 * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        unified_log("auto_hook", LOG_LEVEL_ERROR, "mprotect RWX failed: %s", strerror(errno));
+        munmap(auto_trampoline, 4096);
+        auto_trampoline = NULL;
+        return -1;
+    }
+
+    /* Write B instruction: overwrite first 4 bytes of target.
+     * The remaining 3 instructions of the prologue become dead code at
+     * target+4..target+15 but are never reached because we branch away. */
+    uint32_t b_instr = 0x14000000 | (((uint32_t)(branch_offset >> 2)) & 0x03FFFFFF);
+    memcpy(target, &b_instr, 4);
+
+    /* 7. Cache coherency (required on ARM64 after code modification) */
+    __builtin___clear_cache((char *)target, (char *)(target + 4));
+    __builtin___clear_cache((char *)auto_trampoline, (char *)(auto_trampoline + i * 4));
+
+    /* Restore target page to R-X */
+    mprotect((void *)page_addr, 4096 * 2, PROT_READ | PROT_EXEC);
+
+    auto_hook_active = 1;
+    unified_log("auto_hook", LOG_LEVEL_INFO,
+                "Hook installed! Trampoline=%p Target=%p B=0x%08X", auto_trampoline, target, b_instr);
+    return 0;
+}
+
+/* Discovery mode: track unique (queue_ptr, param_ptr) pairs and log new ones.
+ * Supports up to 256 unique pointers (4 tracks * 8 macros + extras). */
+#define AUTO_DISCOVER_MAX 256
+
+typedef struct {
+    uint64_t queue_ptr;
+    uint64_t param_ptr;
+} auto_discover_entry_t;
+
+static auto_discover_entry_t auto_discovered[AUTO_DISCOVER_MAX];
+static int auto_discovered_count = 0;
+
+static int auto_discover_find(uint64_t ptr) {
+    for (int i = 0; i < auto_discovered_count; i++) {
+        if (auto_discovered[i].param_ptr == ptr) return i;
+    }
+    return -1;
+}
+
+/* Build the automation mapping from discovery table + ME track info.
+ * Groups discovered params by queue_ptr, identifies ME macro groups
+ * (8 params with stride-8 low bytes), and maps to shadow slots. */
+static void auto_build_mapping(void) {
+    auto_map_count = 0;
+    auto_map_ready = 0;
+
+    if (auto_me_track_count == 0 || auto_discovered_count == 0) return;
+
+    /* Step 1: Find unique queue_ptrs and group entries */
+    #define MAX_QUEUES 16
+    struct {
+        uint64_t queue_ptr;
+        int entry_indices[16];  /* indices into auto_discovered[] */
+        int count;
+    } groups[MAX_QUEUES];
+    int group_count = 0;
+
+    for (int i = 0; i < auto_discovered_count; i++) {
+        uint64_t qp = auto_discovered[i].queue_ptr;
+        int gidx = -1;
+        for (int g = 0; g < group_count; g++) {
+            if (groups[g].queue_ptr == qp) { gidx = g; break; }
+        }
+        if (gidx < 0) {
+            if (group_count >= MAX_QUEUES) continue;
+            gidx = group_count++;
+            groups[gidx].queue_ptr = qp;
+            groups[gidx].count = 0;
+        }
+        if (groups[gidx].count < 16) {
+            groups[gidx].entry_indices[groups[gidx].count++] = i;
+        }
+    }
+
+    unified_log("auto_hook", LOG_LEVEL_INFO,
+                "Mapping: %d discovered params in %d queue groups",
+                auto_discovered_count, group_count);
+
+    /* Step 2: Identify ME macro groups.
+     * ME macro knobs have param_ptr low bytes: 0x07, 0x0f, 0x17, 0x1f, 0x27, 0x2f, 0x37, 0x3f
+     * Pattern: (low_byte & 0x07) == 0x07 and low_byte range 0x07..0x3f (stride 8)
+     * Each ME group also has a "02" param (enable/volume) which we skip. */
+    struct {
+        int group_idx;       /* index into groups[] */
+        uint64_t base_ptr;   /* lowest param_ptr & ~0xFF */
+    } me_groups[4];
+    int me_group_count = 0;
+
+    for (int g = 0; g < group_count && me_group_count < 4; g++) {
+        int macro_count = 0;
+        for (int j = 0; j < groups[g].count; j++) {
+            uint8_t low = auto_discovered[groups[g].entry_indices[j]].param_ptr & 0xFF;
+            if ((low & 0x07) == 0x07 && low >= 0x07 && low <= 0x3f) {
+                macro_count++;
+            }
+        }
+        if (macro_count >= 8) {
+            /* This is an ME macro group */
+            uint64_t base = UINT64_MAX;
+            for (int j = 0; j < groups[g].count; j++) {
+                uint64_t pp = auto_discovered[groups[g].entry_indices[j]].param_ptr;
+                uint64_t b = pp & ~(uint64_t)0xFF;
+                if (b < base) base = b;
+            }
+            me_groups[me_group_count].group_idx = g;
+            me_groups[me_group_count].base_ptr = base;
+            me_group_count++;
+            unified_log("auto_hook", LOG_LEVEL_INFO,
+                        "ME group found: queue=0x%lx base=0x%lx macros=%d",
+                        (unsigned long)groups[g].queue_ptr, (unsigned long)base, macro_count);
+        }
+    }
+
+    if (me_group_count == 0) {
+        unified_log("auto_hook", LOG_LEVEL_INFO, "No ME macro groups found in discovery data");
+        return;
+    }
+
+    /* Step 3: Sort ME groups by ascending base_ptr (= ascending track order) */
+    for (int i = 0; i < me_group_count - 1; i++) {
+        for (int j = i + 1; j < me_group_count; j++) {
+            if (me_groups[j].base_ptr < me_groups[i].base_ptr) {
+                /* swap */
+                uint64_t tb = me_groups[i].base_ptr;
+                int tg = me_groups[i].group_idx;
+                me_groups[i].base_ptr = me_groups[j].base_ptr;
+                me_groups[i].group_idx = me_groups[j].group_idx;
+                me_groups[j].base_ptr = tb;
+                me_groups[j].group_idx = tg;
+            }
+        }
+    }
+
+    /* Step 4: Map Nth ME group -> Nth ME track position from Song.abl */
+    int me_idx = 0;  /* index into me_groups[] */
+    for (int track = 0; track < 4 && me_idx < me_group_count; track++) {
+        if (!auto_me_tracks[track]) continue;
+
+        int g = me_groups[me_idx].group_idx;
+        me_idx++;
+
+        /* For each macro param in this group, create a mapping entry */
+        for (int j = 0; j < groups[g].count && auto_map_count < AUTO_MAP_MAX; j++) {
+            int di = groups[g].entry_indices[j];
+            uint64_t pp = auto_discovered[di].param_ptr;
+            uint8_t low = pp & 0xFF;
+
+            /* Skip non-macro params (e.g. the 0x02 enable param) */
+            if ((low & 0x07) != 0x07 || low < 0x07 || low > 0x3f) continue;
+
+            /* knob number: (low_byte >> 3) + 1 -> maps 0x07->1, 0x0f->2, ..., 0x3f->8 */
+            int knob = (low >> 3) + 1;
+            if (knob < 1 || knob > 8) continue;
+
+            auto_map[auto_map_count].param_ptr = pp;
+            auto_map[auto_map_count].slot = (uint8_t)track;
+            auto_map[auto_map_count].knob = (uint8_t)knob;
+            auto_map_count++;
+
+            unified_log("auto_hook", LOG_LEVEL_DEBUG,
+                        "Map: ptr=0x%lx -> slot=%d knob=%d",
+                        (unsigned long)pp, track, knob);
+        }
+    }
+
+    if (auto_map_count > 0) {
+        auto_map_ready = 1;
+        unified_log("auto_hook", LOG_LEVEL_INFO,
+                    "Mapping built: %d entries (%d ME groups -> %d ME tracks)",
+                    auto_map_count, me_group_count, auto_me_track_count);
+    } else {
+        unified_log("auto_hook", LOG_LEVEL_INFO,
+                    "Mapping empty: %d ME groups but no matching ME tracks", me_group_count);
+    }
+    #undef MAX_QUEUES
+}
+
+/* Drain automation ring buffer. Called every ioctl tick (~2.9ms). */
+static void auto_hook_consume(void) {
+    static int diag_logged = 0;
+    if (!diag_logged && unified_log_enabled()) {
+        unified_log("auto_hook", LOG_LEVEL_INFO,
+                    "Consumer check: hook_active=%d hook_enabled=%d trampoline=%p discovered=%d",
+                    auto_hook_active, auto_hook_enabled, auto_trampoline, auto_discovered_count);
+        diag_logged = 1;
+    }
+    if (!auto_hook_active) return;
+
+    /* Check learn mode: /data/UserData/move-anything/auto_learn
+     * When present, log ALL value changes with param index (for mapping knobs).
+     * Check every ~1000 ticks (~3s) to avoid stat() overhead. */
+    static int learn_mode = 0;
+    static int learn_check_counter = 0;
+    if (++learn_check_counter >= 1000) {
+        learn_check_counter = 0;
+        learn_mode = (access("/data/UserData/move-anything/auto_learn", F_OK) == 0) ? 1 : 0;
+    }
+
+    uint32_t t = __atomic_load_n(&auto_ring_tail, __ATOMIC_RELAXED);
+    uint32_t h = __atomic_load_n(&auto_ring_head, __ATOMIC_ACQUIRE);
+    if (t == h) return;
+
+    while (t != h) {
+        auto_event_t *e = &auto_ring[t];
+        int idx = auto_discover_find(e->param_ptr);
+        if (idx < 0 && auto_discovered_count < AUTO_DISCOVER_MAX) {
+            idx = auto_discovered_count++;
+            auto_discovered[idx].param_ptr = e->param_ptr;
+            auto_discovered[idx].queue_ptr = e->queue_ptr;
+            unified_log("auto_hook", LOG_LEVEL_INFO,
+                        "NEW PARAM #%d: q=0x%lx ptr=0x%lx val=%.4f",
+                        idx, (unsigned long)e->queue_ptr, (unsigned long)e->param_ptr, e->value);
+        }
+        if (learn_mode) {
+            unified_log("auto_hook", LOG_LEVEL_DEBUG,
+                        "LEARN #%d: q=0x%lx ptr=0x%lx val=%.4f",
+                        idx, (unsigned long)e->queue_ptr, (unsigned long)e->param_ptr, e->value);
+        }
+
+        /* Route event to shadow slot if mapping is ready */
+        if (auto_map_ready) {
+            for (int m = 0; m < auto_map_count; m++) {
+                if (auto_map[m].param_ptr == e->param_ptr) {
+                    int slot = auto_map[m].slot;
+                    int knob = auto_map[m].knob;
+                    if (shadow_plugin_v2 && shadow_chain_slots[slot].active &&
+                        shadow_chain_slots[slot].instance) {
+                        char key[24], val[16];
+                        snprintf(key, sizeof(key), "knob_%d_absolute", knob);
+                        snprintf(val, sizeof(val), "%.4f", e->value);
+                        shadow_plugin_v2->set_param(
+                            shadow_chain_slots[slot].instance, key, val);
+                    }
+                    break;
+                }
+            }
+        }
+
+        t = (t + 1) & AUTO_RING_MASK;
+    }
+
+    __atomic_store_n(&auto_ring_tail, t, __ATOMIC_RELEASE);
+
+    /* Try to build mapping once we have discovery data and ME track info */
+    if (!auto_map_ready && auto_me_track_count > 0 && auto_discovered_count > 0) {
+        static int build_delay = 0;
+        if (++build_delay >= 500) {  /* ~1.5s after first event — wait for boot flood */
+            auto_build_mapping();
+            build_delay = 0;
+        }
+    }
+}
+
 /* Load feature configuration from config/features.json */
 static void load_feature_config(void)
 {
@@ -5107,13 +5811,27 @@ static void load_feature_config(void)
         }
     }
 
-    char log_msg[256];
+    /* Parse automation_hook_enabled (defaults to false) */
+    const char *auto_hook_key = strstr(config_buf, "\"automation_hook_enabled\"");
+    if (auto_hook_key) {
+        const char *colon = strchr(auto_hook_key, ':');
+        if (colon) {
+            colon++;
+            while (*colon == ' ' || *colon == '\t') colon++;
+            if (strncmp(colon, "true", 4) == 0) {
+                auto_hook_enabled = 1;
+            }
+        }
+    }
+
+    char log_msg[384];
     snprintf(log_msg, sizeof(log_msg),
-             "Features: shadow_ui=%s, standalone=%s, link_audio=%s, display_mirror=%s",
+             "Features: shadow_ui=%s, standalone=%s, link_audio=%s, display_mirror=%s, auto_hook=%s",
              shadow_ui_enabled ? "enabled" : "disabled",
              standalone_enabled ? "enabled" : "disabled",
              link_audio.enabled ? "enabled" : "disabled",
-             display_mirror_enabled ? "enabled" : "disabled");
+             display_mirror_enabled ? "enabled" : "disabled",
+             auto_hook_enabled ? "enabled" : "disabled");
     shadow_log(log_msg);
 }
 
@@ -5528,6 +6246,16 @@ static int shadow_inprocess_log_enabled(void) {
 static void shadow_log(const char *msg) {
     /* Write to unified log */
     unified_log("shim", LOG_LEVEL_DEBUG, "%s", msg ? msg : "(null)");
+}
+
+__attribute__((format(printf, 1, 2)))
+static void shadow_log_fmt(const char *fmt, ...) {
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    shadow_log(buf);
 }
 
 static FILE *shadow_midi_out_log = NULL;
@@ -8121,6 +8849,7 @@ static void init_shadow_shm(void)
 
     /* Initialize unified logging first so we can log during shm init */
     unified_log_init();
+    unified_log("shim", LOG_LEVEL_INFO, "Shim init: ALSA seq hooks with versioned symbols (@@ALSA_0.9)");
 
     /* Install crash signal handlers */
     signal(SIGSEGV, crash_signal_handler);
@@ -9858,6 +10587,10 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
         if (shadow_control) {
             shadow_control->display_mirror = display_mirror_enabled ? 1 : 0;
         }
+        /* Install automation hook if feature is enabled */
+        if (auto_hook_enabled) {
+            auto_hook_install();
+        }
         /* Launch Link Audio subscriber if feature is enabled */
         if (link_audio.enabled) {
             launch_link_subscriber();
@@ -10510,6 +11243,147 @@ static void link_sub_reset_state(void)
     }
 }
 
+/* ==========================================================================
+ * ALSA Sequencer Hook - observe Move's internal MIDI/automation events
+ * ========================================================================== */
+
+/* Minimal ALSA seq event type constants (from asound.h) */
+#define SND_SEQ_EVENT_NOTEON     6
+#define SND_SEQ_EVENT_NOTEOFF    7
+#define SND_SEQ_EVENT_CONTROLLER 10
+#define SND_SEQ_EVENT_PGMCHANGE  11
+#define SND_SEQ_EVENT_PITCHBEND  13
+#define SND_SEQ_EVENT_SYSEX      130
+
+/* Minimal ALSA seq event struct layout (matches ABI) */
+typedef struct {
+    unsigned char type;
+    unsigned char flags;
+    unsigned char tag;
+    unsigned char queue;
+    /* timestamp union (8 bytes) */
+    unsigned char time[8];
+    /* source addr (2 bytes: client, port) */
+    unsigned char source_client;
+    unsigned char source_port;
+    /* dest addr (2 bytes) */
+    unsigned char dest_client;
+    unsigned char dest_port;
+    /* data union starts here (offset 20) */
+    union {
+        struct { unsigned char channel; unsigned char note; unsigned char velocity; unsigned char off_velocity; unsigned int duration; } note;
+        struct { unsigned char channel; unsigned char unused[3]; unsigned int param; int value; } control;
+        unsigned char raw[12];
+    } data;
+} shim_snd_seq_event_t;
+
+static int (*real_snd_seq_event_output)(void *, void *) = NULL;
+static int (*real_snd_seq_event_output_direct)(void *, void *) = NULL;
+static int (*real_snd_seq_open)(void **, const char *, int, int) = NULL;
+static int (*real_snd_seq_drain_output)(void *) = NULL;
+static int (*real_snd_seq_event_input)(void *, void **) = NULL;
+static volatile int alsa_seq_hook_logged_open = 0;
+static volatile int alsa_seq_event_count = 0;
+
+int _shim_snd_seq_open(void **handle, const char *name, int streams, int mode)
+{
+    if (!real_snd_seq_open) {
+        real_snd_seq_open = dlsym(RTLD_NEXT, "snd_seq_open");
+    }
+    int ret = real_snd_seq_open(handle, name, streams, mode);
+    shadow_log_fmt("ALSA seq: snd_seq_open(name=\"%s\", streams=%d, mode=%d) = %d, handle=%p",
+                   name ? name : "(null)", streams, mode, ret, handle ? *handle : NULL);
+    return ret;
+}
+
+int _shim_snd_seq_event_output(void *handle, void *ev)
+{
+    if (!real_snd_seq_event_output) {
+        real_snd_seq_event_output = dlsym(RTLD_NEXT, "snd_seq_event_output");
+    }
+    shim_snd_seq_event_t *e = (shim_snd_seq_event_t *)ev;
+    if (e) {
+        unsigned char type = e->type;
+        if (type == SND_SEQ_EVENT_CONTROLLER) {
+            shadow_log_fmt("ALSA seq OUT: CC ch=%d param=%d value=%d (src=%d:%d dst=%d:%d)",
+                           e->data.control.channel, e->data.control.param, e->data.control.value,
+                           e->source_client, e->source_port, e->dest_client, e->dest_port);
+        } else if (type == SND_SEQ_EVENT_NOTEON || type == SND_SEQ_EVENT_NOTEOFF) {
+            shadow_log_fmt("ALSA seq OUT: %s ch=%d note=%d vel=%d (src=%d:%d dst=%d:%d)",
+                           type == SND_SEQ_EVENT_NOTEON ? "NoteOn" : "NoteOff",
+                           e->data.note.channel, e->data.note.note, e->data.note.velocity,
+                           e->source_client, e->source_port, e->dest_client, e->dest_port);
+        } else {
+            shadow_log_fmt("ALSA seq OUT: type=%d (src=%d:%d dst=%d:%d)",
+                           type, e->source_client, e->source_port, e->dest_client, e->dest_port);
+        }
+    }
+    return real_snd_seq_event_output(handle, ev);
+}
+
+int _shim_snd_seq_event_output_direct(void *handle, void *ev)
+{
+    if (!real_snd_seq_event_output_direct) {
+        real_snd_seq_event_output_direct = dlsym(RTLD_NEXT, "snd_seq_event_output_direct");
+    }
+    shim_snd_seq_event_t *e = (shim_snd_seq_event_t *)ev;
+    if (e) {
+        unsigned char type = e->type;
+        if (type == SND_SEQ_EVENT_CONTROLLER) {
+            shadow_log_fmt("ALSA seq OUT_DIRECT: CC ch=%d param=%d value=%d (src=%d:%d dst=%d:%d)",
+                           e->data.control.channel, e->data.control.param, e->data.control.value,
+                           e->source_client, e->source_port, e->dest_client, e->dest_port);
+        } else {
+            shadow_log_fmt("ALSA seq OUT_DIRECT: type=%d (src=%d:%d dst=%d:%d)",
+                           type, e->source_client, e->source_port, e->dest_client, e->dest_port);
+        }
+    }
+    return real_snd_seq_event_output_direct(handle, ev);
+}
+
+int _shim_snd_seq_drain_output(void *handle)
+{
+    if (!real_snd_seq_drain_output) {
+        real_snd_seq_drain_output = dlsym(RTLD_NEXT, "snd_seq_drain_output");
+    }
+    shadow_log_fmt("ALSA seq: drain_output(handle=%p)", handle);
+    return real_snd_seq_drain_output(handle);
+}
+
+int _shim_snd_seq_event_input(void *handle, void **ev)
+{
+    if (!real_snd_seq_event_input) {
+        real_snd_seq_event_input = dlsym(RTLD_NEXT, "snd_seq_event_input");
+    }
+    int ret = real_snd_seq_event_input(handle, ev);
+    if (ret >= 0 && ev && *ev) {
+        shim_snd_seq_event_t *e = (shim_snd_seq_event_t *)(*ev);
+        unsigned char type = e->type;
+        if (type == SND_SEQ_EVENT_CONTROLLER) {
+            shadow_log_fmt("ALSA seq IN: CC ch=%d param=%d value=%d (src=%d:%d dst=%d:%d)",
+                           e->data.control.channel, e->data.control.param, e->data.control.value,
+                           e->source_client, e->source_port, e->dest_client, e->dest_port);
+        } else if (type == SND_SEQ_EVENT_NOTEON || type == SND_SEQ_EVENT_NOTEOFF) {
+            shadow_log_fmt("ALSA seq IN: %s ch=%d note=%d vel=%d",
+                           type == SND_SEQ_EVENT_NOTEON ? "NoteOn" : "NoteOff",
+                           e->data.note.channel, e->data.note.note, e->data.note.velocity);
+        } else {
+            shadow_log_fmt("ALSA seq IN: type=%d", type);
+        }
+    }
+    return ret;
+}
+
+/* Version tags to match MoveOriginal's @ALSA_0.9 imports.
+ * Use @@ALSA_0.9 (double @) to create the default version definition. */
+__asm__(".symver _shim_snd_seq_open,snd_seq_open@@ALSA_0.9");
+__asm__(".symver _shim_snd_seq_event_output,snd_seq_event_output@@ALSA_0.9");
+__asm__(".symver _shim_snd_seq_event_output_direct,snd_seq_event_output_direct@@ALSA_0.9");
+__asm__(".symver _shim_snd_seq_drain_output,snd_seq_drain_output@@ALSA_0.9");
+__asm__(".symver _shim_snd_seq_event_input,snd_seq_event_input@@ALSA_0.9");
+
+/* ========================================================================== */
+
 int (*real_ioctl)(int, unsigned long, ...) = NULL;
 
 int shiftHeld = 0;
@@ -10910,6 +11784,9 @@ int ioctl(int fd, unsigned long request, ...)
     TIME_SECTION_END(mix_audio_sum, mix_audio_max);
 
 #if SHADOW_INPROCESS_POC
+    /* Drain automation hook ring buffer (lightweight, no-op if hook inactive) */
+    auto_hook_consume();
+
     TIME_SECTION_START();
     shadow_inprocess_handle_ui_request();
     TIME_SECTION_END(ui_req_sum, ui_req_max);
