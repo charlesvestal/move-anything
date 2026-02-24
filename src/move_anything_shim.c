@@ -5878,16 +5878,61 @@ static void auto_hook_consume(void) {
                     break;
                 }
             }
-            /* Log unmatched stride-8 params (rate-limited) */
+            /* Dynamic map extension: runtime automation uses different param_ptrs
+             * than the boot flood. Boot flood creates complete groups of 8, but
+             * runtime events arrive one at a time and never form full groups.
+             * When we get a MISS on a stride-8 param, add it to the map dynamically. */
             if (!matched) {
                 uint8_t low = e->param_ptr & 0xFF;
                 if ((low & 0x07) == 0x07 && low >= 0x07 && low <= 0x3f) {
-                    static int miss_count = 0;
-                    if (miss_count < 10) {
-                        miss_count++;
-                        unified_log("auto_hook", LOG_LEVEL_DEBUG,
-                                    "MISS: stride-8 ptr=0x%lx low=0x%02x not in map",
-                                    (unsigned long)e->param_ptr, low);
+                    int knob = (low >> 3) + 1;
+                    /* Find which slot this knob should map to.
+                     * Use queue_ptr correlation: find an existing map entry whose
+                     * discovery record shares the same queue_ptr as this event. */
+                    int target_slot = -1;
+                    int di = auto_discover_find(e->param_ptr);
+                    if (di >= 0) {
+                        uint64_t this_qp = auto_discovered[di].queue_ptr;
+                        /* Search existing map entries for one sharing this queue_ptr */
+                        for (int m2 = 0; m2 < auto_map_count && target_slot < 0; m2++) {
+                            int di2 = auto_discover_find(auto_map[m2].param_ptr);
+                            if (di2 >= 0 && auto_discovered[di2].queue_ptr == this_qp) {
+                                target_slot = auto_map[m2].slot;
+                            }
+                        }
+                    }
+                    /* Fallback: if only 1 ME track, use it */
+                    if (target_slot < 0 && auto_me_track_count == 1) {
+                        for (int t = 0; t < 4; t++) {
+                            if (auto_me_tracks[t]) { target_slot = t; break; }
+                        }
+                    }
+                    if (target_slot >= 0 && auto_map_count < AUTO_MAP_MAX) {
+                        auto_map[auto_map_count].param_ptr = e->param_ptr;
+                        auto_map[auto_map_count].slot = (uint8_t)target_slot;
+                        auto_map[auto_map_count].knob = (uint8_t)knob;
+                        auto_map_count++;
+                        unified_log("auto_hook", LOG_LEVEL_INFO,
+                                    "DYNAMIC MAP: ptr=0x%lx -> slot=%d knob=%d (runtime param)",
+                                    (unsigned long)e->param_ptr, target_slot, knob);
+                        /* Route this event immediately */
+                        if (shadow_plugin_v2 && shadow_chain_slots[target_slot].active &&
+                            shadow_chain_slots[target_slot].instance) {
+                            char dkey[24], dval[16];
+                            snprintf(dkey, sizeof(dkey), "knob_%d_absolute", knob);
+                            snprintf(dval, sizeof(dval), "%.4f", e->value);
+                            shadow_plugin_v2->set_param(
+                                shadow_chain_slots[target_slot].instance, dkey, dval);
+                        }
+                        matched = 1;
+                    } else {
+                        static int miss_count = 0;
+                        if (miss_count < 10) {
+                            miss_count++;
+                            unified_log("auto_hook", LOG_LEVEL_DEBUG,
+                                        "MISS: stride-8 ptr=0x%lx low=0x%02x slot=%d (no target)",
+                                        (unsigned long)e->param_ptr, low, target_slot);
+                        }
                     }
                 }
             }
