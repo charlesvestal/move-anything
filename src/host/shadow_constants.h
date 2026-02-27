@@ -32,6 +32,12 @@
 #define SHM_DISPLAY_LIVE    "/move-display-live"    /* Live display for remote viewer */
 
 /* ============================================================================
+ * Audio Constants
+ * ============================================================================ */
+
+#define FRAMES_PER_BLOCK 128    /* Audio frames per ioctl block */
+
+/* ============================================================================
  * Buffer Sizes
  * ============================================================================ */
 
@@ -103,7 +109,7 @@ typedef struct shadow_control_t {
     volatile uint8_t tts_volume;      /* TTS volume (0-100) */
     volatile uint16_t tts_pitch;      /* TTS pitch in Hz (80-180) */
     volatile float tts_speed;         /* TTS speed multiplier (0.5-6.0) */
-    volatile uint8_t overlay_knobs_mode; /* 0=shift, 1=jog_touch, 2=off */
+    volatile uint8_t overlay_knobs_mode; /* 0=shift, 1=jog_touch, 2=off, 3=native */
     volatile uint8_t display_mirror;     /* 0=off, 1=on (stream display to browser) */
     volatile uint8_t tts_engine;         /* 0=espeak-ng, 1=flite */
     volatile uint8_t pin_challenge_active; /* 0=none, 1=challenge detected, 2=submitted */
@@ -112,7 +118,9 @@ typedef struct shadow_control_t {
     volatile uint8_t overlay_rect_y;      /* Overlay rect top edge (pixels, 0-63) */
     volatile uint8_t overlay_rect_w;      /* Overlay rect width (pixels) */
     volatile uint8_t overlay_rect_h;      /* Overlay rect height (pixels) */
-    volatile uint8_t reserved[23];
+    volatile uint16_t tts_debounce_ms;   /* Screen reader debounce in ms (0-1000, default 300) */
+    volatile uint8_t set_pages_enabled;  /* 0=off, 1=on (Shift+Left/Right page switching) */
+    volatile uint8_t reserved[19];
 } shadow_control_t;
 
 /*
@@ -138,6 +146,8 @@ typedef struct shadow_param_t {
     volatile uint8_t slot;           /* Which chain slot (0-3) */
     volatile uint8_t response_ready; /* Set by shim when response is ready */
     volatile uint8_t error;          /* Non-zero on error */
+    volatile uint32_t request_id;    /* Monotonic request ID assigned by shadow UI */
+    volatile uint32_t response_id;   /* Request ID this response corresponds to */
     volatile int32_t result_len;     /* Length of result, -1 on error */
     char key[SHADOW_PARAM_KEY_LEN];
     char value[SHADOW_PARAM_VALUE_LEN];
@@ -186,10 +196,12 @@ typedef struct shadow_screenreader_t {
 #define SHADOW_OVERLAY_SAMPLER    1
 #define SHADOW_OVERLAY_SKIPBACK   2
 #define SHADOW_OVERLAY_SHIFT_KNOB 3
+#define SHADOW_OVERLAY_SET_PAGE   4
 
 #define SHADOW_SAMPLER_IDLE       0
 #define SHADOW_SAMPLER_ARMED      1
 #define SHADOW_SAMPLER_RECORDING  2
+#define SHADOW_SAMPLER_PREROLL    3
 
 /*
  * Overlay state structure for communication from shim to shadow UI.
@@ -228,7 +240,19 @@ typedef struct shadow_overlay_state_t {
     char shift_knob_param[64];                  /* Parameter name */
     char shift_knob_value[32];                  /* Parameter value */
 
-    volatile uint8_t  reserved[256 - 208];  /* Pad to SHADOW_OVERLAY_BUFFER_SIZE */
+    /* Set page overlay */
+    volatile uint8_t  set_page_active;            /* 1 = showing set page toast */
+    volatile uint8_t  set_page_current;           /* Current page (0-7) */
+    volatile uint8_t  set_page_total;             /* Total pages (8) */
+    volatile uint8_t  set_page_loading;           /* 1 = loading (pre-restart), 0 = loaded */
+    volatile uint16_t set_page_timeout;           /* Frames remaining for toast */
+
+    /* Preroll state */
+    volatile uint8_t  sampler_preroll_enabled;    /* 0=off, 1=on */
+    volatile uint8_t  sampler_preroll_active;     /* 1 = currently in preroll countdown */
+    volatile uint16_t sampler_preroll_bars_done;  /* Bars completed in preroll */
+
+    volatile uint8_t  reserved[256 - 218];  /* Pad to SHADOW_OVERLAY_BUFFER_SIZE */
 } shadow_overlay_state_t;
 
 /* Compile-time size checks */

@@ -1024,6 +1024,9 @@ if [ "$skip_modules" = false ]; then
     echo "  - Dexed: Additional .syx patch banks (optional - defaults included)"
     echo "  - NAM: .nam model files (free models at tonehunt.org and tone3000.com)"
     echo "  - REX Player: .rx2/.rex loop files (created with Propellerhead ReCycle)"
+    echo "  - HUSH ONE: .vstpreset or .bassline presets (TAL-BassLine-101 format)"
+    echo "  - CLAP: .clap audio effect plugins (ARM64 Linux)"
+    echo "  - Osirus: Virus ROM files (.mid or .BIN)"
     echo
     printf "Would you like to copy assets to your Move now? (y/N): "
     read -r copy_assets </dev/tty
@@ -1234,6 +1237,106 @@ if [ "$copy_assets" = "y" ] || [ "$copy_assets" = "Y" ]; then
         fi
     fi
 
+    # HUSH ONE presets
+    echo
+    echo "HUSH ONE: Enter the folder containing your .vstpreset or .bassline preset files."
+    echo "(TAL-BassLine-101 format. Press ENTER to skip)"
+    printf "Enter or drag folder path: "
+    read -r hush1_path </dev/tty
+
+    if [ -n "$hush1_path" ]; then
+        # Expand ~ to home directory and handle escaped spaces/quotes from drag-and-drop
+        hush1_path=$(echo "$hush1_path" | sed "s|^~|$HOME|" | sed "s/\\\\ / /g; s/\\\\'/'/g" | sed "s/^['\"]//;s/['\"]$//")
+        if [ -d "$hush1_path" ]; then
+            hush1_count=0
+            ssh_ableton_with_retry "mkdir -p move-anything/modules/sound_generators/hush1/presets" || true
+            for preset in "$hush1_path"/*.vstpreset "$hush1_path"/*.bassline "$hush1_path"/*.VSTPRESET "$hush1_path"/*.BASSLINE; do
+                if [ -f "$preset" ]; then
+                    echo "  Copying $(basename "$preset")..."
+                    if scp_with_retry "$preset" "$username@$hostname:./move-anything/modules/sound_generators/hush1/presets/"; then
+                        hush1_count=$((hush1_count + 1))
+                    else
+                        asset_copy_failed=true
+                    fi
+                fi
+            done
+            if [ $hush1_count -gt 0 ]; then
+                echo "  Copied $hush1_count preset file(s)"
+            else
+                echo "  No .vstpreset/.bassline files found in $hush1_path"
+            fi
+        else
+            echo "  Directory not found: $hush1_path"
+        fi
+    fi
+
+    # CLAP plugins
+    echo
+    echo "CLAP: Enter the folder containing your .clap audio effect plugins (ARM64 Linux)."
+    echo "(Press ENTER to skip)"
+    printf "Enter or drag folder path: "
+    read -r clap_path </dev/tty
+
+    if [ -n "$clap_path" ]; then
+        # Expand ~ to home directory and handle escaped spaces/quotes from drag-and-drop
+        clap_path=$(echo "$clap_path" | sed "s|^~|$HOME|" | sed "s/\\\\ / /g; s/\\\\'/'/g" | sed "s/^['\"]//;s/['\"]$//")
+        if [ -d "$clap_path" ]; then
+            clap_count=0
+            ssh_ableton_with_retry "mkdir -p move-anything/modules/audio_fx/clap/plugins" || true
+            for clap in "$clap_path"/*.clap "$clap_path"/*.CLAP; do
+                if [ -f "$clap" ]; then
+                    echo "  Copying $(basename "$clap")..."
+                    if scp_with_retry "$clap" "$username@$hostname:./move-anything/modules/audio_fx/clap/plugins/"; then
+                        clap_count=$((clap_count + 1))
+                    else
+                        asset_copy_failed=true
+                    fi
+                fi
+            done
+            if [ $clap_count -gt 0 ]; then
+                echo "  Copied $clap_count CLAP plugin(s)"
+            else
+                echo "  No .clap files found in $clap_path"
+            fi
+        else
+            echo "  Directory not found: $clap_path"
+        fi
+    fi
+
+    # Osirus ROMs
+    echo
+    echo "Osirus (Virus): Enter the folder containing your Virus ROM files."
+    echo "Accepts .mid or .BIN ROM files."
+    echo "(Press ENTER to skip)"
+    printf "Enter or drag folder path: "
+    read -r osirus_path </dev/tty
+
+    if [ -n "$osirus_path" ]; then
+        # Expand ~ to home directory and handle escaped spaces/quotes from drag-and-drop
+        osirus_path=$(echo "$osirus_path" | sed "s|^~|$HOME|" | sed "s/\\\\ / /g; s/\\\\'/'/g" | sed "s/^['\"]//;s/['\"]$//")
+        if [ -d "$osirus_path" ]; then
+            osirus_count=0
+            ssh_ableton_with_retry "mkdir -p move-anything/modules/sound_generators/osirus/roms" || true
+            for rom in "$osirus_path"/*.mid "$osirus_path"/*.MID "$osirus_path"/*.bin "$osirus_path"/*.BIN; do
+                if [ -f "$rom" ]; then
+                    echo "  Copying $(basename "$rom")..."
+                    if scp_with_retry "$rom" "$username@$hostname:./move-anything/modules/sound_generators/osirus/roms/"; then
+                        osirus_count=$((osirus_count + 1))
+                    else
+                        asset_copy_failed=true
+                    fi
+                fi
+            done
+            if [ $osirus_count -gt 0 ]; then
+                echo "  Copied $osirus_count Virus ROM file(s)"
+            else
+                echo "  No .mid/.bin ROM files found in $osirus_path"
+            fi
+        else
+            echo "  Directory not found: $osirus_path"
+        fi
+    fi
+
     echo
     if [ "$asset_copy_failed" = true ]; then
         echo "Asset copy completed with some errors. You may need to copy failed files manually."
@@ -1245,12 +1348,21 @@ if [ "$copy_assets" = "y" ] || [ "$copy_assets" = "Y" ]; then
     fi
 fi
 
-# Deploy Move Manual cache if available locally (generated by fetch_move_manual.sh)
-MANUAL_CACHE="$(cd "$(dirname "$0")/.." && pwd)/.cache/move_manual.json"
-if [ -f "$MANUAL_CACHE" ]; then
-    $ssh_root "mkdir -p /data/UserData/move-anything/cache && chown ableton:users /data/UserData/move-anything/cache" || true
-    scp_with_retry "$MANUAL_CACHE" "$username@$hostname:/data/UserData/move-anything/cache/"
-    qecho "Deployed Move Manual cache"
+# Deploy track presets to UserLibrary/Move Everything subfolder
+qecho "Installing track presets..."
+ssh_ableton_with_retry "mkdir -p '/data/UserData/UserLibrary/Track Presets/Move Everything'" || true
+ssh_ableton_with_retry "cp /data/UserData/move-anything/presets/track_presets/*.json '/data/UserData/UserLibrary/Track Presets/Move Everything/' 2>/dev/null" || true
+# Clean up old underscore-named presets from root Track Presets folder
+ssh_ableton_with_retry "rm -f '/data/UserData/UserLibrary/Track Presets/ME_Slot_'*.json" || true
+
+# Fetch fresh Move Manual on the installing computer and deploy to device cache
+qecho "Fetching Move Manual..."
+if [ -f "scripts/fetch_move_manual.sh" ] && scripts/fetch_move_manual.sh 2>/dev/null && [ -f ".cache/move_manual.json" ]; then
+    ssh_ableton_with_retry "mkdir -p /data/UserData/move-anything/cache" || true
+    scp_with_retry ".cache/move_manual.json" "$username@$hostname:./move-anything/cache/move_manual.json" || true
+    qecho "Move Manual deployed ($(wc -c < .cache/move_manual.json | tr -d ' ') bytes)"
+else
+    qecho "Manual fetch skipped (requires node + curl)"
 fi
 
 qecho ""
