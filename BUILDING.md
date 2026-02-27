@@ -184,18 +184,6 @@ python3 scripts/generate_font.py --c-array
 DISABLE_SCREEN_READER=1 ./scripts/build.sh
 ```
 
-**Flite bundle verification failed**
-```bash
-# Recommended: use Docker build (auto-installs arm64 dependencies)
-./scripts/build.sh
-
-# If building manually, bootstrap deps (including Flite/dbus):
-./scripts/bootstrap-build-deps.sh
-
-# Or disable screen reader support in this build:
-DISABLE_SCREEN_READER=1 ./scripts/build.sh
-```
-
 **Verify binary architecture**
 ```bash
 file build/move-anything
