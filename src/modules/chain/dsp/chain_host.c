@@ -14,6 +14,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <malloc.h>
 
 #include "host/plugin_api_v1.h"
 #include "host/audio_fx_api_v1.h"
@@ -409,7 +410,7 @@ typedef struct chain_instance {
     char current_midi_fx_modules[MAX_MIDI_FX][MAX_NAME_LEN];
     chain_param_info_t midi_fx_params[MAX_MIDI_FX][MAX_CHAIN_PARAMS];
     int midi_fx_param_counts[MAX_MIDI_FX];
-    char midi_fx_ui_hierarchy[MAX_MIDI_FX][2048];  /* Cached ui_hierarchy JSON */
+    char midi_fx_ui_hierarchy[MAX_MIDI_FX][8192];  /* Cached ui_hierarchy JSON */
 
     /* Knob mapping state */
     knob_mapping_t knob_mappings[MAX_KNOB_MAPPINGS];
@@ -1358,7 +1359,7 @@ static int v2_load_midi_fx(chain_instance_t *inst, const char *fx_name) {
             fseek(f, 0, SEEK_END);
             long size = ftell(f);
             fseek(f, 0, SEEK_SET);
-            if (size > 0 && size < 8192) {
+            if (size > 0 && size < 32768) {
                 char *json = malloc(size + 1);
                 if (json) {
                     { size_t nr = fread(json, 1, size, f); json[nr] = '\0'; }
@@ -1376,7 +1377,7 @@ static int v2_load_midi_fx(chain_instance_t *inst, const char *fx_name) {
                                 obj_end++;
                             }
                             int len = (int)(obj_end - obj_start);
-                            if (len > 0 && len < 2047) {
+                            if (len > 0 && len < 8191) {
                                 strncpy(inst->midi_fx_ui_hierarchy[slot], obj_start, len);
                                 inst->midi_fx_ui_hierarchy[slot][len] = '\0';
                             }
@@ -5921,6 +5922,17 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
                 fclose(mf);
             }
         }
+    }
+    else if (strcmp(key, "clear") == 0) {
+        /* Clear all DSP (synth + FX) without loading anything new.
+         * Used by two-pass set switching to free memory before loading. */
+        v2_synth_panic(inst);
+        v2_unload_all_midi_fx(inst);
+        v2_unload_all_audio_fx(inst);
+        v2_unload_synth(inst);
+        inst->current_patch = -1;
+        inst->dirty = 0;
+        malloc_trim(0);
     }
     /* Master preset commands */
     else if (strcmp(key, "save_master_preset") == 0) {

@@ -87,17 +87,29 @@ import {
 } from '/data/UserData/move-anything/shared/screen_reader.mjs';
 
 import {
+    fetchAndParseManual,
+    refreshManualBackground,
+    processDownloadedHtml
+} from '/data/UserData/move-anything/shared/parse_move_manual.mjs';
+
+import {
     OVERLAY_NONE,
     OVERLAY_SAMPLER,
     OVERLAY_SKIPBACK,
     OVERLAY_SHIFT_KNOB,
+    OVERLAY_SET_PAGE,
     drawSamplerOverlay,
     drawSkipbackToast,
     drawShiftKnobOverlay,
+    drawSetPageToast,
     SHIFT_KNOB_BOX_X,
     SHIFT_KNOB_BOX_Y,
     SHIFT_KNOB_BOX_W,
-    SHIFT_KNOB_BOX_H
+    SHIFT_KNOB_BOX_H,
+    SET_PAGE_BOX_X,
+    SET_PAGE_BOX_Y,
+    SET_PAGE_BOX_W,
+    SET_PAGE_BOX_H
 } from '/data/UserData/move-anything/shared/sampler_overlay.mjs';
 
 /* Track buttons - derive from imported constants */
@@ -578,7 +590,7 @@ const GLOBAL_SETTINGS_SECTIONS = [
         items: [
             { key: "display_mirror", label: "Mirror Display", type: "bool" },
             { key: "overlay_knobs", label: "Overlay Knobs", type: "enum",
-              options: ["+Shift", "+Jog Touch", "Off"], values: [0, 1, 2] }
+              options: ["+Shift", "+Jog Touch", "Off", "Native"], values: [0, 1, 2, 3] }
         ]
     },
     {
@@ -597,7 +609,14 @@ const GLOBAL_SETTINGS_SECTIONS = [
               options: ["eSpeak-NG", "Flite"], values: ["espeak", "flite"] },
             { key: "screen_reader_speed", label: "Voice Speed", type: "float", min: 0.5, max: 6.0, step: 0.1 },
             { key: "screen_reader_pitch", label: "Voice Pitch", type: "float", min: 80, max: 180, step: 5 },
-            { key: "screen_reader_volume", label: "Voice Vol", type: "int", min: 0, max: 100, step: 5 }
+            { key: "screen_reader_volume", label: "Voice Vol", type: "int", min: 0, max: 100, step: 5 },
+            { key: "screen_reader_debounce", label: "Debounce", type: "int", min: 0, max: 1000, step: 50 }
+        ]
+    },
+    {
+        id: "set_pages", label: "Set Pages",
+        items: [
+            { key: "set_pages_enabled", label: "Set Pages", type: "bool" }
         ]
     },
     {
@@ -661,6 +680,8 @@ const SLOT_SETTINGS = [
     { key: "patch", label: "Patch", type: "action" },  // Opens patch browser
     { key: "chain", label: "Edit Chain", type: "action" },  // Opens chain editor
     { key: "slot:volume", label: "Volume", type: "float", min: 0, max: 1, step: 0.05 },
+    { key: "slot:muted", label: "Muted", type: "int", min: 0, max: 1, step: 1 },
+    { key: "slot:soloed", label: "Soloed", type: "int", min: 0, max: 1, step: 1 },
     { key: "slot:receive_channel", label: "Recv Ch", type: "int", min: 0, max: 16, step: 1 },
     { key: "slot:forward_channel", label: "Fwd Ch", type: "int", min: -2, max: 15, step: 1 },  // -2 = passthrough, -1 = auto, 0-15 = ch 1-16
 ];
@@ -971,6 +992,8 @@ function processAllUpdates() {
 const CHAIN_SETTINGS_ITEMS = [
     { key: "knobs", label: "Knobs", type: "action" },  // Opens knob assignment editor
     { key: "slot:volume", label: "Volume", type: "float", min: 0, max: 1, step: 0.05 },
+    { key: "slot:muted", label: "Muted", type: "int", min: 0, max: 1, step: 1 },
+    { key: "slot:soloed", label: "Soloed", type: "int", min: 0, max: 1, step: 1 },
     { key: "slot:receive_channel", label: "Recv Ch", type: "int", min: 0, max: 16, step: 1 },
     { key: "slot:forward_channel", label: "Fwd Ch", type: "int", min: -2, max: 15, step: 1 },  // -2 = passthrough, -1 = auto, 0-15 = ch 1-16
     { key: "save", label: "[Save]", type: "action" },  // Save slot preset (overwrite for existing)
@@ -1382,6 +1405,40 @@ function setSlotParam(slot, key, value) {
     }
 }
 
+function setSlotParamWithTimeout(slot, key, value, timeoutMs) {
+    const timeout = Number.isFinite(timeoutMs) ? Math.max(1, Math.floor(timeoutMs)) : 100;
+    if (typeof shadow_set_param_timeout === "function") {
+        try {
+            return shadow_set_param_timeout(slot, key, String(value), timeout);
+        } catch (e) {
+            return false;
+        }
+    }
+    return setSlotParam(slot, key, value);
+}
+
+function setSlotParamWithRetry(slot, key, value, timeoutMs, retryTimeoutMs, logLabel) {
+    let ok = setSlotParamWithTimeout(slot, key, value, timeoutMs);
+    if (!ok) {
+        debugLog(`${logLabel} timeout slot ${slot + 1} key ${key} (retry)`);
+        ok = setSlotParamWithTimeout(slot, key, value, retryTimeoutMs);
+    }
+    if (!ok) {
+        debugLog(`${logLabel} timeout slot ${slot + 1} key ${key} (final)`);
+    }
+    return ok;
+}
+
+function clearSlotForEmptySetState(slot) {
+    const keys = ["synth:module", "midi_fx1:module", "fx1:module", "fx2:module"];
+    let allOk = true;
+    for (const key of keys) {
+        const ok = setSlotParamWithRetry(slot, key, "", 1500, 3000, "SET_CHANGED: clear");
+        if (!ok) allOk = false;
+    }
+    return allOk;
+}
+
 /* Scan modules directory for audio_fx modules */
 function scanForAudioFxModules() {
     const MODULES_DIR = "/data/UserData/move-anything/modules";
@@ -1740,7 +1797,7 @@ function drawOvertakeMenu() {
         });
     }
 
-    drawFooter("Jog:Select  Back:Exit");
+    drawFooter({left: "Back: Exit", right: "Jog: Select"});
 }
 
 /* Handle input in overtake menu */
@@ -2766,44 +2823,69 @@ function handleMasterFxSettingsAction(key) {
                 debugLog("Failed to load help content: " + e);
             }
         }
-        /* Try to load parsed Move Manual (from cache, if not already loaded) */
+        /* Try to load Move Manual (from bundled or cache — never HTTP) */
         if (helpContent && !helpContent._manualLoaded) {
             try {
-                const manualRaw = host_read_file("/data/UserData/move-anything/cache/move_manual.json");
-                if (manualRaw) {
-                    const manualData = JSON.parse(manualRaw);
-                    if (manualData && manualData.sections && manualData.sections.length > 0) {
-                        /* Find the Move Manual section and replace its children */
-                        for (let i = 0; i < helpContent.sections.length; i++) {
-                            if (helpContent.sections[i].title === "Move Manual") {
-                                helpContent.sections[i].children = manualData.sections;
-                                break;
-                            }
+                /* Pick up any completed background download first */
+                processDownloadedHtml();
+                const sections = fetchAndParseManual();
+                if (sections && sections.length > 0) {
+                    /* Find the Move Manual section and replace its children */
+                    for (let i = 0; i < helpContent.sections.length; i++) {
+                        if (helpContent.sections[i].title === "Move Manual") {
+                            helpContent.sections[i].children = sections;
+                            break;
                         }
-                        helpContent._manualLoaded = true;
-                        debugLog("Loaded Move Manual: " + manualData.sections.length + " chapters");
                     }
+                    helpContent._manualLoaded = true;
+                    debugLog("Loaded Move Manual: " + sections.length + " chapters");
                 }
             } catch (e) {
-                debugLog("Move Manual cache not available: " + e);
+                debugLog("Move Manual not available: " + e);
             }
         }
+        /* Ensure Notice section is always present */
+        if (helpContent && helpContent.sections &&
+            !helpContent.sections.find(s => s.title === "Notice")) {
+            helpContent.sections.push({
+                title: "Notice",
+                children: [{
+                    title: "Copyright",
+                    lines: [
+                        "Ableton Move Manual",
+                        "",
+                        "Copyright 2024",
+                        "Ableton AG.",
+                        "All rights reserved.",
+                        "Made in Germany.",
+                        "",
+                        "Manual content",
+                        "displayed with",
+                        "permission from",
+                        "Ableton AG."
+                    ]
+                }, {
+                    title: "Trademark Notice",
+                    lines: [
+                        "Ableton and Move are",
+                        "trademarks of",
+                        "Ableton AG.",
+                        "",
+                        "Move Everything is",
+                        "an independent",
+                        "product and has not",
+                        "been authorized,",
+                        "sponsored, or",
+                        "otherwise approved",
+                        "by Ableton AG."
+                    ]
+                }]
+            });
+        }
         if (helpContent && helpContent.sections && helpContent.sections.length > 0) {
-            /* If only Move Everything section has real content, skip straight to it */
-            const meSection = helpContent.sections.find(s => s.title === "Move Everything");
-            const hasManual = helpContent._manualLoaded;
-            if (meSection && meSection.children && !hasManual) {
-                /* Skip section list, go directly to ME topics */
-                helpNavStack = [
-                    { items: meSection.children, selectedIndex: 0, title: meSection.title }
-                ];
-                needsRedraw = true;
-                announce(meSection.title + ", " + meSection.children[0].title);
-            } else {
-                helpNavStack = [{ items: helpContent.sections, selectedIndex: 0, title: "Help" }];
-                needsRedraw = true;
-                announce("Help, " + helpContent.sections[0].title);
-            }
+            helpNavStack = [{ items: helpContent.sections, selectedIndex: 0, title: "Help" }];
+            needsRedraw = true;
+            announce("Help, " + helpContent.sections[0].title);
         }
         return;
     }
@@ -3135,6 +3217,10 @@ function saveMasterFxChainConfig() {
         if (typeof overlay_knobs_get_mode === "function") {
             config.overlay_knobs_mode = overlay_knobs_get_mode();
         }
+        /* Save TTS debounce */
+        if (typeof tts_get_debounce === "function") {
+            config.tts_debounce_ms = tts_get_debounce();
+        }
         /* Use JS-cached values instead of reading from shim to avoid
          * race condition where periodic autosave reads shim defaults
          * before loadMasterFxChainFromConfig() has restored them. */
@@ -3193,6 +3279,10 @@ function loadMasterFxChainFromConfig() {
         /* Restore overlay knobs mode */
         if (typeof config.overlay_knobs_mode === "number" && typeof overlay_knobs_set_mode === "function") {
             overlay_knobs_set_mode(config.overlay_knobs_mode);
+        }
+        /* Restore TTS debounce */
+        if (typeof config.tts_debounce_ms === "number" && typeof tts_set_debounce === "function") {
+            tts_set_debounce(config.tts_debounce_ms);
         }
         if (config.resample_bridge_mode !== undefined && typeof shadow_set_param === "function") {
             const mode = parseResampleBridgeMode(config.resample_bridge_mode);
@@ -3958,7 +4048,13 @@ function getChainSettingValue(slot, setting) {
 
     if (setting.key === "slot:volume") {
         const pct = Math.round(parseFloat(val) * 100);
-        return pct === 0 ? "Muted" : `${pct}%`;
+        return `${pct}%`;
+    }
+    if (setting.key === "slot:muted") {
+        return parseInt(val) ? "Yes" : "No";
+    }
+    if (setting.key === "slot:soloed") {
+        return parseInt(val) ? "Yes" : "No";
     }
     if (setting.key === "slot:forward_channel") {
         const ch = parseInt(val);
@@ -4740,7 +4836,7 @@ function buildKnobContextForKnob(knobIndex) {
             meta,
             pluginName,
             displayName,
-            title: `${pluginName} ${displayName}`
+            title: `S${hierEditorSlot + 1}: ${pluginName} ${displayName}`
         };
     }
 
@@ -4798,7 +4894,7 @@ function buildKnobContextForKnob(knobIndex) {
                         meta,
                         pluginName,
                         displayName,
-                        title: `${pluginName} ${displayName}`
+                        title: `S${selectedSlot + 1}: ${pluginName} ${displayName}`
                     };
                 }
                 debugLog(`buildKnobContext: no knob mapping for knobIndex=${knobIndex}, levelDef.knobs=${levelDef?.knobs ? JSON.stringify(levelDef.knobs) : 'undefined'}`);
@@ -4821,7 +4917,7 @@ function buildKnobContextForKnob(knobIndex) {
                         meta: param,
                         pluginName,
                         displayName,
-                        title: `${pluginName} ${displayName}`
+                        title: `S${selectedSlot + 1}: ${pluginName} ${displayName}`
                     };
                 }
             }
@@ -5273,7 +5369,7 @@ function drawHierarchyEditor() {
         }
 
         /* Footer hints - always push to edit (for swap/params) */
-        drawFooter("Jog:browse  Push:edit");
+        drawFooter({left: "Push: edit", right: "Jog: browse"});
     } else {
         /* Draw param list */
         if (hierEditorParams.length === 0) {
@@ -5349,7 +5445,7 @@ function drawHierarchyEditor() {
         }
 
         /* Footer hints */
-        const hint = hierEditorEditMode ? "Jog:adjust  Push:done" : "Jog:scroll  Push:edit";
+        const hint = hierEditorEditMode ? {left: "Push: done", right: "Jog: adjust"} : {left: "Push: edit", right: "Jog: scroll"};
         drawFooter(hint);
     }
 }
@@ -5389,7 +5485,13 @@ function getSlotSettingValue(slot, setting) {
     if (setting.key === "slot:volume") {
         const num = parseFloat(val);
         const pct = isNaN(num) ? 0 : Math.round(num * 100);
-        return pct === 0 ? "Muted" : `${pct}%`;
+        return `${pct}%`;
+    }
+    if (setting.key === "slot:muted") {
+        return parseInt(val) ? "Yes" : "No";
+    }
+    if (setting.key === "slot:soloed") {
+        return parseInt(val) ? "Yes" : "No";
     }
     if (setting.key === "slot:forward_channel") {
         const ch = parseInt(val);
@@ -5446,7 +5548,7 @@ function getMasterFxSettingValue(setting) {
     }
     if (setting.key === "overlay_knobs") {
         const mode = typeof overlay_knobs_get_mode === "function" ? overlay_knobs_get_mode() : 0;
-        return ["+Shift", "+Jog Touch", "Off"][mode] || "+Shift";
+        return ["+Shift", "+Jog Touch", "Off", "Native"][mode] || "+Shift";
     }
     if (setting.key === "display_mirror") {
         return (typeof display_mirror_get === "function" && display_mirror_get()) ? "On" : "Off";
@@ -5478,6 +5580,15 @@ function getMasterFxSettingValue(setting) {
             return tts_get_volume() + "%";
         }
         return "70%";
+    }
+    if (setting.key === "screen_reader_debounce") {
+        if (typeof tts_get_debounce === "function") {
+            return tts_get_debounce() + "ms";
+        }
+        return "300ms";
+    }
+    if (setting.key === "set_pages_enabled") {
+        return (typeof set_pages_get === "function" && set_pages_get()) ? "On" : "Off";
     }
     if (setting.key === "auto_update_check") {
         return autoUpdateCheckEnabled ? "On" : "Off";
@@ -5573,6 +5684,20 @@ function adjustMasterFxSetting(setting, delta) {
         val += delta * setting.step;
         val = Math.max(setting.min, Math.min(setting.max, val));
         tts_set_volume(Math.round(val));
+        return;
+    }
+
+    if (setting.key === "screen_reader_debounce" && typeof tts_set_debounce === "function") {
+        let val = typeof tts_get_debounce === "function" ? tts_get_debounce() : 300;
+        val += delta * setting.step;
+        val = Math.max(setting.min, Math.min(setting.max, val));
+        tts_set_debounce(Math.round(val));
+        return;
+    }
+
+    if (setting.key === "set_pages_enabled" && typeof set_pages_set === "function") {
+        const current = typeof set_pages_get === "function" ? set_pages_get() : true;
+        set_pages_set(!current ? 1 : 0);
         return;
     }
 
@@ -6018,7 +6143,7 @@ function handleSelect() {
                     helpDetailScrollState = createScrollableText({
                         lines: item.lines,
                         actionLabel: "Back",
-                        visibleLines: 3,
+                        visibleLines: 4,
                         onActionSelected: (label) => announce(label)
                     });
                     needsRedraw = true;
@@ -6635,7 +6760,7 @@ function handleSelect() {
                     helpDetailScrollState = createScrollableText({
                         lines: item.lines,
                         actionLabel: "Back",
-                        visibleLines: 3,
+                        visibleLines: 4,
                         onActionSelected: (label) => announce(label)
                     });
                     needsRedraw = true;
@@ -7116,11 +7241,17 @@ function drawSlots() {
      * Show asterisk (*) before patch name for track-selected slot (playing/knob control)
      * Use leading space for non-selected to maintain alignment */
     const items = [
-        ...slots.map((s, i) => ({
-            label: (i === trackSelectedSlot ? "*" : " ") + (slotDirtyCache[i] ? "*" : "") + (s.name || "Unknown Patch"),
-            value: s.channel === 0 ? "All" : `Ch${s.channel}`,
-            isSlot: true
-        })),
+        ...slots.map((s, i) => {
+            const muted = getSlotParam(i, "slot:muted") === "1";
+            const soloed = getSlotParam(i, "slot:soloed") === "1";
+            const flags = (muted ? "M" : "") + (soloed ? "S" : "");
+            const prefix = (i === trackSelectedSlot ? "*" : " ") + (slotDirtyCache[i] ? "*" : "");
+            return {
+                label: prefix + (s.name || "Unknown Patch"),
+                value: flags || (s.channel === 0 ? "All" : `Ch${s.channel}`),
+                isSlot: true
+            };
+        }),
         { label: " Master FX", value: getMasterFxDisplayName(), isSlot: false }
     ];
 
@@ -7191,9 +7322,9 @@ function drawSlotSettings() {
     }
 
     if (editingSettingValue) {
-        drawFooter("Jog: adjust  Click: done");
+        drawFooter({left: "Click: done", right: "Jog: adjust"});
     } else {
-        drawFooter("Click: edit  Back: slots");
+        drawFooter({left: "Back: slots", right: "Click: edit"});
     }
 }
 
@@ -7216,7 +7347,7 @@ function drawPatches() {
                 return isCurrent ? `* ${item.name}` : item.name;
             }
         });
-        drawFooter("Click: load  Back: settings");
+        drawFooter({left: "Back: settings", right: "Click: load"});
     }
 }
 
@@ -7259,7 +7390,7 @@ function drawPatchDetail() {
         }
     }
 
-    drawFooter("Click: edit  Back: list");
+    drawFooter({left: "Back: list", right: "Click: edit"});
 }
 
 function drawComponentParams() {
@@ -7311,9 +7442,9 @@ function drawComponentParams() {
     }
 
     if (editingValue) {
-        drawFooter("Jog: adjust  Click: done");
+        drawFooter({left: "Click: done", right: "Jog: adjust"});
     } else {
-        drawFooter("Click: edit  Back: detail");
+        drawFooter({left: "Back: detail", right: "Click: edit"});
     }
 }
 
@@ -7460,7 +7591,7 @@ function drawStorePickerCategories() {
         getValue: (item) => item.value || ''
     });
 
-    drawFooter('Back:return  Jog:browse');
+    drawFooter({left: "Back: return", right: "Jog: browse"});
 }
 
 /* Draw store picker module list */
@@ -7507,7 +7638,7 @@ function drawStorePickerList() {
         getValue: (item) => item.statusIcon
     });
 
-    drawFooter('Back:return  Jog:browse');
+    drawFooter({left: "Back: return", right: "Jog: browse"});
 }
 
 /* Draw store picker loading screen */
@@ -7779,9 +7910,7 @@ function drawComponentEdit() {
     }
 
     /* Show hint at bottom */
-    const hint = "Jog: preset  Back: done";
-    const hintX = Math.floor((SCREEN_WIDTH - hint.length * 5) / 2);
-    print(hintX, 56, hint, 1);
+    drawFooter({left: "Back: done", right: "Jog: preset"});
 }
 
 /* Draw chain settings view */
@@ -7932,7 +8061,7 @@ function drawKnobEditor() {
         }
     }
 
-    drawFooter("Click: edit  Back: cancel");
+    drawFooter({left: "Back: cancel", right: "Click: edit"});
 }
 
 /* Draw param picker - select target then param for knob assignment */
@@ -7953,7 +8082,7 @@ function drawKnobParamPicker() {
             getValue: () => ""
         });
 
-        drawFooter("Click: select  Back: cancel");
+        drawFooter({left: "Back: cancel", right: "Click: select"});
     } else if (knobParamPickerHierarchy && knobParamPickerLevel) {
         /* Hierarchy mode - show current level */
         const levelDef = knobParamPickerHierarchy.levels[knobParamPickerLevel];
@@ -7969,7 +8098,7 @@ function drawKnobParamPicker() {
         });
 
         const hasNav = knobParamPickerParams.some(p => p.type === "nav");
-        drawFooter(hasNav ? "Click: select  Back: up" : "Click: assign  Back: up");
+        drawFooter(hasNav ? {left: "Back: up", right: "Click: select"} : {left: "Back: up", right: "Click: assign"});
     } else {
         /* Flat mode - show params for selected target */
         drawHeader(`Knob ${knobNum} Param`);
@@ -7987,7 +8116,7 @@ function drawKnobParamPicker() {
             getValue: () => ""
         });
 
-        drawFooter("Click: assign  Back: targets");
+        drawFooter({left: "Back: targets", right: "Click: assign"});
     }
 }
 
@@ -8100,11 +8229,16 @@ function drawHelpDetail() {
     if (helpDetailScrollState) {
         drawScrollableText({
             state: helpDetailScrollState,
-            topY: 16,
-            bottomY: 43,
-            actionY: 52
+            topY: LIST_TOP_Y,
+            bottomY: FOOTER_RULE_Y,
+            actionY: -1
         });
     }
+
+    const backTarget = helpNavStack.length > 1
+        ? helpNavStack[helpNavStack.length - 2].title
+        : "Settings";
+    drawFooter("Back: " + backTarget);
 }
 
 /* ========== End Master Preset Draw Functions ========== */
@@ -8313,7 +8447,7 @@ function drawMasterFxModuleSelect() {
             return item.id === currentModule ? "*" : "";
         }
     });
-    drawFooter("Click: apply  Back: cancel");
+    drawFooter({left: "Back: cancel", right: "Click: apply"});
 }
 
 globalThis.init = function() {
@@ -8342,6 +8476,11 @@ globalThis.init = function() {
     /* Note: Jump-to-slot check moved to first tick() to avoid race condition */
 
     /* Auto-update check is manual only (Settings → Updates → Check Updates) */
+
+    /* Process any HTML left by a prior background download, then kick off
+     * a new background download if the cache is stale. Both are non-blocking. */
+    try { processDownloadedHtml(); } catch (e) { debugLog("Manual process: " + e); }
+    try { refreshManualBackground(); } catch (e) { debugLog("Manual refresh: " + e); }
 
     /* Read active set UUID to point autosave at the correct per-set directory.
      * File format: line 1 = UUID, line 2 = set name */
@@ -8381,6 +8520,15 @@ globalThis.init = function() {
     /* Announce initial view + selection */
     const slotName = slots[selectedSlot]?.name || "Unknown";
     announce(`Slots Menu, S${selectedSlot + 1} ${slotName}`);
+};
+
+/* Called by shadow_ui.c during controlled exits (restart/shutdown paths)
+ * to guarantee one final persistence flush before process termination. */
+globalThis.shadow_save_state_now = function() {
+    autosaveAllSlots();
+    saveMasterFxChainConfig();
+    debugLog("shadow_save_state_now: flushed set state before exit");
+    return true;
 };
 
 globalThis.tick = function() {
@@ -8482,6 +8630,11 @@ globalThis.tick = function() {
                 ? "/data/UserData/move-anything/set_state/" + uuid
                 : SLOT_STATE_DIR_DEFAULT;
 
+            if (uuid && typeof host_ensure_dir === "function") {
+                host_ensure_dir("/data/UserData/move-anything/set_state");
+                host_ensure_dir(newDir);
+            }
+
             /* 4. First visit to this set: seed its state directory.
              *    Batch migration (shim boot) already copied default state to all existing sets.
              *    Here we only handle: (a) duplicated sets, (b) newly created sets (start clean). */
@@ -8514,27 +8667,39 @@ globalThis.tick = function() {
             activeSlotStateDir = newDir;
             debugLog("SET_CHANGED: " + oldDir + " -> " + newDir);
 
-            /* 6. Reload all chain slots from new directory.
-             *    IMPORTANT: We use setSlotParam (synchronous) to clear slots,
-             *    NOT shadow_request_patch which is a single-item queue and
-             *    can only process one slot per tick. */
+            /* 6. Two-pass reload: clear ALL old slots first (freeing memory),
+             *    then load new slots. This reduces peak memory when switching
+             *    between sets with heavy synths. */
+
+            /* Pass 1: Clear all slots to free memory before loading anything new */
+            debugLog("SET_CHANGED: pass 1 — clearing all slots");
+            for (let i = 0; i < SHADOW_UI_SLOTS; i++) {
+                setSlotParamWithTimeout(i, "clear", "", 1500);
+            }
+
+            /* Pass 2: Load new state for non-empty slots */
+            debugLog("SET_CHANGED: pass 2 — loading new slot states");
             for (let i = 0; i < SHADOW_UI_SLOTS; i++) {
                 const path = activeSlotStateDir + "/slot_" + i + ".json";
-                let loaded = false;
                 if (host_file_exists(path)) {
                     const raw = host_read_file(path);
-                    /* Only load if file has content beyond empty marker */
+                    /* Non-empty state: try load_file with extended timeout + retry. */
                     if (raw && raw.length > 10) {
-                        setSlotParam(i, "load_file", path);
-                        loaded = true;
+                        let loadOk = setSlotParamWithTimeout(i, "load_file", path, 1500);
+                        if (!loadOk) {
+                            debugLog("SET_CHANGED: load_file timeout slot " + (i + 1) + " path " + path + " (retry)");
+                            loadOk = setSlotParamWithTimeout(i, "load_file", path, 3000);
+                        }
+                        if (loadOk) {
+                            debugLog("SET_CHANGED: slot " + (i + 1) + " loaded");
+                        } else {
+                            debugLog("SET_CHANGED: slot " + (i + 1) + " not restored (load timeout)");
+                        }
+                    } else {
+                        debugLog("SET_CHANGED: slot " + (i + 1) + " empty state (already cleared)");
                     }
-                }
-                if (!loaded) {
-                    /* Clear the slot synchronously by unloading each component */
-                    setSlotParam(i, "synth:module", "");
-                    setSlotParam(i, "midi_fx1:module", "");
-                    setSlotParam(i, "fx1:module", "");
-                    setSlotParam(i, "fx2:module", "");
+                } else {
+                    debugLog("SET_CHANGED: slot " + (i + 1) + " no state file (already cleared)");
                 }
             }
 
@@ -8752,6 +8917,19 @@ globalThis.tick = function() {
         drawSkipbackToast();
         if (typeof shadow_set_display_overlay === "function") {
             shadow_set_display_overlay(1, 9, 22, 110, 20);
+        }
+        return;
+    }
+
+    /* Set page toast - render to shadow display, request rect overlay on native */
+    if (overlayState && overlayState.type === OVERLAY_SET_PAGE &&
+        overlayState.setPageActive && overlayState.setPageTimeout > 0) {
+        clear_screen();
+        drawSetPageToast(overlayState);
+        if (typeof shadow_set_display_overlay === "function") {
+            shadow_set_display_overlay(1,
+                SET_PAGE_BOX_X, SET_PAGE_BOX_Y,
+                SET_PAGE_BOX_W, SET_PAGE_BOX_H);
         }
         return;
     }
