@@ -6,25 +6,32 @@ import { getMenuLabelScroller } from './text_scroll.mjs';
 import { announceMenuItem, announceParameter } from './screen_reader.mjs';
 import { truncateText } from './chain_ui_views.mjs';
 
-const SCREEN_WIDTH = 128;
-const SCREEN_HEIGHT = 64;
-const TITLE_Y = 2;
-const TITLE_RULE_Y = 12;
-const LIST_TOP_Y = 15;
-const LIST_LINE_HEIGHT = 11;
-const LIST_HIGHLIGHT_HEIGHT = LIST_LINE_HEIGHT + 2;
-const LIST_HIGHLIGHT_OFFSET = 0;
-const LIST_LABEL_X = 4;
-const LIST_VALUE_X = 75;
-const LIST_MAX_VISIBLE = 5;
-const LIST_INDICATOR_X = 120;
-const LIST_INDICATOR_BOTTOM_Y = SCREEN_HEIGHT - 2;
-const FOOTER_TEXT_Y = SCREEN_HEIGHT - 11;
-const FOOTER_RULE_Y = FOOTER_TEXT_Y - 1;
-const LIST_BOTTOM_WITH_FOOTER = FOOTER_RULE_Y - 1;
-const DEFAULT_CHAR_WIDTH = 6;
-const DEFAULT_LABEL_GAP = 6;
-const DEFAULT_VALUE_PADDING_RIGHT = 2;
+/* Screen dimensions */
+export const SCREEN_WIDTH = 128;
+export const SCREEN_HEIGHT = 64;
+
+/* Header and footer positioning */
+export const TITLE_Y = 2;
+export const TITLE_RULE_Y = 12;
+export const FOOTER_TEXT_Y = SCREEN_HEIGHT - 7;
+export const FOOTER_RULE_Y = FOOTER_TEXT_Y - 2;
+
+/* List rendering */
+export const LIST_TOP_Y = 15;
+export const LIST_LINE_HEIGHT = 9;                      // 5x7px font + 2px spacing
+export const LIST_HIGHLIGHT_HEIGHT = LIST_LINE_HEIGHT;
+export const LIST_HIGHLIGHT_OFFSET = 1;                 // Shift rect up 1px to vertically center
+export const LIST_LABEL_X = 4;
+export const LIST_VALUE_X = 92;
+export const LIST_MAX_VISIBLE = 5;
+export const LIST_INDICATOR_X = 120;
+export const LIST_INDICATOR_BOTTOM_Y = SCREEN_HEIGHT - 2;
+export const LIST_BOTTOM_WITH_FOOTER = FOOTER_RULE_Y - 1;
+
+/* Text rendering */
+export const DEFAULT_CHAR_WIDTH = 6;
+export const DEFAULT_LABEL_GAP = 6;
+export const DEFAULT_VALUE_PADDING_RIGHT = 2;
 
 /* Screen reader state - track last announced item to avoid redundant announcements */
 let lastAnnouncedIndex = -1;
@@ -34,7 +41,8 @@ export function drawMenuHeader(title, titleRight = "") {
     print(2, TITLE_Y, title, 1);
 
     if (titleRight) {
-        const rightX = SCREEN_WIDTH - (titleRight.length * DEFAULT_CHAR_WIDTH) - 2;
+        const rightW = (typeof text_width === 'function') ? text_width(titleRight) : (titleRight.length * DEFAULT_CHAR_WIDTH);
+        const rightX = SCREEN_WIDTH - rightW - 2;
         print(Math.max(2, rightX), TITLE_Y, titleRight, 1);
     }
 
@@ -42,8 +50,16 @@ export function drawMenuHeader(title, titleRight = "") {
 }
 
 export function drawMenuFooter(text, y = FOOTER_TEXT_Y) {
-    if (text) {
-        fill_rect(0, FOOTER_RULE_Y, SCREEN_WIDTH, 1, 1);
+    if (!text) return;
+    fill_rect(0, FOOTER_RULE_Y, SCREEN_WIDTH, 1, 1);
+    if (typeof text === 'object' && text.left !== undefined) {
+        /* { left: "Back: exit", right: "Jog: browse" } */
+        print(2, y, text.left, 1);
+        if (text.right) {
+            const rightW = (typeof text_width === 'function') ? text_width(text.right) : (text.right.length * DEFAULT_CHAR_WIDTH);
+            print(SCREEN_WIDTH - rightW - 2, y, text.right, 1);
+        }
+    } else {
         print(2, y, text, 1);
     }
 }
@@ -167,7 +183,7 @@ export function drawMenuList({
                 const displayValue = editMode ? `[${value}]` : value;
                 /* When valueAlignRight and editMode, shift left to account for added brackets */
                 const editValueX = (editMode && valueAlignRight)
-                    ? resolvedValueX - (2 * DEFAULT_CHAR_WIDTH)  /* Shift left for both brackets */
+                    ? resolvedValueX - (1 * DEFAULT_CHAR_WIDTH)  /* Shift left for right bracket */
                     : resolvedValueX;
                 print(editValueX, y, displayValue, 0);
             }

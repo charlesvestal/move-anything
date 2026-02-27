@@ -4,8 +4,8 @@
     "name": "Move Anything",
     "github_repo": "charlesvestal/move-anything",
     "asset_name": "move-anything.tar.gz",
-    "latest_version": "0.5.2",
-    "download_url": "https://github.com/charlesvestal/move-anything/releases/download/v0.5.2/move-anything.tar.gz",
+    "latest_version": "0.5.10",
+    "download_url": "https://github.com/charlesvestal/move-anything/releases/download/v0.5.10/move-anything.tar.gz",
     "min_host_version": "0.1.0"
   },
   "modules": [
@@ -321,18 +321,7 @@
       "github_repo": "handcraftedcc/move-anything-superarp",
       "default_branch": "main",
       "asset_name": "superarp-module.tar.gz",
-      "min_host_version": "0.3.0"
-    },
-    {
-	  "id": "eucalypso",
-	  "name": "Eucalypso",
-	  "description": "Deterministic 4-lane Euclidean MIDI sequencer with held/scale note registers, retrigger modes, and seeded modulation",
-	  "author": "dom",
-	  "component_type": "midi_fx",
-	  "github_repo": "handcraftedcc/move-anything-eucalypso",
-	  "default_branch": "main",
-	  "asset_name": "eucalypso-module.tar.gz",
-	  "min_host_version": "0.3.0"
+      "min_host_version": "0.5.8"
     },
     {
       "id": "rex",
@@ -345,6 +334,39 @@
       "asset_name": "rex-module.tar.gz",
       "min_host_version": "0.3.0",
       "requires": ".rx2/.rex loop files (created with Propellerhead ReCycle)"
+    },
+    {
+      "id": "hush1",
+      "name": "HUSH ONE",
+      "description": "Monophonic subtractive synthesizer emulating the Roland SH-101",
+      "author": "Move Everything Community",
+      "component_type": "sound_generator",
+      "github_repo": "charlesvestal/move-anything-hush1",
+      "default_branch": "main",
+      "asset_name": "hush1-module.tar.gz",
+      "min_host_version": "0.3.0"
+    },
+    {
+      "id": "nusaw",
+      "name": "NuSaw",
+      "description": "Polyphonic detuned multi-saw synthesizer with resonant filter, dual envelopes, chorus, and delay",
+      "author": "charlesvestal",
+      "component_type": "sound_generator",
+      "github_repo": "charlesvestal/move-anything-nusaw",
+      "default_branch": "main",
+      "asset_name": "nusaw-module.tar.gz",
+      "min_host_version": "0.3.0"
+    },
+    {
+      "id": "usefulity",
+      "name": "Usefulity",
+      "description": "Stereo utility - channel select, width, bass mono, gain, pan, phase, mute, DC filter",
+      "author": "charlesvestal",
+      "component_type": "audio_fx",
+      "github_repo": "charlesvestal/move-anything-usefulity",
+      "default_branch": "main",
+      "asset_name": "usefulity-module.tar.gz",
+      "min_host_version": "0.3.0"
     }
   ]
 }

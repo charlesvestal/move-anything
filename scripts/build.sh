@@ -29,6 +29,14 @@ if [ -z "$CROSS_PREFIX" ] && [ ! -f "/.dockerenv" ]; then
         echo ""
     fi
 
+    # Fetch Move Manual on host (Docker has no network access)
+    echo "Fetching Move Manual..."
+    if ./scripts/fetch_move_manual.sh 2>/dev/null && [ -f ".cache/move_manual.json" ]; then
+        echo "Move Manual fetched ($(wc -c < .cache/move_manual.json) bytes)"
+    else
+        echo "Warning: Could not fetch Move Manual - will use existing cache if available"
+    fi
+
     # Run build inside container
     echo "Running build..."
     docker run --rm \
@@ -91,7 +99,7 @@ fi
 if [ ! -f "./libs/quickjs/quickjs-2025-04-26/libquickjs.a" ]; then
     echo "QuickJS static library not found, building it..."
     make -C ./libs/quickjs/quickjs-2025-04-26 clean >/dev/null 2>&1 || true
-    CC="${CROSS_PREFIX}gcc" make -C ./libs/quickjs/quickjs-2025-04-26 libquickjs.a
+    CC="${CROSS_PREFIX}gcc" AR="${CROSS_PREFIX}ar" make -C ./libs/quickjs/quickjs-2025-04-26 libquickjs.a
 fi
 
 # Clean and prepare
@@ -101,6 +109,10 @@ mkdir -p ./build/host/
 mkdir -p ./build/shared/
 # Module directories are created automatically when copying files
 # External modules (sf2, dexed, m8, minijv, obxd, clap) are in separate repos
+
+# Generate bitmap font for host display (single source of truth: scripts/generate_font.py)
+echo "Generating host bitmap font..."
+python3 scripts/generate_font.py --deploy-png build/host/font.png
 
 if [ "$SCREEN_READER_ENABLED" = "1" ]; then
     echo "Screen reader build: enabled (dual engine: eSpeak-NG + Flite)"
@@ -128,13 +140,26 @@ echo "Building host..."
     -Isrc -Isrc/lib \
     -Ilibs/quickjs/quickjs-2025-04-26 \
     -Llibs/quickjs/quickjs-2025-04-26 \
-    -lquickjs -lm -ldl
+    -lquickjs -lm -ldl -lrt -lpthread
 
 # Build shim (with shared memory support for shadow instrument)
 # D-Bus/TTS are optional and can be disabled with DISABLE_SCREEN_READER=1
 "${CROSS_PREFIX}gcc" -g3 -shared -fPIC \
     -o build/move-anything-shim.so \
     src/move_anything_shim.c \
+    src/host/shadow_sampler.c \
+    src/host/shadow_set_pages.c \
+    src/host/shadow_dbus.c \
+    src/host/shadow_chain_mgmt.c \
+    src/host/shadow_link_audio.c \
+    src/host/shadow_process.c \
+    src/host/shadow_resample.c \
+    src/host/shadow_overlay.c \
+    src/host/shadow_pin_scanner.c \
+    src/host/shadow_led_queue.c \
+    src/host/shadow_fd_trace.c \
+    src/host/shadow_state.c \
+    src/host/shadow_midi.c \
     src/host/unified_log.c \
     $SHIM_TTS_SRC \
     $SHIM_DEFINES \
@@ -171,7 +196,7 @@ echo "Building Shadow UI..."
     -Isrc -Isrc/lib \
     -Ilibs/quickjs/quickjs-2025-04-26 \
     -Llibs/quickjs/quickjs-2025-04-26 \
-    -lquickjs -lm -ldl -lrt
+    -lquickjs -lm -ldl -lrt -lpthread
 
 # Build Link Audio subscriber (C++17, requires Link SDK)
 if [ -d "./libs/link/include/ableton" ]; then
@@ -319,12 +344,19 @@ mkdir -p ./build/modules/sound_generators/linein/
     -Isrc \
     -lm
 
-# Copy shared utilities (exclude parse_move_manual.mjs — not for distribution)
+# Copy shared utilities
 for f in ./src/shared/*.mjs; do
-    case "$f" in *parse_move_manual*) continue ;; esac
     cp "$f" ./build/shared/
 done
 cp ./src/shared/*.json ./build/shared/ 2>/dev/null || true
+
+# Bundle Move Manual (fetched on host before Docker, or from prior build)
+if [ -f ".cache/move_manual.json" ]; then
+    cp .cache/move_manual.json ./build/shared/move_manual_bundled.json
+    echo "Bundled Move Manual ($(wc -c < .cache/move_manual.json) bytes)"
+else
+    echo "Warning: .cache/move_manual.json not found - no bundled manual"
+fi
 
 # Copy host files
 cp ./src/host/menu_ui.js ./build/host/
@@ -360,7 +392,10 @@ echo "Copying patches..."
 mkdir -p ./build/patches
 cp -r ./src/patches/*.json ./build/patches/ 2>/dev/null || true
 
-# Copy master presets directory
+# Copy track presets (ME Slot templates for Move's preset browser)
+echo "Copying track presets..."
+mkdir -p ./build/presets/track_presets
+cp ./src/presets/track_presets/*.json ./build/presets/track_presets/ 2>/dev/null || true
 
 # Copy curl binary for store module (if present)
 if [ -f "./libs/curl/curl" ]; then
