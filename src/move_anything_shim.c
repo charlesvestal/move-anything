@@ -10580,9 +10580,14 @@ static void launch_link_subscriber(void)
     if (pid < 0) return;
     if (pid == 0) {
         setsid();
-        /* Redirect stdout/stderr to log file before closing fds */
-        freopen("/tmp/link-subscriber.log", "w", stdout);
-        freopen("/tmp/link-subscriber.log", "a", stderr);
+        int null_fd = open("/dev/null", O_WRONLY);
+        if (null_fd >= 0) {
+            dup2(null_fd, STDOUT_FILENO);
+            dup2(null_fd, STDERR_FILENO);
+            if (null_fd > STDERR_FILENO) {
+                close(null_fd);
+            }
+        }
         int fdlimit = (int)sysconf(_SC_OPEN_MAX);
         for (int i = STDERR_FILENO + 1; i < fdlimit; i++) {
             close(i);
