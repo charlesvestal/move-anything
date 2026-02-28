@@ -467,6 +467,12 @@ typedef struct chain_instance {
     /* When set, render_block outputs raw synth only (no inject mix, no FX).
      * The shim calls chain_process_fx() separately for same-frame FX. */
     int external_fx_mode;
+
+    /* Buffered MIDI FX tick output for shim consumption.
+     * tick() output is always copied here in addition to being sent to
+     * the synth (if loaded). The shim reads via midi_fx_tick_output get_param. */
+    uint8_t midi_fx_tick_buf[MIDI_FX_MAX_OUT_MSGS][3];
+    int midi_fx_tick_count;
 } chain_instance_t;
 
 /* ============================================================================
@@ -1485,9 +1491,14 @@ static int v2_process_midi_fx(chain_instance_t *inst,
     return out_count;
 }
 
-/* Call tick on all MIDI FX modules and send generated messages to synth */
+/* Call tick on all MIDI FX modules and send generated messages to synth.
+ * Also buffers output in inst->midi_fx_tick_buf for the shim to read
+ * via the midi_fx_tick_output get_param handler. */
 static void v2_tick_midi_fx(chain_instance_t *inst, int frames) {
     if (!inst) return;
+
+    /* Clear tick buffer for this frame */
+    inst->midi_fx_tick_count = 0;
 
     for (int fx = 0; fx < inst->midi_fx_count; fx++) {
         midi_fx_api_v1_t *api = inst->midi_fx_plugins[fx];
@@ -1505,6 +1516,12 @@ static void v2_tick_midi_fx(chain_instance_t *inst, int frames) {
                 inst->synth_plugin_v2->on_midi(inst->synth_instance, out_msgs[i], out_lens[i], 0);
             } else if (inst->synth_plugin && inst->synth_plugin->on_midi) {
                 inst->synth_plugin->on_midi(out_msgs[i], out_lens[i], 0);
+            }
+            /* Buffer for shim consumption */
+            if (inst->midi_fx_tick_count < MIDI_FX_MAX_OUT_MSGS) {
+                memcpy(inst->midi_fx_tick_buf[inst->midi_fx_tick_count],
+                       out_msgs[i], 3);
+                inst->midi_fx_tick_count++;
             }
         }
     }
@@ -6386,6 +6403,22 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
             off += snprintf(buf + off, buf_len - off, "%02X %02X %02X",
                             out_msgs[i][0], out_msgs[i][1], out_msgs[i][2]);
         }
+        return off;
+    }
+    /* Return buffered MIDI FX tick output (time-based effects: strum, arp).
+     * Output format same as midi_fx_process. Clears the buffer after reading.
+     * Called by the shim each frame to pick up delayed/generated notes. */
+    if (strcmp(key, "midi_fx_tick_output") == 0) {
+        if (inst->midi_fx_tick_count <= 0) return snprintf(buf, buf_len, "");
+        int off = 0;
+        for (int i = 0; i < inst->midi_fx_tick_count && off < buf_len - 12; i++) {
+            if (i > 0) off += snprintf(buf + off, buf_len - off, ",");
+            off += snprintf(buf + off, buf_len - off, "%02X %02X %02X",
+                            inst->midi_fx_tick_buf[i][0],
+                            inst->midi_fx_tick_buf[i][1],
+                            inst->midi_fx_tick_buf[i][2]);
+        }
+        inst->midi_fx_tick_count = 0;  /* Clear after reading */
         return off;
     }
     /* Master preset queries */
