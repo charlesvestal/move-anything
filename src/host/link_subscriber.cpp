@@ -31,10 +31,14 @@
 #include <thread>
 #include <vector>
 
+#include "unified_log.h"
+
 static std::atomic<bool> g_running{true};
 static std::atomic<bool> g_reconnect_requested{false};
 
 static const char *TEMPO_FILE = "/data/UserData/move-anything/link-audio-tempo";
+
+#define LINK_SUB_LOG_SOURCE "link_subscriber"
 
 /* Channel IDs discovered via callback — processed in main loop */
 struct PendingChannel {
@@ -135,20 +139,21 @@ int main()
     std::signal(SIGUSR1, signal_handler);
     std::signal(SIGUSR2, signal_handler);
 
-    setvbuf(stdout, NULL, _IOLBF, 0);
+    unified_log_init();
 
     if (!is_link_audio_enabled()) {
+        unified_log_shutdown();
         return 0;
     }
 
-    printf("link-subscriber: starting (always-active mode)\n");
+    LOG_INFO(LINK_SUB_LOG_SOURCE, "starting (no-session-join mode)");
 
     write_pid_file();
 
     /* Wait for Move to be running before joining Link — if we create the
      * session first, our initial tempo overwrites Move's project tempo.
      * By waiting, Move creates the session and we adopt its tempo. */
-    printf("link-subscriber: waiting for Move to start...\n");
+    LOG_INFO(LINK_SUB_LOG_SOURCE, "waiting for Move to start...");
     for (int wait = 0; wait < 60 && g_running; wait++) {
         FILE *p = popen("pgrep -f MoveOriginal", "r");
         if (p) {
@@ -156,7 +161,7 @@ int main()
             bool found = (fgets(buf, sizeof(buf), p) != nullptr);
             pclose(p);
             if (found) {
-                printf("link-subscriber: Move detected, waiting 5s for Link init...\n");
+                LOG_INFO(LINK_SUB_LOG_SOURCE, "Move detected, waiting 5s for Link init...");
                 std::this_thread::sleep_for(std::chrono::seconds(5));
                 break;
             }
@@ -167,10 +172,10 @@ int main()
     /* Read project tempo from shim's tempo file, fall back to 120 BPM */
     double initial_tempo = read_tempo_file();
     if (initial_tempo <= 0) initial_tempo = 120.0;
-    printf("link-subscriber: initial tempo = %.1f BPM\n", initial_tempo);
+    LOG_INFO(LINK_SUB_LOG_SOURCE, "initial tempo = %.1f BPM", initial_tempo);
 
-    /* Create Link instance — always enabled, shim handles quantum avoidance
-     * by filtering ALIVEs in its recvfrom hook while transport is stopped */
+    /* Create Link instance — no-session-join subscriber stays in different
+     * session so Move sees numPeers=0, avoiding quantum sync delay */
     ableton::LinkAudio link(initial_tempo, "ME-Sub");
     link.enable(true);
     link.enableLinkAudio(true);
@@ -182,7 +187,7 @@ int main()
      * with channels is received.  Without this, forPeer() returns nullopt
      * and audio is silently never sent. */
     ableton::LinkAudioSink dummySink(link, "ME-Sub-Ack", 256);
-    printf("link-subscriber: dummy sink created (triggers peer announcement)\n");
+    LOG_INFO(LINK_SUB_LOG_SOURCE, "dummy sink created (triggers peer announcement)");
 
     /* Callback records channel IDs — source creation deferred to main loop
      * because LinkAudioSource constructor isn't safe from the callback thread. */
@@ -196,11 +201,11 @@ int main()
             }
         }
         g_channels_changed = true;
-        printf("link-subscriber: discovered %zu Move channels\n",
-               g_pending_channels.size());
+        LOG_INFO(LINK_SUB_LOG_SOURCE, "discovered %zu Move channels",
+                 g_pending_channels.size());
     });
 
-    printf("link-subscriber: waiting for channel discovery...\n");
+    LOG_INFO(LINK_SUB_LOG_SOURCE, "waiting for channel discovery...");
 
     /* Active sources — managed in main loop only */
     std::vector<ableton::LinkAudioSource> sources;
@@ -235,15 +240,15 @@ int main()
 
             /* Destroy old sources first */
             sources.clear();
-            printf("link-subscriber: cleared old sources\n");
+            LOG_INFO(LINK_SUB_LOG_SOURCE, "cleared old sources");
 
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
             sources.reserve(pending.size());
 
             for (const auto& pc : pending) {
-                printf("link-subscriber: subscribing to %s/%s...\n",
-                       pc.peerName.c_str(), pc.name.c_str());
+                LOG_INFO(LINK_SUB_LOG_SOURCE, "subscribing to %s/%s...",
+                         pc.peerName.c_str(), pc.name.c_str());
 
                 try {
                     sources.emplace_back(link, pc.id,
@@ -252,29 +257,34 @@ int main()
                              * to trigger Move's audio flow.  Counting or touching
                              * the buffer wastes CPU on this constrained device. */
                         });
-                    printf("link-subscriber: OK\n");
+                    LOG_INFO(LINK_SUB_LOG_SOURCE, "subscription OK");
                 } catch (const std::exception& e) {
-                    printf("link-subscriber: ERROR: %s\n", e.what());
+                    LOG_ERROR(LINK_SUB_LOG_SOURCE, "subscription failed: %s", e.what());
                 } catch (...) {
-                    printf("link-subscriber: ERROR (unknown)\n");
+                    LOG_ERROR(LINK_SUB_LOG_SOURCE, "subscription failed: unknown error");
                 }
 
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
 
-            printf("link-subscriber: %zu sources active\n", sources.size());
+            LOG_INFO(LINK_SUB_LOG_SOURCE, "%zu sources active", sources.size());
         }
 
-        /* Log numPeers every 50 ticks (5 seconds at 100ms interval) */
-        if (tick % 50 == 0) {
-            printf("link-subscriber: tick=%d peers=%zu sources=%zu\n",
-                   tick, link.numPeers(), sources.size());
+        /* Log buffer count every 30 seconds */
+        if (tick % 60 == 0) {
+            uint64_t count = g_buffers_received.load(std::memory_order_relaxed);
+            if (count != last_count) {
+                LOG_INFO(LINK_SUB_LOG_SOURCE, "%llu audio buffers received, peers=%zu sources=%zu",
+                         (unsigned long long)count, link.numPeers(), sources.size());
+                last_count = count;
+            }
         }
     }
 
     sources.clear();
     remove_pid_file();
-    printf("link-subscriber: shutting down (%llu total buffers)\n",
-           (unsigned long long)g_buffers_received.load());
+    LOG_INFO(LINK_SUB_LOG_SOURCE, "shutting down (%llu total buffers)",
+             (unsigned long long)g_buffers_received.load());
+    unified_log_shutdown();
     return 0;
 }
