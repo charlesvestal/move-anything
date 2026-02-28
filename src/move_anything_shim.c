@@ -6679,6 +6679,14 @@ static int shadow_midi_fx_rewrite(uint8_t *sh_midi)
     int transform_slot = shadow_move_transform_slot();
     int has_midi_fx = (transform_slot >= 0) ? shadow_slot_has_midi_fx(transform_slot) : 0;
 
+    /* Force transform slot out of idle gate when MIDI FX needs tick().
+     * The idle gate skips render_block (and therefore tick) for silent slots,
+     * which starves time-based MIDI FX like arp and strum. */
+    if (has_midi_fx && transform_slot >= 0 && transform_slot < SHADOW_CHAIN_INSTANCES) {
+        shadow_slot_idle[transform_slot] = 0;
+        shadow_slot_silence_frames[transform_slot] = 0;
+    }
+
     int log_on = shadow_midi_fx_log_enabled();
     int mode = shadow_midi_fx_mode();
     int modified = 0;
@@ -6785,8 +6793,6 @@ static int shadow_midi_fx_rewrite(uint8_t *sh_midi)
                 transform_slot, status, note, vel,
                 out_notes, out_vels, SHADOW_MIDI_FX_OUT_MAX);
 
-            if (out_count <= 0) continue;  /* MIDI FX returned nothing, pass through */
-
             /* Find a free slot in held table */
             int hi = -1;
             for (int i = 0; i < SHADOW_MIDI_FX_HELD_MAX; i++) {
@@ -6794,19 +6800,22 @@ static int shadow_midi_fx_rewrite(uint8_t *sh_midi)
             }
             if (hi < 0) continue;  /* Table full, pass note through unchanged */
 
-            /* Block the original cable-0 pad note */
+            /* ALWAYS block the original cable-0 pad note when MIDI FX is active.
+             * Even if process_midi returned 0 (arp stores note for tick output),
+             * the original must not reach Move's native synth. */
             sh_midi[j]     = 0;
             sh_midi[j + 1] = 0;
             sh_midi[j + 2] = 0;
             sh_midi[j + 3] = 0;
 
-            /* Record held note and all output notes */
+            /* Record held note — needed even when out_count=0 (arp/strum)
+             * so that note-off is properly blocked and forwarded to MIDI FX. */
             shadow_midi_fx_held[hi].active = 1;
             shadow_midi_fx_held[hi].root_note = note;
             shadow_midi_fx_held[hi].channel = ch;
             shadow_midi_fx_held[hi].extra_count = 0;
 
-            /* Queue all MIDI FX output notes */
+            /* Queue any immediate MIDI FX output notes */
             for (int i = 0; i < out_count; i++) {
                 shadow_midi_fx_queue_push(out_notes[i], out_vels[i], ch);
                 /* Track non-root notes for note-off cleanup */
@@ -6820,7 +6829,7 @@ static int shadow_midi_fx_rewrite(uint8_t *sh_midi)
             if (log_on) {
                 char dbg[256];
                 snprintf(dbg, sizeof(dbg),
-                         "move-midifx FX ON root=%d ch=%d -> %d outputs q=%d",
+                         "move-midifx FX ON root=%d ch=%d -> %d immediate q=%d",
                          note, ch, out_count, shadow_midi_fx_queue_count());
                 shadow_log(dbg);
             }
@@ -6833,16 +6842,12 @@ static int shadow_midi_fx_rewrite(uint8_t *sh_midi)
                 out_notes, out_vels, SHADOW_MIDI_FX_OUT_MAX);
 
             /* Find held entry for this root note */
+            int found_held = 0;
             for (int i = 0; i < SHADOW_MIDI_FX_HELD_MAX; i++) {
                 if (!shadow_midi_fx_held[i].active) continue;
                 if (shadow_midi_fx_held[i].root_note != note) continue;
                 if (shadow_midi_fx_held[i].channel != ch) continue;
-
-                /* Block the original cable-0 pad note-off */
-                sh_midi[j]     = 0;
-                sh_midi[j + 1] = 0;
-                sh_midi[j + 2] = 0;
-                sh_midi[j + 3] = 0;
+                found_held = 1;
 
                 if (out_count > 0) {
                     /* Queue MIDI FX output note-offs */
@@ -6850,11 +6855,18 @@ static int shadow_midi_fx_rewrite(uint8_t *sh_midi)
                         shadow_midi_fx_queue_push(out_notes[o], 0, ch);
                     }
                 } else {
-                    /* MIDI FX returned nothing — send note-offs for root + extras */
-                    shadow_midi_fx_queue_push(note, 0, ch);
-                    for (int e = 0; e < shadow_midi_fx_held[i].extra_count; e++) {
-                        shadow_midi_fx_queue_push(shadow_midi_fx_held[i].extras[e], 0, ch);
+                    /* MIDI FX returned nothing — send note-offs for root + extras.
+                     * For arp: tick() handles note-off timing internally,
+                     * so only queue root off if there are no extras (arp-generated
+                     * notes are cleaned up by the arp's own note-off via tick). */
+                    if (shadow_midi_fx_held[i].extra_count > 0) {
+                        shadow_midi_fx_queue_push(note, 0, ch);
+                        for (int e = 0; e < shadow_midi_fx_held[i].extra_count; e++) {
+                            shadow_midi_fx_queue_push(shadow_midi_fx_held[i].extras[e], 0, ch);
+                        }
                     }
+                    /* For arp (extra_count=0): don't queue note-off here.
+                     * The arp's tick() will generate its own note-offs. */
                 }
 
                 if (log_on) {
@@ -6869,6 +6881,16 @@ static int shadow_midi_fx_rewrite(uint8_t *sh_midi)
                 shadow_midi_fx_held[i].active = 0;
                 modified++;
                 break;
+            }
+
+            /* ALWAYS block pad note-off when MIDI FX is active, even if
+             * no held entry was found (shouldn't happen, but be safe). */
+            if (found_held || has_midi_fx) {
+                sh_midi[j]     = 0;
+                sh_midi[j + 1] = 0;
+                sh_midi[j + 2] = 0;
+                sh_midi[j + 3] = 0;
+                if (!found_held) modified++;
             }
         }
     }
