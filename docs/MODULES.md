@@ -733,6 +733,11 @@ The Signal Chain module allows combining MIDI sources, MIDI effects, sound gener
 | MIDI Effects | Chord (none, major, minor, power, octave with strum), Arpeggiator (off, up, down, up_down, random with BPM/division/sync) |
 | Audio Effects | Freeverb (reverb), CLAP effects |
 
+These chain MIDI effects are part of the Shadow/Signal Chain routing path. They
+are not a supported path for driving native Move synths with transformed live
+notes. See [`docs/NATIVE_MOVE_MIDI_FINDINGS.md`](NATIVE_MOVE_MIDI_FINDINGS.md)
+for the current branch findings on the experimental native Move injection path.
+
 ### CLAP Host Module
 
 The CLAP module (separate repo: `move-anything-clap`) hosts arbitrary CLAP audio plugins:
