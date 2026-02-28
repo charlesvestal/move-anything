@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Verify shim supports experimental native-Move chord expansion:
-# - Pre-ioctl: captures MIDI_OUT notes (before SPI destroys them)
-# - Post-ioctl: injects chord extras into MIDI_IN as cable-2 external MIDI
+# Verify shim supports staggered native-Move chord expansion:
+# - Post-ioctl: scans cable-0 pad notes, leaves root in-place
+# - Chord intervals queued for one-per-frame injection
+# - All injected notes are cable-0 (same as real pad presses)
 # This checks for:
-# - dedicated transform helper
+# - chord rewrite function operating on MIDI_IN buffer
 # - lookup of slot MIDI FX module/type
-# - pre-ioctl generation function
-# - post-ioctl injection of pre-generated extras
-# - explicit cable-2 reinjection for transformed packets.
+# - staggered injection queue
+# - cable-0 note-on/off format (0x09/0x08 headers)
+# - pad note range filtering (68-99)
+# - held-notes table for tracking chord state
 
 file="src/move_anything_shim.c"
 
@@ -18,8 +20,8 @@ if ! command -v rg >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! rg -n "shadow_transform_musical_note_for_move" "$file" >/dev/null 2>&1; then
-  echo "FAIL: Missing musical-note chord transform helper" >&2
+if ! rg -n "shadow_chord_rewrite_midi_in" "$file" >/dev/null 2>&1; then
+  echo "FAIL: Missing post-ioctl chord rewrite function" >&2
   exit 1
 fi
 
@@ -33,19 +35,32 @@ if ! rg -n "midi_fx1:type" "$file" >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! rg -n "shadow_generate_chord_extras_pre_ioctl" "$file" >/dev/null 2>&1; then
-  echo "FAIL: Missing pre-ioctl chord generation function" >&2
+# Verify staggered queue mechanism
+if ! rg -n "shadow_chord_queue_push" "$file" >/dev/null 2>&1; then
+  echo "FAIL: Missing staggered chord queue push" >&2
   exit 1
 fi
 
-if ! rg -n "shadow_pre_chord_extras" "$file" >/dev/null 2>&1; then
-  echo "FAIL: Missing pre-ioctl chord extras buffer" >&2
+if ! rg -n "shadow_chord_queue_pop" "$file" >/dev/null 2>&1; then
+  echo "FAIL: Missing staggered chord queue pop" >&2
   exit 1
 fi
 
-if ! rg -n "0x02 << 4" "$file" >/dev/null 2>&1; then
-  echo "FAIL: Missing cable-2 reinjection format for transformed packets" >&2
+# Verify cable-0 format for injection (0x09/0x08 headers)
+if ! rg -n 'sh_midi\[wp\].*= 0x09' "$file" >/dev/null 2>&1; then
+  echo "FAIL: Missing cable-0 note-on injection (0x09)" >&2
   exit 1
 fi
 
-echo "PASS: Native Move musical-note chord transform hook is present"
+if ! rg -n 'sh_midi\[wp\].*= 0x08' "$file" >/dev/null 2>&1; then
+  echo "FAIL: Missing cable-0 note-off injection (0x08)" >&2
+  exit 1
+fi
+
+# Verify pad note range check
+if ! rg -n "note < 68 \|\| note > 99" "$file" >/dev/null 2>&1; then
+  echo "FAIL: Missing pad note range filter (68-99)" >&2
+  exit 1
+fi
+
+echo "PASS: Staggered native-Move chord injection is present"

@@ -162,32 +162,48 @@ Interpretation:
 5. This path should not be generalized to `arp` or other MIDI FX in its current
    form.
 
-## Current Recommendation
+## Approach 2: Subtractive Rewrite (Current)
 
-Do not treat native Move synth MIDI-FX injection through mailbox `MIDI_IN` as a
-supported feature.
+After the additive approach failed, a subtractive approach was implemented:
 
-Recommended next steps:
+Instead of **adding** extra cable-2 notes alongside the original pad note,
+the shim now **rewrites** MIDI_IN in the post-ioctl copy. When a chord is
+active:
 
-1. Disable or hide the experimental native-Move chord path by default.
-2. Keep MIDI FX for Shadow DSP / Shadow-chain synths, where routing is under our
-   control.
-3. If native Move MIDI FX is still required, approach it as a separate reverse
-   engineering project:
-   - find Move's internal event-buffer API
-   - inject properly timestamped events before `ProcessEventsStepper`
-   - avoid mailbox `MIDI_IN` synthesis as the main integration point
+1. The hardware MIDI_IN buffer is copied to the shadow mailbox as usual
+2. `shadow_chord_rewrite_midi_in()` scans for cable-0 pad notes (68-99)
+3. The original note-on stays in place (root of chord)
+4. Chord interval notes are written into subsequent empty buffer slots
+5. All injected notes use cable-0 format (`0x09`/`0x08` headers)
+
+Key differences from the additive approach:
+
+- **No cable-2**: All events are cable-0, identical to real pad presses
+- **No echo suppression needed**: No feedback loop since we don't inject
+  on a separate cable
+- **Same-frame delivery**: Root and intervals are in the same buffer frame
+- **No rate limiting**: All chord notes appear atomically in one frame
+
+The hypothesis is that Move already handles multiple cable-0 note events
+per frame (polyphonic pad playing), so chord-expanded notes in the same
+format should not violate `ProcessEventsStepper` ordering invariants.
+
+### Risks
+
+- Move may have per-pad state that expects specific note numbers from the
+  hardware scan. Synthetic notes without corresponding pad touches could
+  confuse pad-state tracking.
+- Pad LED feedback may desync since the hardware only registers one pad
+  press but the synth sees multiple notes.
+- If Move's engine processes cable-0 notes differently from how they appear
+  in the USB-MIDI buffer (e.g., with per-pad timestamps from the scanner),
+  the synthetic notes may still trigger ordering violations.
 
 ## Branch Artifacts
 
-This branch contains useful debugging artifacts even if the feature should not
-ship as-is:
+This branch contains useful debugging artifacts:
 
-- richer `move-chord` state logging
-- abort/assert diagnostics
-- abort backtrace capture
-- source-level regressions for suppression, state coalescing, pacing, busy
-  gating, and overlap suppression
-
-Those artifacts are still useful if native Move event injection is revisited
-later with a different architecture.
+- `move-chord` state logging (flag-file gated)
+- abort/assert diagnostics and backtrace capture
+- MIDI injection test harness (flag-file triggered cable/channel combos)
+- richer mailbox probe and ALSA seq trace tools
