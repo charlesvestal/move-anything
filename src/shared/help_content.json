@@ -13,15 +13,25 @@
             "+Track 1-4: jump to",
             " slot settings",
             "+Menu: Master FX",
+            "+Step 2: Global",
+            " settings menu",
             "+Jog Click: overtake",
             " module menu",
-            "+Knob 8: toggle",
-            " standalone mode",
             "",
             "Shift+Sample:",
             " quantized sampler",
             "Shift+Capture:",
-            " skipback last 30s"
+            " skipback last 30s",
+            "",
+            "Overlay Knobs:",
+            " Global Settings >",
+            " Display > Overlay",
+            " Knobs: +Shift,",
+            " +Jog Touch, Off",
+            "",
+            "Use +Jog Touch or",
+            "Off to avoid Shift+",
+            "Knob conflicts."
           ]
         },
         {
@@ -36,6 +46,12 @@
             "Play the track to",
             "trigger the slot",
             "synth.",
+            "",
+            "Tip: load an empty",
+            "Drum Rack or Sampler",
+            "preset on the Move",
+            "track to silence the",
+            "native sound.",
             "",
             "Pitch bend, mod",
             "wheel, sustain, and",
@@ -89,6 +105,33 @@
           ]
         },
         {
+          "title": "Sets & Slots",
+          "lines": [
+            "Each Move Set keeps",
+            "its own slots.",
+            "",
+            "Switching Sets saves",
+            "your current slots",
+            "and loads the new",
+            "Set's slots.",
+            "",
+            "Changes are local to",
+            "the Set. Editing a",
+            "synth in one Set",
+            "won't affect others.",
+            "",
+            "Presets are separate:",
+            "loading a preset",
+            "copies it into the",
+            "Set. Tweaks stay in",
+            "the Set, not the",
+            "preset.",
+            "",
+            "New Sets start with",
+            "empty slots."
+          ]
+        },
+        {
           "title": "Master FX",
           "lines": [
             "Open: Shift+Vol+Menu",
@@ -98,12 +141,11 @@
             "mixed output of all",
             "instrument slots.",
             "",
-            "Settings (last item)",
-            "has: volume, Link",
-            "Audio toggle,",
-            "resample source,",
-            "display mirror, and",
-            "screen reader."
+            "Use Shift+Vol+",
+            "Step 2 for global",
+            "settings (Link,",
+            "Mirror, screen",
+            "reader, updates)."
           ]
         },
         {
@@ -117,8 +159,9 @@
             "Setup:",
             "1.Enable Link in",
             "  Move Settings",
-            "2.Toggle Link Audio",
-            "  On in MFX Settings",
+            "2.Global Settings",
+            "  > Audio > Link",
+            "  Audio On",
             "",
             "Track N maps to",
             "Slot N audio input.",
@@ -180,9 +223,9 @@
             "Stream the OLED to",
             "a web browser.",
             "",
-            "Enable in Master FX",
-            "> Settings > Mirror",
-            "Display On.",
+            "Enable in Global",
+            "Settings > Display",
+            "> Mirror Display.",
             "",
             "Then open:",
             " move.local:7681",
@@ -201,7 +244,7 @@
             "accessibility.",
             "",
             "Toggle on/off:",
-            " MFX Settings >",
+            " Global Settings >",
             " Screen Reader",
             " or Shift+Menu",
             "",
@@ -217,12 +260,51 @@
       "title": "Move Manual",
       "children": [
         {
-          "title": "Coming Soon",
+          "title": "Loading...",
           "lines": [
-            "The Ableton Move",
-            "manual will be",
-            "available in a",
-            "future update."
+            "Fetching the Move",
+            "manual from",
+            "ableton.com.",
+            "",
+            "Requires an internet",
+            "connection."
+          ]
+        }
+      ]
+    },
+    {
+      "title": "Notice",
+      "children": [
+        {
+          "title": "Copyright",
+          "lines": [
+            "Ableton Move Manual",
+            "",
+            "Copyright 2024",
+            "Ableton AG.",
+            "All rights reserved.",
+            "Made in Germany.",
+            "",
+            "Manual content",
+            "displayed with",
+            "permission from",
+            "Ableton AG."
+          ]
+        },
+        {
+          "title": "Trademark Notice",
+          "lines": [
+            "Ableton and Move are",
+            "trademarks of",
+            "Ableton AG.",
+            "",
+            "Move Everything is",
+            "an independent",
+            "product and has not",
+            "been authorized,",
+            "sponsored, or",
+            "otherwise approved",
+            "by Ableton AG."
           ]
         }
       ]
