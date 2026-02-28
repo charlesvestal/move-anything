@@ -6363,6 +6363,31 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
     if (strcmp(key, "midi_fx2_module") == 0) {
         return snprintf(buf, buf_len, "%s", inst->current_midi_fx_modules[1]);
     }
+    /* Process MIDI through MIDI FX chain and return output (no synth routing).
+     * Key format: "midi_fx_process:SS DD DD" (hex bytes, space-separated)
+     * Output format: "SS DD DD,SS DD DD,..." (comma-separated hex triplets)
+     * Used by the shim to run pad notes through MIDI FX before injecting
+     * the transformed output into Move's native synth path. */
+    if (strncmp(key, "midi_fx_process:", 16) == 0) {
+        const char *hex = key + 16;
+        unsigned int b0, b1, b2;
+        if (sscanf(hex, "%x %x %x", &b0, &b1, &b2) != 3) return -1;
+        uint8_t in_msg[3] = { (uint8_t)b0, (uint8_t)b1, (uint8_t)b2 };
+
+        uint8_t out_msgs[MIDI_FX_MAX_OUT_MSGS][3];
+        int out_lens[MIDI_FX_MAX_OUT_MSGS];
+        int count = v2_process_midi_fx(inst, in_msg, 3, out_msgs, out_lens,
+                                       MIDI_FX_MAX_OUT_MSGS);
+        if (count <= 0) return snprintf(buf, buf_len, "");
+
+        int off = 0;
+        for (int i = 0; i < count && off < buf_len - 12; i++) {
+            if (i > 0) off += snprintf(buf + off, buf_len - off, ",");
+            off += snprintf(buf + off, buf_len - off, "%02X %02X %02X",
+                            out_msgs[i][0], out_msgs[i][1], out_msgs[i][2]);
+        }
+        return off;
+    }
     /* Master preset queries */
     if (strcmp(key, "master_preset_count") == 0) {
         scan_master_presets();
