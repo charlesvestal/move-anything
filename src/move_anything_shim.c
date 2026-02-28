@@ -4629,11 +4629,10 @@ static void load_feature_config(void)
                         fclose(tf);
                     }
                 }
-                /* Quantum avoidance: start with ALIVE filter active.
-                 * recvfrom hook drops all incoming discovery ALIVEs so
-                 * Move sees numPeers=0 at startup → no quantum on first Play.
-                 * Filter lifts on Play (0xFA), re-activates on Stop (0xFC). */
-                link_audio.filter_active = 1;
+                /* Quantum avoidance: with the no-session-join subscriber patch,
+                 * the subscriber stays in a different session so Move sees
+                 * numPeers=0 naturally.  No ALIVE filtering needed. */
+                link_audio.filter_active = 0;
             }
         }
     }
@@ -6722,36 +6721,18 @@ static void shadow_inprocess_process_midi(void) {
             if (cable == 0) {
                 sampler_on_clock(status_usb);
 
-                /* Link Audio quantum avoidance: toggle ALIVE filter on transport */
-                if (link_audio.enabled) {
-                    if (status_usb == 0xFC) {
-                        /* MIDI Stop — activate filter, inject ByeByes to evict peers.
-                         * byebye_pending=10 converts the next 10 incoming ALIVEs to
-                         * ByeByes, ensuring all peers (subscriber + Live) are evicted
-                         * from Move's session before the filter drops subsequent packets. */
-                        if (!link_audio.filter_active) {
-                            link_audio.filter_active = 1;
-                            link_audio.byebye_pending = 10;
-                            shadow_log("Link Audio: Stop → filter ON, 10 ByeByes queued");
+                /* Link Audio: no-session-join subscriber handles quantum avoidance
+                 * at the SDK level.  No ALIVE filter toggling needed on transport.
+                 * We still signal the subscriber on Play for re-announcement. */
+                if (link_audio.enabled && (status_usb == 0xFA || status_usb == 0xFB)) {
+                    /* MIDI Start/Continue — signal subscriber for re-announcement */
+                    FILE *pf = fopen("/data/UserData/move-anything/link-subscriber-pid", "r");
+                    if (pf) {
+                        int sub_pid = 0;
+                        if (fscanf(pf, "%d", &sub_pid) == 1 && sub_pid > 0) {
+                            kill(sub_pid, SIGUSR1);
                         }
-                    } else if (status_usb == 0xFA || status_usb == 0xFB) {
-                        /* MIDI Start/Continue — lift filter, signal subscriber */
-                        if (link_audio.filter_active) {
-                            link_audio.filter_active = 0;
-                            link_audio.byebye_pending = 0;
-                            link_audio.play_mute_remaining = LINK_AUDIO_PLAY_MUTE_FRAMES;
-                            shadow_log("Link Audio: Play → filter OFF, mute active");
-
-                            /* Signal subscriber to force immediate re-announcement */
-                            FILE *pf = fopen("/data/UserData/move-anything/link-subscriber-pid", "r");
-                            if (pf) {
-                                int sub_pid = 0;
-                                if (fscanf(pf, "%d", &sub_pid) == 1 && sub_pid > 0) {
-                                    kill(sub_pid, SIGUSR1);
-                                }
-                                fclose(pf);
-                            }
-                        }
+                        fclose(pf);
                     }
                 }
             }
