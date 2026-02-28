@@ -180,9 +180,12 @@ if [ -d "./libs/link/include/ableton" ]; then
     "${CROSS_PREFIX}gcc" -c -g -O0 \
         src/host/arc4random_compat.c \
         -o build/arc4random_compat.o
+    # The Link SDK must have the no-session-join patch applied before building.
+    # Apply it with: cd libs/link && git apply ../../libs/link-subscriber-no-session-join.patch
     "${CROSS_PREFIX}g++" -std=c++17 -O3 -DNDEBUG \
         -DLINK_PLATFORM_UNIX=1 \
         -DLINK_PLATFORM_LINUX=1 \
+        -DLINK_SUBSCRIBER_NO_SESSION_JOIN=1 \
         -Wno-multichar \
         -I./libs/link/include \
         -I./libs/link/modules/asio-standalone/asio/include \
