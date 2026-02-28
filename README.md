@@ -107,6 +107,7 @@ If monitoring is on (or source/routing is configured differently), audio feedbac
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - System and Shadow UI architecture
 - [docs/MODULES.md](docs/MODULES.md) - Module development, Shadow UI integration, overtake modules
 - [docs/API.md](docs/API.md) - JavaScript module API
+- [docs/NATIVE_MOVE_MIDI_FINDINGS.md](docs/NATIVE_MOVE_MIDI_FINDINGS.md) - Findings from the experimental native Move MIDI FX injection path
 - [src/modules/chain/README.md](src/modules/chain/README.md) - Signal Chain module notes
 
 ## Related Repositories

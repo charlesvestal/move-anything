@@ -62,9 +62,15 @@ If no `midi_source` is specified, the chain uses `input` for MIDI as before.
 
 ### MIDI FX
 
-Native MIDI FX supported today:
+Built-in chain MIDI FX supported today:
 - Chord: `major`, `minor`, `power`, `octave`
 - Arp: `up`, `down`, `up_down`, `random` with `arp_bpm` and `arp_division`
+
+These effects are supported inside the Signal Chain path shown above. They
+should not be treated as a supported way to drive native Move synths by
+injecting transformed notes back into Move. See
+[`docs/NATIVE_MOVE_MIDI_FINDINGS.md`](../../../docs/NATIVE_MOVE_MIDI_FINDINGS.md)
+for the current findings on that experimental path.
 
 JavaScript MIDI FX can be attached per patch using `midi_fx_js`:
 
