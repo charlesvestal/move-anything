@@ -6752,11 +6752,11 @@ static int shadow_chord_rewrite_midi_in(uint8_t *sh_midi)
             continue;
         }
 
-        /* === MODE 0: STAGGERED CABLE-0 CHORD EXPANSION ===
-         * Root note: leave in place (plays immediately)
-         * Chord intervals: queue for injection one-per-frame
-         * This avoids writing multiple events per frame which crashes
-         * Move's ProcessEventsStepper ordering invariants. */
+        /* === MODE 0: FULLY QUEUED CHORD EXPANSION ===
+         * Block the original pad note entirely and queue root + intervals
+         * through the staggered injection queue. This enables future MIDI FX
+         * (transpose, velocity, arp) to transform the root before injection.
+         * Each frame injects at most one cable-0 note event. */
         if (is_note_on) {
             /* Find a free slot in held table */
             int hi = -1;
@@ -6765,13 +6765,22 @@ static int shadow_chord_rewrite_midi_in(uint8_t *sh_midi)
             }
             if (hi < 0) continue;  /* Table full, pass note through unchanged */
 
-            /* Record held note — root stays in buffer as-is */
+            /* Block the original cable-0 pad note */
+            sh_midi[j]     = 0;
+            sh_midi[j + 1] = 0;
+            sh_midi[j + 2] = 0;
+            sh_midi[j + 3] = 0;
+
+            /* Record held note */
             shadow_chord_held[hi].active = 1;
             shadow_chord_held[hi].root_note = note;
             shadow_chord_held[hi].channel = ch;
             shadow_chord_held[hi].extra_count = 0;
 
-            /* Queue chord interval note-ons for staggered injection */
+            /* Queue root note-on */
+            shadow_chord_queue_push(note, vel, ch);
+
+            /* Queue chord interval note-ons */
             for (int i = 0; i < n_intervals; i++) {
                 int transposed = (int)note + intervals[i];
                 if (transposed < 0 || transposed > 127) continue;
@@ -6785,18 +6794,27 @@ static int shadow_chord_rewrite_midi_in(uint8_t *sh_midi)
             if (log_on) {
                 char dbg[256];
                 snprintf(dbg, sizeof(dbg),
-                         "move-chord STAGGER ON root=%d ch=%d -> queued %d intervals q=%d",
+                         "move-chord QUEUED ON root=%d ch=%d -> %d intervals q=%d",
                          note, ch, shadow_chord_held[hi].extra_count,
                          shadow_chord_queue_count());
                 shadow_log(dbg);
             }
         } else if (is_note_off) {
-            /* Find held entry for this root note and queue note-offs for extras.
-             * The original pad note-off stays in buffer (root off). */
+            /* Find held entry for this root note.
+             * Block the original pad note-off and queue all note-offs. */
             for (int i = 0; i < SHADOW_CHORD_HELD_MAX; i++) {
                 if (!shadow_chord_held[i].active) continue;
                 if (shadow_chord_held[i].root_note != note) continue;
                 if (shadow_chord_held[i].channel != ch) continue;
+
+                /* Block the original cable-0 pad note-off */
+                sh_midi[j]     = 0;
+                sh_midi[j + 1] = 0;
+                sh_midi[j + 2] = 0;
+                sh_midi[j + 3] = 0;
+
+                /* Queue root note-off */
+                shadow_chord_queue_push(note, 0, ch);
 
                 /* Queue note-offs for all extras */
                 for (int e = 0; e < shadow_chord_held[i].extra_count; e++) {
@@ -6806,7 +6824,7 @@ static int shadow_chord_rewrite_midi_in(uint8_t *sh_midi)
                 if (log_on) {
                     char dbg[256];
                     snprintf(dbg, sizeof(dbg),
-                             "move-chord STAGGER OFF root=%d ch=%d queued %d offs q=%d",
+                             "move-chord QUEUED OFF root=%d ch=%d queued %d+1 offs q=%d",
                              note, ch, shadow_chord_held[i].extra_count,
                              shadow_chord_queue_count());
                     shadow_log(dbg);
