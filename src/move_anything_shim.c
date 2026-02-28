@@ -6415,18 +6415,18 @@ static int shadow_is_internal_control_note(uint8_t note)
  * This avoids the timing/ordering invariant violations that crashed Move when
  * extra notes were injected additively as cable-2 events. */
 
-#define SHADOW_MOVE_CHORD_INTERVAL_MAX 4
-#define SHADOW_CHORD_HELD_MAX 16
+#define SHADOW_MIDI_FX_EXTRAS_MAX 4
+#define SHADOW_MIDI_FX_HELD_MAX 16
 
 typedef struct {
     uint8_t active;
     uint8_t root_note;     /* Original pad note */
     uint8_t channel;       /* MIDI channel (low nibble of status) */
-    uint8_t extras[SHADOW_MOVE_CHORD_INTERVAL_MAX];  /* Generated chord interval notes */
+    uint8_t extras[SHADOW_MIDI_FX_EXTRAS_MAX];  /* Generated chord interval notes */
     int extra_count;
-} shadow_chord_held_t;
+} shadow_midi_fx_held_t;
 
-static shadow_chord_held_t shadow_chord_held[SHADOW_CHORD_HELD_MAX];
+static shadow_midi_fx_held_t shadow_midi_fx_held[SHADOW_MIDI_FX_HELD_MAX];
 
 static int shadow_move_transform_slot(void)
 {
@@ -6541,12 +6541,55 @@ static int shadow_get_move_chord_intervals(int slot, int *intervals, int max_int
     return shadow_chord_extra_intervals(chord_type, intervals, max_intervals);
 }
 
-static int shadow_move_chord_log_enabled(void)
+/* Check if a slot has any MIDI FX loaded */
+static int shadow_slot_has_midi_fx(int slot)
+{
+    char buf[8];
+    if (!shadow_slot_get_param_string(slot, "midi_fx_count", buf, sizeof(buf))) return 0;
+    return atoi(buf) > 0;
+}
+
+/* Process a MIDI message through a slot's MIDI FX chain.
+ * Returns number of output messages written to out_notes/out_vels.
+ * Each output is a note+velocity pair (channel preserved from input).
+ * If no MIDI FX loaded or on error, returns 0 (caller should pass through). */
+#define SHADOW_MIDI_FX_OUT_MAX 16
+static int shadow_slot_process_midi_fx(int slot, uint8_t status, uint8_t note, uint8_t vel,
+                                       uint8_t *out_notes, uint8_t *out_vels, int max_out)
+{
+    if (max_out <= 0) return 0;
+
+    /* Build get_param key: "midi_fx_process:SS DD DD" */
+    char key[48];
+    snprintf(key, sizeof(key), "midi_fx_process:%02X %02X %02X", status, note, vel);
+
+    char buf[256];
+    if (!shadow_slot_get_param_string(slot, key, buf, sizeof(buf))) return 0;
+    if (buf[0] == '\0') return 0;
+
+    /* Parse output: "SS DD DD,SS DD DD,..." */
+    int count = 0;
+    char *p = buf;
+    while (*p && count < max_out) {
+        unsigned int s, d1, d2;
+        if (sscanf(p, "%x %x %x", &s, &d1, &d2) != 3) break;
+        out_notes[count] = (uint8_t)d1;
+        out_vels[count] = (uint8_t)d2;
+        count++;
+        /* Advance past comma */
+        char *comma = strchr(p, ',');
+        if (!comma) break;
+        p = comma + 1;
+    }
+    return count;
+}
+
+static int shadow_midi_fx_log_enabled(void)
 {
     static int enabled = -1;
     static int check_counter = 0;
     if (enabled < 0 || (check_counter++ % 200 == 0)) {
-        enabled = (access("/data/UserData/move-anything/shadow_move_chord_log_on", F_OK) == 0);
+        enabled = (access("/data/UserData/move-anything/shadow_midi_fx_log_on", F_OK) == 0);
     }
     return enabled;
 }
@@ -6569,23 +6612,21 @@ static int shadow_move_chord_log_enabled(void)
  * - Latency cost: ~3ms per interval (1 frame at 44100/128)
  *
  * Diagnostic modes (flag files):
- *   move_chord_mode_block     — suppress pad note entirely (zero it out)
+ *   move_midi_fx_mode_block     — suppress pad note entirely (zero it out)
  *   move_chord_mode_transpose — change note number in-place (+first interval)
  *   (default)                 — staggered chord expansion
  *
  * sh_midi: pointer to shadow_mailbox + MIDI_IN_OFFSET (already copied from hw).
  * Returns number of events modified/written (0 = no chord active). */
 
-/* Chord mode: 0=staggered expansion, 1=block only, 2=transpose only */
-static int shadow_chord_mode(void)
+/* Chord mode: 0=MIDI FX processing, 1=block only (diagnostic) */
+static int shadow_midi_fx_mode(void)
 {
     static int mode = -1;
     static int check_counter = 0;
     if (mode < 0 || (check_counter++ % 200 == 0)) {
-        if (access("/data/UserData/move-anything/move_chord_mode_block", F_OK) == 0)
+        if (access("/data/UserData/move-anything/move_midi_fx_mode_block", F_OK) == 0)
             mode = 1;
-        else if (access("/data/UserData/move-anything/move_chord_mode_transpose", F_OK) == 0)
-            mode = 2;
         else
             mode = 0;
     }
@@ -6594,54 +6635,52 @@ static int shadow_chord_mode(void)
 
 /* Queue for staggered chord injection: one event per ioctl frame.
  * Events are cable-0, written at position 0 of the MIDI_IN buffer. */
-#define SHADOW_CHORD_QUEUE_MAX 32
+#define SHADOW_MIDI_FX_QUEUE_MAX 32
 typedef struct {
     uint8_t note;
     uint8_t vel;   /* 0 = note-off, >0 = note-on */
     uint8_t ch;    /* channel (low nibble) */
-} shadow_chord_queue_entry_t;
+} shadow_midi_fx_queue_entry_t;
 
-static shadow_chord_queue_entry_t shadow_chord_queue[SHADOW_CHORD_QUEUE_MAX];
-static int shadow_chord_queue_head = 0;
-static int shadow_chord_queue_tail = 0;
+static shadow_midi_fx_queue_entry_t shadow_midi_fx_queue[SHADOW_MIDI_FX_QUEUE_MAX];
+static int shadow_midi_fx_queue_head = 0;
+static int shadow_midi_fx_queue_tail = 0;
 
-static int shadow_chord_queue_count(void)
+static int shadow_midi_fx_queue_count(void)
 {
-    int c = shadow_chord_queue_tail - shadow_chord_queue_head;
-    if (c < 0) c += SHADOW_CHORD_QUEUE_MAX;
+    int c = shadow_midi_fx_queue_tail - shadow_midi_fx_queue_head;
+    if (c < 0) c += SHADOW_MIDI_FX_QUEUE_MAX;
     return c;
 }
 
-static int shadow_chord_queue_push(uint8_t note, uint8_t vel, uint8_t ch)
+static int shadow_midi_fx_queue_push(uint8_t note, uint8_t vel, uint8_t ch)
 {
-    int next = (shadow_chord_queue_tail + 1) % SHADOW_CHORD_QUEUE_MAX;
-    if (next == shadow_chord_queue_head) return 0;  /* full */
-    shadow_chord_queue[shadow_chord_queue_tail].note = note;
-    shadow_chord_queue[shadow_chord_queue_tail].vel = vel;
-    shadow_chord_queue[shadow_chord_queue_tail].ch = ch;
-    shadow_chord_queue_tail = next;
+    int next = (shadow_midi_fx_queue_tail + 1) % SHADOW_MIDI_FX_QUEUE_MAX;
+    if (next == shadow_midi_fx_queue_head) return 0;  /* full */
+    shadow_midi_fx_queue[shadow_midi_fx_queue_tail].note = note;
+    shadow_midi_fx_queue[shadow_midi_fx_queue_tail].vel = vel;
+    shadow_midi_fx_queue[shadow_midi_fx_queue_tail].ch = ch;
+    shadow_midi_fx_queue_tail = next;
     return 1;
 }
 
-static int shadow_chord_queue_pop(shadow_chord_queue_entry_t *out)
+static int shadow_midi_fx_queue_pop(shadow_midi_fx_queue_entry_t *out)
 {
-    if (shadow_chord_queue_head == shadow_chord_queue_tail) return 0;
-    *out = shadow_chord_queue[shadow_chord_queue_head];
-    shadow_chord_queue_head = (shadow_chord_queue_head + 1) % SHADOW_CHORD_QUEUE_MAX;
+    if (shadow_midi_fx_queue_head == shadow_midi_fx_queue_tail) return 0;
+    *out = shadow_midi_fx_queue[shadow_midi_fx_queue_head];
+    shadow_midi_fx_queue_head = (shadow_midi_fx_queue_head + 1) % SHADOW_MIDI_FX_QUEUE_MAX;
     return 1;
 }
 
-static int shadow_chord_rewrite_midi_in(uint8_t *sh_midi)
+static int shadow_midi_fx_rewrite(uint8_t *sh_midi)
 {
     if (!sh_midi) return 0;
 
     int transform_slot = shadow_move_transform_slot();
-    int intervals[SHADOW_MOVE_CHORD_INTERVAL_MAX];
-    int n_intervals = shadow_get_move_chord_intervals(
-        transform_slot, intervals, SHADOW_MOVE_CHORD_INTERVAL_MAX);
+    int has_midi_fx = (transform_slot >= 0) ? shadow_slot_has_midi_fx(transform_slot) : 0;
 
-    int log_on = shadow_move_chord_log_enabled();
-    int mode = shadow_chord_mode();
+    int log_on = shadow_midi_fx_log_enabled();
+    int mode = shadow_midi_fx_mode();
     int modified = 0;
 
     /* Periodic trace */
@@ -6649,22 +6688,20 @@ static int shadow_chord_rewrite_midi_in(uint8_t *sh_midi)
         static int trace_counter = 0;
         if (log_on && (trace_counter++ % 500 == 0)) {
             char module_buf[64] = {0};
-            char type_buf[32] = {0};
             int has_instance = (transform_slot >= 0 && transform_slot < SHADOW_CHAIN_INSTANCES &&
                                 shadow_chain_slots[transform_slot].instance != NULL);
             if (has_instance) {
                 shadow_slot_get_param_string(transform_slot, "midi_fx1_module", module_buf, sizeof(module_buf));
-                shadow_slot_get_param_string(transform_slot, "midi_fx1:type", type_buf, sizeof(type_buf));
             }
             char dbg[256];
             snprintf(dbg, sizeof(dbg),
-                     "move-chord trace: mode=%d slot=%d inst=%d module='%s' type='%s' intv=%d q=%d held=",
-                     mode, transform_slot, has_instance, module_buf, type_buf, n_intervals,
-                     shadow_chord_queue_count());
+                     "move-midifx trace: mode=%d slot=%d inst=%d midi_fx=%d module='%s' q=%d held=",
+                     mode, transform_slot, has_instance, has_midi_fx, module_buf,
+                     shadow_midi_fx_queue_count());
             int off = strlen(dbg);
-            for (int i = 0; i < SHADOW_CHORD_HELD_MAX && off < (int)sizeof(dbg) - 8; i++) {
-                if (shadow_chord_held[i].active)
-                    off += snprintf(dbg + off, sizeof(dbg) - off, "%d ", shadow_chord_held[i].root_note);
+            for (int i = 0; i < SHADOW_MIDI_FX_HELD_MAX && off < (int)sizeof(dbg) - 8; i++) {
+                if (shadow_midi_fx_held[i].active)
+                    off += snprintf(dbg + off, sizeof(dbg) - off, "%d ", shadow_midi_fx_held[i].root_note);
             }
             shadow_log(dbg);
         }
@@ -6672,23 +6709,23 @@ static int shadow_chord_rewrite_midi_in(uint8_t *sh_midi)
 
     int has_real_pad_note = 0;  /* Track whether this frame has a real pad note */
 
-    if (n_intervals <= 0) {
-        /* No chord active — if we have held notes from a previous chord setting,
+    if (!has_midi_fx) {
+        /* No MIDI FX loaded — if we have held notes from a previous session,
          * queue note-offs for the extras */
-        for (int i = 0; i < SHADOW_CHORD_HELD_MAX; i++) {
-            if (!shadow_chord_held[i].active) continue;
-            for (int e = 0; e < shadow_chord_held[i].extra_count; e++) {
-                shadow_chord_queue_push(shadow_chord_held[i].extras[e], 0,
-                                        shadow_chord_held[i].channel);
+        for (int i = 0; i < SHADOW_MIDI_FX_HELD_MAX; i++) {
+            if (!shadow_midi_fx_held[i].active) continue;
+            for (int e = 0; e < shadow_midi_fx_held[i].extra_count; e++) {
+                shadow_midi_fx_queue_push(shadow_midi_fx_held[i].extras[e], 0,
+                                        shadow_midi_fx_held[i].channel);
             }
             if (log_on) {
                 char dbg[128];
                 snprintf(dbg, sizeof(dbg),
-                         "move-chord cleanup: queued %d offs for root=%d",
-                         shadow_chord_held[i].extra_count, shadow_chord_held[i].root_note);
+                         "move-midifx cleanup: queued %d offs for root=%d",
+                         shadow_midi_fx_held[i].extra_count, shadow_midi_fx_held[i].root_note);
                 shadow_log(dbg);
             }
-            shadow_chord_held[i].active = 0;
+            shadow_midi_fx_held[i].active = 0;
         }
         return modified;
     }
@@ -6728,40 +6765,32 @@ static int shadow_chord_rewrite_midi_in(uint8_t *sh_midi)
             if (log_on) {
                 char dbg[128];
                 snprintf(dbg, sizeof(dbg),
-                         "move-chord BLOCK %s note=%d ch=%d",
+                         "move-midifx BLOCK %s note=%d ch=%d",
                          is_note_on ? "ON" : "OFF", note, ch);
                 shadow_log(dbg);
             }
             continue;
         }
 
-        /* === MODE 2: TRANSPOSE — change note number in-place === */
-        if (mode == 2) {
-            int transposed = (int)note + intervals[0];
-            if (transposed >= 0 && transposed <= 127) {
-                sh_midi[j + 2] = (uint8_t)transposed;
-                modified++;
-                if (log_on) {
-                    char dbg[128];
-                    snprintf(dbg, sizeof(dbg),
-                             "move-chord TRANSPOSE %s note=%d->%d ch=%d",
-                             is_note_on ? "ON" : "OFF", note, transposed, ch);
-                    shadow_log(dbg);
-                }
-            }
-            continue;
-        }
-
-        /* === MODE 0: FULLY QUEUED CHORD EXPANSION ===
-         * Block the original pad note entirely and queue root + intervals
-         * through the staggered injection queue. This enables future MIDI FX
-         * (transpose, velocity, arp) to transform the root before injection.
+        /* === MODE 0: MIDI FX PROCESSING ===
+         * Block the original pad note, run it through the chain's MIDI FX
+         * pipeline (chord, arp, transpose, velocity, etc.), and queue all
+         * output notes for staggered cable-0 injection.
          * Each frame injects at most one cable-0 note event. */
         if (is_note_on) {
+            /* Process note-on through chain's MIDI FX */
+            uint8_t out_notes[SHADOW_MIDI_FX_OUT_MAX];
+            uint8_t out_vels[SHADOW_MIDI_FX_OUT_MAX];
+            int out_count = shadow_slot_process_midi_fx(
+                transform_slot, status, note, vel,
+                out_notes, out_vels, SHADOW_MIDI_FX_OUT_MAX);
+
+            if (out_count <= 0) continue;  /* MIDI FX returned nothing, pass through */
+
             /* Find a free slot in held table */
             int hi = -1;
-            for (int i = 0; i < SHADOW_CHORD_HELD_MAX; i++) {
-                if (!shadow_chord_held[i].active) { hi = i; break; }
+            for (int i = 0; i < SHADOW_MIDI_FX_HELD_MAX; i++) {
+                if (!shadow_midi_fx_held[i].active) { hi = i; break; }
             }
             if (hi < 0) continue;  /* Table full, pass note through unchanged */
 
@@ -6771,41 +6800,43 @@ static int shadow_chord_rewrite_midi_in(uint8_t *sh_midi)
             sh_midi[j + 2] = 0;
             sh_midi[j + 3] = 0;
 
-            /* Record held note */
-            shadow_chord_held[hi].active = 1;
-            shadow_chord_held[hi].root_note = note;
-            shadow_chord_held[hi].channel = ch;
-            shadow_chord_held[hi].extra_count = 0;
+            /* Record held note and all output notes */
+            shadow_midi_fx_held[hi].active = 1;
+            shadow_midi_fx_held[hi].root_note = note;
+            shadow_midi_fx_held[hi].channel = ch;
+            shadow_midi_fx_held[hi].extra_count = 0;
 
-            /* Queue root note-on */
-            shadow_chord_queue_push(note, vel, ch);
-
-            /* Queue chord interval note-ons */
-            for (int i = 0; i < n_intervals; i++) {
-                int transposed = (int)note + intervals[i];
-                if (transposed < 0 || transposed > 127) continue;
-
-                uint8_t tn = (uint8_t)transposed;
-                shadow_chord_held[hi].extras[shadow_chord_held[hi].extra_count++] = tn;
-                shadow_chord_queue_push(tn, vel, ch);
+            /* Queue all MIDI FX output notes */
+            for (int i = 0; i < out_count; i++) {
+                shadow_midi_fx_queue_push(out_notes[i], out_vels[i], ch);
+                /* Track non-root notes for note-off cleanup */
+                if (out_notes[i] != note &&
+                    shadow_midi_fx_held[hi].extra_count < SHADOW_MIDI_FX_EXTRAS_MAX) {
+                    shadow_midi_fx_held[hi].extras[shadow_midi_fx_held[hi].extra_count++] = out_notes[i];
+                }
             }
 
             modified++;
             if (log_on) {
                 char dbg[256];
                 snprintf(dbg, sizeof(dbg),
-                         "move-chord QUEUED ON root=%d ch=%d -> %d intervals q=%d",
-                         note, ch, shadow_chord_held[hi].extra_count,
-                         shadow_chord_queue_count());
+                         "move-midifx FX ON root=%d ch=%d -> %d outputs q=%d",
+                         note, ch, out_count, shadow_midi_fx_queue_count());
                 shadow_log(dbg);
             }
         } else if (is_note_off) {
-            /* Find held entry for this root note.
-             * Block the original pad note-off and queue all note-offs. */
-            for (int i = 0; i < SHADOW_CHORD_HELD_MAX; i++) {
-                if (!shadow_chord_held[i].active) continue;
-                if (shadow_chord_held[i].root_note != note) continue;
-                if (shadow_chord_held[i].channel != ch) continue;
+            /* Process note-off through chain's MIDI FX */
+            uint8_t out_notes[SHADOW_MIDI_FX_OUT_MAX];
+            uint8_t out_vels[SHADOW_MIDI_FX_OUT_MAX];
+            int out_count = shadow_slot_process_midi_fx(
+                transform_slot, status, note, vel,
+                out_notes, out_vels, SHADOW_MIDI_FX_OUT_MAX);
+
+            /* Find held entry for this root note */
+            for (int i = 0; i < SHADOW_MIDI_FX_HELD_MAX; i++) {
+                if (!shadow_midi_fx_held[i].active) continue;
+                if (shadow_midi_fx_held[i].root_note != note) continue;
+                if (shadow_midi_fx_held[i].channel != ch) continue;
 
                 /* Block the original cable-0 pad note-off */
                 sh_midi[j]     = 0;
@@ -6813,24 +6844,29 @@ static int shadow_chord_rewrite_midi_in(uint8_t *sh_midi)
                 sh_midi[j + 2] = 0;
                 sh_midi[j + 3] = 0;
 
-                /* Queue root note-off */
-                shadow_chord_queue_push(note, 0, ch);
-
-                /* Queue note-offs for all extras */
-                for (int e = 0; e < shadow_chord_held[i].extra_count; e++) {
-                    shadow_chord_queue_push(shadow_chord_held[i].extras[e], 0, ch);
+                if (out_count > 0) {
+                    /* Queue MIDI FX output note-offs */
+                    for (int o = 0; o < out_count; o++) {
+                        shadow_midi_fx_queue_push(out_notes[o], 0, ch);
+                    }
+                } else {
+                    /* MIDI FX returned nothing — send note-offs for root + extras */
+                    shadow_midi_fx_queue_push(note, 0, ch);
+                    for (int e = 0; e < shadow_midi_fx_held[i].extra_count; e++) {
+                        shadow_midi_fx_queue_push(shadow_midi_fx_held[i].extras[e], 0, ch);
+                    }
                 }
 
                 if (log_on) {
                     char dbg[256];
                     snprintf(dbg, sizeof(dbg),
-                             "move-chord QUEUED OFF root=%d ch=%d queued %d+1 offs q=%d",
-                             note, ch, shadow_chord_held[i].extra_count,
-                             shadow_chord_queue_count());
+                             "move-midifx FX OFF root=%d ch=%d fx_out=%d extras=%d q=%d",
+                             note, ch, out_count, shadow_midi_fx_held[i].extra_count,
+                             shadow_midi_fx_queue_count());
                     shadow_log(dbg);
                 }
 
-                shadow_chord_held[i].active = 0;
+                shadow_midi_fx_held[i].active = 0;
                 modified++;
                 break;
             }
@@ -6838,40 +6874,34 @@ static int shadow_chord_rewrite_midi_in(uint8_t *sh_midi)
     }
 
     /* === DRAIN QUEUE: inject one queued event per frame ===
-     * ONLY when this frame has NO real pad note events, to avoid
-     * multiple cable-0 note events per frame (crashes ProcessEventsStepper).
-     * Write into the first empty slot in the buffer. */
-    if (!has_real_pad_note && shadow_chord_queue_count() > 0) {
-        int wp = -1;
-        for (int j = 0; j < MIDI_BUFFER_SIZE; j += 4) {
-            if (!sh_midi[j] && !sh_midi[j+1] && !sh_midi[j+2] && !sh_midi[j+3]) {
-                wp = j;
-                break;
+     * ONLY when this frame has NO real pad note events AND
+     * the first buffer slot (pos=0) is empty. Always inject at pos=0
+     * to guarantee consistent event ordering for ProcessEventsStepper.
+     * Never inject at higher positions — Move may crash if events
+     * appear after other data in the same frame. */
+    if (!has_real_pad_note && shadow_midi_fx_queue_count() > 0 &&
+        !sh_midi[0] && !sh_midi[1] && !sh_midi[2] && !sh_midi[3]) {
+        shadow_midi_fx_queue_entry_t ev;
+        if (shadow_midi_fx_queue_pop(&ev)) {
+            if (ev.vel > 0) {
+                sh_midi[0] = 0x09;  /* cable 0, CIN=note-on */
+                sh_midi[1] = 0x90 | ev.ch;
+                sh_midi[2] = ev.note;
+                sh_midi[3] = ev.vel;
+            } else {
+                sh_midi[0] = 0x08;  /* cable 0, CIN=note-off */
+                sh_midi[1] = 0x80 | ev.ch;
+                sh_midi[2] = ev.note;
+                sh_midi[3] = 0;
             }
-        }
-        if (wp >= 0) {
-            shadow_chord_queue_entry_t ev;
-            if (shadow_chord_queue_pop(&ev)) {
-                if (ev.vel > 0) {
-                    sh_midi[wp]     = 0x09;  /* cable 0, CIN=note-on */
-                    sh_midi[wp + 1] = 0x90 | ev.ch;
-                    sh_midi[wp + 2] = ev.note;
-                    sh_midi[wp + 3] = ev.vel;
-                } else {
-                    sh_midi[wp]     = 0x08;  /* cable 0, CIN=note-off */
-                    sh_midi[wp + 1] = 0x80 | ev.ch;
-                    sh_midi[wp + 2] = ev.note;
-                    sh_midi[wp + 3] = 0;
-                }
-                modified++;
-                if (log_on) {
-                    char dbg[128];
-                    snprintf(dbg, sizeof(dbg),
-                             "move-chord INJECT %s note=%d ch=%d pos=%d q=%d",
-                             ev.vel > 0 ? "ON" : "OFF", ev.note, ev.ch,
-                             wp, shadow_chord_queue_count());
-                    shadow_log(dbg);
-                }
+            modified++;
+            if (log_on) {
+                char dbg[128];
+                snprintf(dbg, sizeof(dbg),
+                         "move-midifx INJECT %s note=%d ch=%d q=%d",
+                         ev.vel > 0 ? "ON" : "OFF", ev.note, ev.ch,
+                         shadow_midi_fx_queue_count());
+                shadow_log(dbg);
             }
         }
     }
@@ -11772,10 +11802,9 @@ do_ioctl:
             memcpy(sh_midi, hw_midi, MIDI_BUFFER_SIZE);
         }
 
-        /* Subtractive chord rewrite: expand cable-0 pad notes in-place.
-         * All chord notes are written as cable-0 events so Move sees them
-         * as simultaneous pad presses, not external MIDI injection. */
-        shadow_chord_rewrite_midi_in(sh_midi);
+        /* MIDI FX rewrite: block pad notes, process through chain's MIDI FX,
+         * and inject transformed output as staggered cable-0 events. */
+        shadow_midi_fx_rewrite(sh_midi);
 
         /* === MIDI INJECTION TEST ===
          * One-shot test: touch midi_inject_test_N (N=0-9) to fire that combo.
