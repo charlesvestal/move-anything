@@ -29,6 +29,14 @@ if [ -z "$CROSS_PREFIX" ] && [ ! -f "/.dockerenv" ]; then
         echo ""
     fi
 
+    # Fetch Move Manual on host (Docker has no network access)
+    echo "Fetching Move Manual..."
+    if ./scripts/fetch_move_manual.sh 2>/dev/null && [ -f ".cache/move_manual.json" ]; then
+        echo "Move Manual fetched ($(wc -c < .cache/move_manual.json) bytes)"
+    else
+        echo "Warning: Could not fetch Move Manual - will use existing cache if available"
+    fi
+
     # Run build inside container
     echo "Running build..."
     docker run --rm \
@@ -62,7 +70,8 @@ fi
         for dep in \
             /usr/include/dbus-1.0/dbus/dbus.h \
             /usr/lib/aarch64-linux-gnu/dbus-1.0/include/dbus/dbus-arch-deps.h \
-        /usr/include/flite/flite.h; do
+            /usr/include/espeak-ng/speak_lib.h \
+            /usr/include/flite/flite.h; do
         if [ ! -f "$dep" ]; then
             echo "Missing screen reader dependency: $dep"
             missing_deps=1
@@ -90,7 +99,7 @@ fi
 if [ ! -f "./libs/quickjs/quickjs-2025-04-26/libquickjs.a" ]; then
     echo "QuickJS static library not found, building it..."
     make -C ./libs/quickjs/quickjs-2025-04-26 clean >/dev/null 2>&1 || true
-    CC="${CROSS_PREFIX}gcc" make -C ./libs/quickjs/quickjs-2025-04-26 libquickjs.a
+    CC="${CROSS_PREFIX}gcc" AR="${CROSS_PREFIX}ar" make -C ./libs/quickjs/quickjs-2025-04-26 libquickjs.a
 fi
 
 # Clean and prepare
@@ -101,12 +110,16 @@ mkdir -p ./build/shared/
 # Module directories are created automatically when copying files
 # External modules (sf2, dexed, m8, minijv, obxd, clap) are in separate repos
 
+# Generate bitmap font for host display (single source of truth: scripts/generate_font.py)
+echo "Generating host bitmap font..."
+python3 scripts/generate_font.py --deploy-png build/host/font.png
+
 if [ "$SCREEN_READER_ENABLED" = "1" ]; then
-    echo "Screen reader build: enabled"
-    SHIM_TTS_SRC="src/host/tts_engine_flite.c"
+    echo "Screen reader build: enabled (dual engine: eSpeak-NG + Flite)"
+    SHIM_TTS_SRC="src/host/tts_engine_dispatch.c src/host/tts_engine_espeak.c src/host/tts_engine_flite.c"
     SHIM_DEFINES="-DENABLE_SCREEN_READER=1"
-    SHIM_INCLUDES="-Isrc -I/usr/include -I/usr/include/dbus-1.0 -I/usr/lib/aarch64-linux-gnu/dbus-1.0/include"
-    SHIM_LIBS="-L/usr/lib/aarch64-linux-gnu -ldl -lrt -lpthread -ldbus-1 -lsystemd -lm -lflite -lflite_cmu_us_kal -lflite_usenglish -lflite_cmulex"
+    SHIM_INCLUDES="-Isrc -I/usr/include -I/usr/include/dbus-1.0 -I/usr/lib/aarch64-linux-gnu/dbus-1.0/include -I/usr/include/flite"
+    SHIM_LIBS="-L/usr/lib/aarch64-linux-gnu -ldl -lrt -lpthread -ldbus-1 -lsystemd -lm -lespeak-ng -lflite -lflite_cmu_us_kal -lflite_usenglish -lflite_cmulex"
 else
     echo "Screen reader build: disabled"
     SHIM_TTS_SRC="src/host/tts_engine_stub.c"
@@ -127,18 +140,47 @@ echo "Building host..."
     -Isrc -Isrc/lib \
     -Ilibs/quickjs/quickjs-2025-04-26 \
     -Llibs/quickjs/quickjs-2025-04-26 \
-    -lquickjs -lm -ldl
+    -lquickjs -lm -ldl -lrt -lpthread
 
 # Build shim (with shared memory support for shadow instrument)
 # D-Bus/TTS are optional and can be disabled with DISABLE_SCREEN_READER=1
 "${CROSS_PREFIX}gcc" -g3 -shared -fPIC \
     -o build/move-anything-shim.so \
     src/move_anything_shim.c \
+    src/host/shadow_sampler.c \
+    src/host/shadow_set_pages.c \
+    src/host/shadow_dbus.c \
+    src/host/shadow_chain_mgmt.c \
+    src/host/shadow_link_audio.c \
+    src/host/shadow_process.c \
+    src/host/shadow_resample.c \
+    src/host/shadow_overlay.c \
+    src/host/shadow_pin_scanner.c \
+    src/host/shadow_led_queue.c \
+    src/host/shadow_fd_trace.c \
+    src/host/shadow_state.c \
+    src/host/shadow_midi.c \
     src/host/unified_log.c \
-    "$SHIM_TTS_SRC" \
+    $SHIM_TTS_SRC \
     $SHIM_DEFINES \
     $SHIM_INCLUDES \
     $SHIM_LIBS
+
+# Build web shim (tiny LD_PRELOAD for MoveWebService PIN challenge detection)
+echo "Building web shim..."
+"${CROSS_PREFIX}gcc" -g -shared -fPIC \
+    -o build/move-anything-web-shim.so \
+    src/host/web_shim.c \
+    src/host/unified_log.c \
+    -Isrc -Isrc/host \
+    -ldl -lrt
+
+echo "Building unified log CLI..."
+"${CROSS_PREFIX}gcc" -g -O3 \
+    src/host/unified_log_cli.c \
+    src/host/unified_log.c \
+    -o build/unified-log \
+    -Isrc -Isrc/host
 
 echo "Building Shadow POC..."
 
@@ -162,7 +204,7 @@ echo "Building Shadow UI..."
     -Isrc -Isrc/lib \
     -Ilibs/quickjs/quickjs-2025-04-26 \
     -Llibs/quickjs/quickjs-2025-04-26 \
-    -lquickjs -lm -ldl -lrt
+    -lquickjs -lm -ldl -lrt -lpthread
 
 # Build Link Audio subscriber (C++17, requires Link SDK)
 if [ -d "./libs/link/include/ableton" ]; then
@@ -171,14 +213,20 @@ if [ -d "./libs/link/include/ableton" ]; then
     "${CROSS_PREFIX}gcc" -c -g -O0 \
         src/host/arc4random_compat.c \
         -o build/arc4random_compat.o
+    "${CROSS_PREFIX}gcc" -c -g -O3 \
+        src/host/unified_log.c \
+        -o build/unified_log.o \
+        -Isrc -Isrc/host
     "${CROSS_PREFIX}g++" -std=c++17 -O3 -DNDEBUG \
         -DLINK_PLATFORM_UNIX=1 \
         -DLINK_PLATFORM_LINUX=1 \
         -Wno-multichar \
         -I./libs/link/include \
         -I./libs/link/modules/asio-standalone/asio/include \
+        -Isrc -Isrc/host \
         src/host/link_subscriber.cpp \
         build/arc4random_compat.o \
+        build/unified_log.o \
         -o build/link-subscriber \
         -lpthread -latomic \
         -static-libstdc++ \
@@ -192,31 +240,69 @@ mkdir -p ./build/test/
 if [ "$SCREEN_READER_ENABLED" = "1" ]; then
     echo "Building TTS test program..."
 
-    # Build Flite test program for testing TTS - using dynamic linking
+    # Build eSpeak-NG test program for testing TTS - using dynamic linking
     "${CROSS_PREFIX}gcc" -g -O3 \
-        test/test_flite.c \
-        -o build/test/test_flite \
+        test/test_espeak.c \
+        -o build/test/test_espeak \
         -I/usr/include \
         -L/usr/lib/aarch64-linux-gnu \
-        -lflite -lflite_cmu_us_kal -lflite_usenglish -lflite_cmulex \
+        -lespeak-ng \
         -lm -lpthread || echo "Warning: TTS test build failed"
-
-    echo "Copying Flite libraries for deployment..."
-
-    # Copy Flite .so files to build/lib/ for deployment to Move
-    mkdir -p ./build/lib/
-    cp -L /usr/lib/aarch64-linux-gnu/libflite.so.* ./build/lib/ 2>/dev/null || true
-    cp -L /usr/lib/aarch64-linux-gnu/libflite_cmu_us_kal.so.* ./build/lib/ 2>/dev/null || true
-    cp -L /usr/lib/aarch64-linux-gnu/libflite_usenglish.so.* ./build/lib/ 2>/dev/null || true
-    cp -L /usr/lib/aarch64-linux-gnu/libflite_cmulex.so.* ./build/lib/ 2>/dev/null || true
-    ./scripts/verify-flite-bundle.sh ./build/lib
-
-    # Copy Flite copyright notice (required by BSD-style license)
-    mkdir -p ./build/licenses/
-    cp /usr/share/doc/libflite1/copyright ./build/licenses/FLITE_LICENSE.txt 2>/dev/null || echo "Warning: Flite license file not found"
-else
-    echo "Skipping TTS/Flite artifacts (screen reader disabled)"
 fi
+
+# Always bundle TTS runtime libraries and data (even when screen reader is compiled
+# as disabled) so the screen reader can be enabled at runtime without rebuilding.
+echo "Bundling TTS runtime libraries..."
+mkdir -p ./build/lib/
+
+# eSpeak-NG libraries
+cp -L /usr/lib/aarch64-linux-gnu/libespeak-ng.so.* ./build/lib/ 2>/dev/null || true
+# libsonic (needed by eSpeak-NG for time-stretching/pitch-shifting)
+cp -L /usr/lib/aarch64-linux-gnu/libsonic.so.* ./build/lib/ 2>/dev/null || true
+# pcaudio stub (satisfies eSpeak-NG's libpcaudio symbols without pulling in
+# the full libpcaudio→libpulse→libX11 dependency chain)
+if command -v "${CROSS_PREFIX}gcc" >/dev/null 2>&1; then
+    echo "Building pcaudio stub library..."
+    "${CROSS_PREFIX}gcc" -shared -fPIC -o ./build/lib/libpcaudio.so.0 src/host/pcaudio_stub.c
+fi
+
+# Flite libraries
+cp -L /usr/lib/aarch64-linux-gnu/libflite.so.* ./build/lib/ 2>/dev/null || true
+cp -L /usr/lib/aarch64-linux-gnu/libflite_cmu_us_kal.so.* ./build/lib/ 2>/dev/null || true
+cp -L /usr/lib/aarch64-linux-gnu/libflite_usenglish.so.* ./build/lib/ 2>/dev/null || true
+cp -L /usr/lib/aarch64-linux-gnu/libflite_cmulex.so.* ./build/lib/ 2>/dev/null || true
+
+# eSpeak-NG data (English only, ~1.6MB instead of ~13MB)
+echo "Bundling eSpeak-NG data files..."
+ESPEAK_SRC=""
+if [ -d /usr/lib/aarch64-linux-gnu/espeak-ng-data ]; then
+    ESPEAK_SRC=/usr/lib/aarch64-linux-gnu/espeak-ng-data
+elif [ -d /usr/share/espeak-ng-data ]; then
+    ESPEAK_SRC=/usr/share/espeak-ng-data
+fi
+
+if [ -n "$ESPEAK_SRC" ]; then
+    mkdir -p ./build/espeak-ng-data/
+    cp "$ESPEAK_SRC"/phontab "$ESPEAK_SRC"/phonindex "$ESPEAK_SRC"/phondata ./build/espeak-ng-data/
+    cp "$ESPEAK_SRC"/phondata-manifest ./build/espeak-ng-data/ 2>/dev/null || true
+    cp "$ESPEAK_SRC"/intonations ./build/espeak-ng-data/
+    cp "$ESPEAK_SRC"/en_dict ./build/espeak-ng-data/
+    cp -r "$ESPEAK_SRC"/voices ./build/espeak-ng-data/
+    mkdir -p ./build/espeak-ng-data/lang/gmw/
+    cp "$ESPEAK_SRC"/lang/gmw/en* ./build/espeak-ng-data/lang/gmw/ 2>/dev/null || true
+else
+    echo "Warning: eSpeak-NG data directory not found"
+fi
+
+# Verify eSpeak-NG bundle if script is available
+if [ -f ./scripts/verify-espeak-bundle.sh ]; then
+    ./scripts/verify-espeak-bundle.sh ./build/lib ./build/espeak-ng-data || true
+fi
+
+# License files
+mkdir -p ./build/licenses/
+cp /usr/share/doc/libespeak-ng1/copyright ./build/licenses/ESPEAK_NG_LICENSE.txt 2>/dev/null || true
+cp /usr/share/doc/libflite1/copyright ./build/licenses/FLITE_LICENSE.txt 2>/dev/null || true
 
 echo "Building Signal Chain module..."
 
@@ -255,6 +341,13 @@ mkdir -p ./build/modules/midi_fx/arp/
     -o build/modules/midi_fx/arp/dsp.so \
     -Isrc
 
+# Build Velocity Scale MIDI FX
+mkdir -p ./build/modules/midi_fx/velocity_scale/
+"${CROSS_PREFIX}gcc" -g -O3 -shared -fPIC \
+    src/modules/midi_fx/velocity_scale/dsp/velocity_scale.c \
+    -o build/modules/midi_fx/velocity_scale/dsp.so \
+    -Isrc
+
 echo "Building Sound Generator plugins..."
 
 # Build Line In sound generator
@@ -266,18 +359,38 @@ mkdir -p ./build/modules/sound_generators/linein/
     -lm
 
 # Copy shared utilities
-cp ./src/shared/*.mjs ./build/shared/
+for f in ./src/shared/*.mjs; do
+    cp "$f" ./build/shared/
+done
+cp ./src/shared/*.json ./build/shared/ 2>/dev/null || true
+
+# Bundle Move Manual (fetched on host before Docker, or from prior build)
+if [ -f ".cache/move_manual.json" ]; then
+    cp .cache/move_manual.json ./build/shared/move_manual_bundled.json
+    echo "Bundled Move Manual ($(wc -c < .cache/move_manual.json) bytes)"
+else
+    echo "Warning: .cache/move_manual.json not found - no bundled manual"
+fi
 
 # Copy host files
 cp ./src/host/menu_ui.js ./build/host/
 cp ./src/host/*.mjs ./build/host/ 2>/dev/null || true
 cp ./src/host/version.txt ./build/host/
+# Build display server (live display SSE streaming to browser)
+echo "Building display server..."
+"${CROSS_PREFIX}gcc" -g -O3 \
+    src/host/display_server.c \
+    src/host/unified_log.c \
+    -o build/display-server \
+    -Isrc -Isrc/host \
+    -lrt
 
 # Copy shadow UI files
 cp ./src/shadow/shadow_ui.js ./build/shadow/
 
 # Copy scripts and assets
 cp ./src/shim-entrypoint.sh ./build/
+cp ./src/restart-move.sh ./build/ 2>/dev/null || true
 cp ./src/start.sh ./build/ 2>/dev/null || true
 cp ./src/stop.sh ./build/ 2>/dev/null || true
 
@@ -295,7 +408,10 @@ echo "Copying patches..."
 mkdir -p ./build/patches
 cp -r ./src/patches/*.json ./build/patches/ 2>/dev/null || true
 
-# Copy master presets directory
+# Copy track presets (ME Slot templates for Move's preset browser)
+echo "Copying track presets..."
+mkdir -p ./build/presets/track_presets
+cp ./src/presets/track_presets/*.json ./build/presets/track_presets/ 2>/dev/null || true
 
 # Copy curl binary for store module (if present)
 if [ -f "./libs/curl/curl" ]; then
@@ -306,7 +422,7 @@ else
     echo "Warning: libs/curl/curl not found - store module will not work without it"
 fi
 
-# Flite voice data is built into the Flite libraries - no separate data directory needed
+# eSpeak-NG data directory is copied to build/espeak-ng-data/ above
 
 echo "Build complete!"
 echo "Host binary: build/move-anything"
