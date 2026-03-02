@@ -112,6 +112,13 @@ import {
     SET_PAGE_BOX_H
 } from '/data/UserData/move-anything/shared/sampler_overlay.mjs';
 
+import {
+    buildFilepathBrowserState,
+    refreshFilepathBrowser,
+    moveFilepathBrowserSelection,
+    activateFilepathBrowserItem
+} from '/data/UserData/move-anything/shared/filepath_browser.mjs';
+
 /* Track buttons - derive from imported constants */
 const TRACK_CC_START = MoveRow4;  // CC 40
 const TRACK_CC_END = MoveRow1;    // CC 43
@@ -156,6 +163,7 @@ const VIEWS = {
     COMPONENT_EDIT: "compedit",  // Edit component (presets, params) via Shift+Click
     MASTER_FX: "masterfx",    // Master FX selection
     HIERARCHY_EDITOR: "hierarch", // Hierarchy-based parameter editor
+    FILEPATH_BROWSER: "filepathbrowser", // Generic filepath picker for filepath params
     KNOB_EDITOR: "knobedit",  // Edit knob assignments for a slot
     KNOB_PARAM_PICKER: "knobpick", // Pick parameter for a knob assignment
     STORE_PICKER_CATEGORIES: "storepickercats", // Store: browse categories
@@ -238,6 +246,7 @@ const VIEW_NAMES = {
     [VIEWS.COMPONENT_EDIT]: "Preset Picker",
     [VIEWS.MASTER_FX]: "Master FX",
     [VIEWS.HIERARCHY_EDITOR]: "Hierarchy Editor",
+    [VIEWS.FILEPATH_BROWSER]: "File Browser",
     [VIEWS.KNOB_EDITOR]: "Knob Editor",
     [VIEWS.KNOB_PARAM_PICKER]: "Parameter Picker",
     [VIEWS.STORE_PICKER_CATEGORIES]: "Module Store",
@@ -1079,6 +1088,20 @@ let hierEditorPresetEditMode = false; // true when editing params within a prese
 let hierEditorIsDynamicItems = false; // true when current level uses items_param
 let hierEditorSelectParam = "";       // param to set when item selected
 let hierEditorNavigateTo = "";        // level to navigate to after item selection (optional)
+
+/* Filepath browser state (for chain_params type: filepath) */
+let filepathBrowserState = null;
+let filepathBrowserParamKey = "";
+const FILEPATH_BROWSER_FS = {
+    readdir(path) {
+        const entries = os.readdir(path) || [];
+        if (Array.isArray(entries[0])) return entries[0];
+        return Array.isArray(entries) ? entries : [];
+    },
+    stat(path) {
+        return os.stat(path);
+    }
+};
 
 /* Loaded module UI state */
 let loadedModuleUi = null;       // The chain_ui object from loaded module
@@ -4452,6 +4475,8 @@ function enterHierarchyEditor(slotIndex, componentKey) {
     hierEditorEditMode = false;
     hierEditorIsMasterFx = false;
     hierEditorMasterFxSlot = -1;
+    filepathBrowserState = null;
+    filepathBrowserParamKey = "";
 
     /* Fetch chain_params metadata for this component */
     hierEditorChainParams = getComponentChainParams(slotIndex, componentKey);
@@ -4710,9 +4735,40 @@ function exitHierarchyEditor() {
     hierEditorPresetEditMode = false;
     hierEditorIsMasterFx = false;
     hierEditorMasterFxSlot = -1;
+    filepathBrowserState = null;
+    filepathBrowserParamKey = "";
 
     view = returnToMasterFx ? VIEWS.MASTER_FX : VIEWS.CHAIN_EDIT;
     needsRedraw = true;
+}
+
+/* Open generic file browser for a filepath parameter */
+function openHierarchyFilepathBrowser(key, meta) {
+    const effectiveMeta = meta || getParamMetadata(key);
+    if (!effectiveMeta || effectiveMeta.type !== "filepath") return false;
+
+    const fullKey = buildHierarchyParamKey(key);
+    const currentVal = getSlotParam(hierEditorSlot, fullKey) || "";
+
+    filepathBrowserParamKey = key;
+    filepathBrowserState = buildFilepathBrowserState(effectiveMeta, currentVal);
+    refreshFilepathBrowser(filepathBrowserState, FILEPATH_BROWSER_FS);
+    setView(VIEWS.FILEPATH_BROWSER);
+
+    if (filepathBrowserState.items.length > 0) {
+        const selected = filepathBrowserState.items[filepathBrowserState.selectedIndex];
+        announceMenuItem(selected.label || "File", "");
+    } else {
+        announce("No files found");
+    }
+
+    return true;
+}
+
+function closeHierarchyFilepathBrowser() {
+    filepathBrowserState = null;
+    filepathBrowserParamKey = "";
+    setView(VIEWS.HIERARCHY_EDITOR);
 }
 
 /* Get param metadata from chain_params */
@@ -5263,6 +5319,12 @@ function formatHierDisplayValue(key, val) {
         return val;
     }
 
+    if (meta && meta.type === "filepath") {
+        if (!val) return "";
+        const slashIdx = val.lastIndexOf('/');
+        return slashIdx >= 0 ? val.slice(slashIdx + 1) : val;
+    }
+
     const num = parseFloat(val);
     if (isNaN(num)) return val;
 
@@ -5279,6 +5341,43 @@ function formatHierDisplayValue(key, val) {
         return Math.round(num).toString();
     }
     return num.toFixed(2);
+}
+
+/* Draw filepath browser for filepath chain params */
+function drawFilepathBrowser() {
+    clear_screen();
+
+    const state = filepathBrowserState;
+    const title = state && state.title ? state.title : "File Browser";
+    drawHeader(truncateText(title, 24));
+
+    if (!state) {
+        print(4, LIST_TOP_Y, "Browser unavailable", 1);
+        drawFooter({ left: "Push: return", right: "Jog: scroll" });
+        return;
+    }
+
+    if (state.error) {
+        print(4, LIST_TOP_Y, truncateText(state.error, 20), 1);
+    }
+
+    if (!state.items || state.items.length === 0) {
+        print(4, LIST_TOP_Y + 10, "No files", 1);
+    } else {
+        drawMenuList({
+            items: state.items,
+            selectedIndex: state.selectedIndex,
+            listArea: { topY: LIST_TOP_Y, bottomY: FOOTER_RULE_Y },
+            getLabel: (item) => item.label,
+            getValue: () => ""
+        });
+    }
+
+    const selected = state.items && state.items.length > 0
+        ? state.items[state.selectedIndex]
+        : null;
+    const actionText = selected && selected.kind === "file" ? "Push: select" : "Push: open";
+    drawFooter({ left: actionText, right: "Jog: scroll" });
 }
 
 /* Draw the hierarchy-based parameter editor */
@@ -5440,7 +5539,10 @@ function drawHierarchyEditor() {
                 getLabel: (item) => item.label,
                 getValue: (item) => item.value,
                 valueAlignRight: true,
-                editMode: hierEditorEditMode
+                editMode: hierEditorEditMode,
+                scrollSelectedValue: true,
+                prioritizeSelectedValue: true,
+                selectedMinLabelChars: 6
             });
         }
 
@@ -5939,6 +6041,13 @@ function handleJog(delta) {
                     const param = hierEditorParams[hierEditorSelectedIdx];
                     announceMenuItem(param.label || param.key, param.value || "");
                 }
+            }
+            break;
+        case VIEWS.FILEPATH_BROWSER:
+            if (filepathBrowserState) {
+                moveFilepathBrowserSelection(filepathBrowserState, delta);
+                const selected = filepathBrowserState.items[filepathBrowserState.selectedIndex];
+                if (selected) announceMenuItem(selected.label || "File", "");
             }
             break;
         case VIEWS.KNOB_EDITOR:
@@ -6571,8 +6680,34 @@ function handleSelect() {
                         }
                     }
                 } else {
-                    /* Normal param - toggle edit mode */
-                    hierEditorEditMode = !hierEditorEditMode;
+                    /* Normal param - open filepath browser or toggle edit mode */
+                    const selectedKey = (selectedParam && typeof selectedParam === "object")
+                        ? (selectedParam.key || selectedParam)
+                        : selectedParam;
+                    const meta = getParamMetadata(selectedKey);
+                    if (!hierEditorEditMode && meta && meta.type === "filepath") {
+                        openHierarchyFilepathBrowser(selectedKey, meta);
+                    } else {
+                        hierEditorEditMode = !hierEditorEditMode;
+                    }
+                }
+            }
+            break;
+        case VIEWS.FILEPATH_BROWSER:
+            if (!filepathBrowserState) {
+                closeHierarchyFilepathBrowser();
+                break;
+            }
+            {
+                const result = activateFilepathBrowserItem(filepathBrowserState);
+                if (result.action === "open") {
+                    refreshFilepathBrowser(filepathBrowserState, FILEPATH_BROWSER_FS);
+                } else if (result.action === "select") {
+                    const key = filepathBrowserParamKey || result.key;
+                    const fullKey = buildHierarchyParamKey(key);
+                    setSlotParam(hierEditorSlot, fullKey, result.value || "");
+                    announceParameter(filepathBrowserState.title || key, result.filename || result.value || "");
+                    closeHierarchyFilepathBrowser();
                 }
             }
             break;
@@ -6954,6 +7089,14 @@ function handleBack() {
             announce("Chain Editor");
             needsRedraw = true;
             break;
+        case VIEWS.FILEPATH_BROWSER:
+            closeHierarchyFilepathBrowser();
+            {
+                const ld = getHierarchyLevelDef();
+                announce(ld && ld.label ? ld.label : "Parameters");
+            }
+            needsRedraw = true;
+            break;
         case VIEWS.HIERARCHY_EDITOR: {
             /* Helper: announce current hierarchy level label after navigation */
             const announceHierLevel = () => {
@@ -7260,7 +7403,7 @@ function drawSlots() {
         selectedIndex: selectedSlot,
         listArea: { topY: LIST_TOP_Y, bottomY: FOOTER_RULE_Y },
         getLabel: (item) => item.label,
-        getValue: (item) => item.value,
+                getValue: (item) => item.value,
         valueAlignRight: true
     });
     /* Debug: show flags value in footer */
@@ -8991,6 +9134,9 @@ globalThis.tick = function() {
             break;
         case VIEWS.HIERARCHY_EDITOR:
             drawHierarchyEditor();
+            break;
+        case VIEWS.FILEPATH_BROWSER:
+            drawFilepathBrowser();
             break;
         case VIEWS.KNOB_EDITOR:
             drawKnobEditor();
