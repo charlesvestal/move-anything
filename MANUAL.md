@@ -41,19 +41,35 @@ After installation, Move will restart automatically.
 
 ---
 
+## Uninstall
+
+Run:
+```
+curl -L https://raw.githubusercontent.com/charlesvestal/move-anything/main/scripts/uninstall.sh | sh
+```
+
+By default, uninstall exports inactive Set Pages backups to `/data/UserData/UserLibrary/Move Everything Backups/Set Pages/` before removing Move Everything.
+
+To skip that export and permanently delete Move Anything data:
+```
+curl -L https://raw.githubusercontent.com/charlesvestal/move-anything/main/scripts/uninstall.sh | sh -s -- --purge-data
+```
+
+---
+
 ## Shortcuts
 
 All shortcuts use **Shift + touch Volume knob** as a modifier:
 
 | Shortcut | Action |
 |----------|--------|
-| **Shift+Vol + Track 1-4** | Open that slot's editor |
-| **Shift+Vol + Menu** | Open Master FX |
+| **Shift+Vol + Track 1-4**| Open that slot's editor |
+| **Shift+Vol + Note/Session** | Open Master FX |
 | **Shift+Vol + Step 2** | Open Global Settings |
 | **Shift+Vol + Jog Click** | Open Overtake menu (or exit Overtake mode) |
 | **Shift+Sample** | Open Quantized Sampler |
 | **Shift+Capture** | Skipback (save last 30 seconds) |
-| **Shift+Left/Right** | Switch set page (when enabled) |
+| **Shift+Vol + Left/Right** | Switch set page (when enabled) |
 
 **Tip:** You can access slots directly from normal Move mode - you don't need to be in shadow mode first.
 
@@ -144,8 +160,8 @@ Set Pages let you organize your sets into 8 switchable pages. Each page holds it
 
 ### Usage
 
-- **Shift+Left**: Switch to the previous page
-- **Shift+Right**: Switch to the next page
+- **Shift+Vol+Left**: Switch to the previous page
+- **Shift+Vol+Right**: Switch to the next page
 
 A toast overlay shows "Loading Page X/8..." during the switch. Move restarts automatically to load the new page's sets.
 
@@ -180,11 +196,13 @@ The setting takes effect immediately (no restart needed) and persists across reb
 
 Move Everything also forwards pitch bend, mod wheel, sustain, and other CCs from external MIDI controllers.
 
+**Tip:** Some synths and FX (i.e. Arp) utilize Midi Cloc for tempo sync. Make sure your Move is set to "Midi Clock: Out" for these to pick up sync correctly. 
+
 ---
 
 ## Master FX
 
-Access via **Shift+Vol + Menu**. Contains four audio effect slots that process the mixed output of all instrument slots.
+Access via **Shift+Vol + Note/Session**. Contains four audio effect slots that process the mixed output of all instrument slots.
 
 Global settings (Link Audio, Resample Src, Mirror Display, Screen Reader, Set Pages, Help, Updates) are accessed via **Shift+Vol + Step 2**.
 
@@ -286,7 +304,7 @@ Access via **Shift+Sample**. Records Move's audio output (including Move Everyth
 3. Recording starts on a note event or pressing Play
 4. Press **Shift+Sample** again to stop (or it stops automatically at the set duration)
 
-Recordings are saved to `Samples/Move Everything/`.
+Recordings are saved to `Samples/Move Everything/Resampler/YYYY-MM-DD/`.
 
 Uses MIDI clock for accurate bar timing, falling back to project tempo if no clock is available. You can also use Move's built-in count-in for line-in recordings.
 
@@ -296,7 +314,7 @@ Press **Shift+Capture** to save the last 30 seconds of audio to disk.
 
 Move Everything continuously maintains a 30-second rolling buffer of audio. When triggered, it dumps this buffer to a WAV file instantly without interrupting playback.
 
-Files are saved to `Samples/Move Everything/Skipback/`. Uses the same source setting as the Quantized Sampler (Resample or Move Input).
+Files are saved to `Samples/Move Everything/Skipback/YYYY-MM-DD/`. Uses the same source setting as the Quantized Sampler (Resample or Move Input).
 
 ---
 
@@ -380,7 +398,7 @@ To exit an overtake module: **Shift+Vol + Jog Click** (works anytime)
 
 Move Everything includes an optional screen reader for accessibility, using text-to-speech to announce UI elements.
 
-Toggle via **Global Settings > Screen Reader** (**Shift+Vol + Step 2**), or **Shift+Menu** when Shadow UI is disabled.
+Toggle via **Global Settings > Screen Reader** (**Shift+Vol + Step 2**), or **Shift+Note/Session** when Shadow UI is disabled.
 
 Settings:
 - **Speed**: 0.5x to 2.0x
@@ -437,5 +455,5 @@ Muted slots are silenced but continue processing MIDI. Solo isolates a single sl
 ## Tips
 
 - Each Move Set has its own slot configurations — switch Sets to switch between different instrument setups
-- Use Set Pages to organize sets by project or performance — Shift+Left/Right to switch
+- Use Set Pages to organize sets by project or performance — Shift+Vol+Left/Right to switch
 - If something goes wrong, use Move's DFU restore mode to reset

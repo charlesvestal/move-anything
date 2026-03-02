@@ -4,8 +4,8 @@
     "name": "Move Anything",
     "github_repo": "charlesvestal/move-anything",
     "asset_name": "move-anything.tar.gz",
-    "latest_version": "0.5.10",
-    "download_url": "https://github.com/charlesvestal/move-anything/releases/download/v0.5.10/move-anything.tar.gz",
+    "latest_version": "0.5.15",
+    "download_url": "https://github.com/charlesvestal/move-anything/releases/download/v0.5.15/move-anything.tar.gz",
     "min_host_version": "0.1.0"
   },
   "modules": [
@@ -324,15 +324,15 @@
       "min_host_version": "0.5.8"
     },
     {
-	  "id": "eucalypso",
-	  "name": "Eucalypso",
-	  "description": "Deterministic 4-lane Euclidean MIDI sequencer with held/scale note registers, retrigger modes, and seeded modulation",
-	  "author": "dom",
-	  "component_type": "midi_fx",
-	  "github_repo": "handcraftedcc/move-anything-eucalypso",
-	  "default_branch": "main",
-	  "asset_name": "eucalypso-module.tar.gz",
-	  "min_host_version": "0.3.0"
+      "id": "eucalypso",
+      "name": "Eucalypso",
+      "description": "Deterministic 4-lane Euclidean MIDI sequencer with held/scale note registers, retrigger modes, and seeded modulation",
+      "author": "dom",
+      "component_type": "midi_fx",
+      "github_repo": "handcraftedcc/move-anything-eucalypso",
+      "default_branch": "main",
+      "asset_name": "eucalypso-module.tar.gz",
+      "min_host_version": "0.3.0"
     },
     {
       "id": "rex",

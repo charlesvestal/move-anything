@@ -605,9 +605,10 @@ const GLOBAL_SETTINGS_SECTIONS = [
     {
         id: "audio", label: "Audio",
         items: [
-            { key: "link_audio_routing", label: "Link Audio", type: "bool" },
-            { key: "resample_bridge", label: "Resample Src", type: "enum",
-              options: ["Off", "Replace"], values: [0, 2] }
+            { key: "link_audio_routing", label: "Route thru ME", type: "bool" },
+            { key: "link_audio_publish", label: "ME->Link Audio", type: "bool" },
+            { key: "resample_bridge", label: "Sampling Src", type: "enum",
+              options: ["Native", "ME Mix"], values: [0, 2] }
         ]
     },
     {
@@ -645,8 +646,32 @@ let globalSettingsInSection = false;
 let globalSettingsItemIndex = 0;
 let globalSettingsEditing = false;
 
-const RESAMPLE_BRIDGE_LABEL_BY_MODE = { 0: "Off", 2: "Replace" };
+const RESAMPLE_BRIDGE_LABEL_BY_MODE = { 0: "Native", 2: "ME Mix" };
 const RESAMPLE_BRIDGE_VALUES = [0, 2];
+
+/* Check Move's system Link setting via shim param (reads Settings.json) */
+function checkSystemLinkEnabled() {
+    try {
+        const val = shadow_get_param(0, "master_fx:system_link_enabled");
+        systemLinkEnabled = (val === "1");
+    } catch (e) { /* keep previous value */ }
+}
+
+/* Show warning overlay if a Link Audio setting is on but system Link is off.
+ * Optional settingName focuses the message on what was just toggled. */
+function warnIfLinkDisabled(settingName) {
+    checkSystemLinkEnabled();
+    if (systemLinkEnabled === false) {
+        const routingOn = shadow_get_param(0, "master_fx:link_audio_routing") === "1";
+        const publishOn = shadow_get_param(0, "master_fx:link_audio_publish") === "1";
+        if (routingOn || publishOn) {
+            const name = settingName || (routingOn ? "Route thru ME" : "ME->Link Audio");
+            warningTitle = name;
+            warningLines = wrapText("requires Link enabled in Move System Settings", 18);
+            warningActive = true;
+        }
+    }
+}
 
 function parseResampleBridgeMode(raw) {
     if (raw === null || raw === undefined) return 0;
@@ -1033,6 +1058,8 @@ let inMasterPresetPicker = false;    // True when showing preset picker
  * loadMasterFxChainFromConfig() has restored the correct values. */
 let cachedResampleBridgeMode = 0;
 let cachedLinkAudioRouting = false;
+let cachedLinkAudioPublish = false;
+let systemLinkEnabled = null; /* null = not checked yet */
 
 /* Master preset CRUD state (reuse pattern from slot presets) */
 let masterPendingSaveName = "";
@@ -1110,11 +1137,12 @@ let loadedModuleComponent = "";  // "synth", "fx1", "fx2"
 let moduleUiLoadError = false;   // True if load failed
 
 /* Asset warning overlay state */
-let assetWarningActive = false;  // True when showing asset warning overlay
-let assetWarningTitle = "";      // e.g., "Dexed Warning"
-let assetWarningLines = [];      // Wrapped error message lines
-let assetWarningShownForSlots = new Set();  // Track which chain slots have shown warnings
-let assetWarningShownForMasterFx = new Set();  // Track which Master FX slots have shown warnings
+let warningActive = false;  // True when showing warning overlay
+let warningTitle = "";      // Warning overlay title
+let warningLines = [];      // Wrapped warning message lines
+let warningShownForSlots = new Set();  // Track which chain slots have shown warnings
+let warningShownForMidiFxSlots = new Set();  // Track which slots have shown MIDI FX warnings
+let warningShownForMasterFx = new Set();  // Track which Master FX slots have shown warnings
 
 const MODULES_ROOT = "/data/UserData/move-anything/modules";
 
@@ -1296,11 +1324,26 @@ function checkAndShowSynthError(slotIndex) {
     const synthError = getSlotParam(slotIndex, "synth_error");
     if (synthError && synthError.length > 0) {
         const synthName = getSlotParam(slotIndex, "synth:name") || "Synth";
-        assetWarningTitle = `${synthName} Warning`;
-        assetWarningLines = wrapText(synthError, 18);
-        assetWarningActive = true;
+        warningTitle = `${synthName} Warning`;
+        warningLines = wrapText(synthError, 18);
+        warningActive = true;
         /* Announce the error */
-        announce(`${assetWarningTitle}: ${synthError}`);
+        announce(`${warningTitle}: ${synthError}`);
+        needsRedraw = true;
+        return true;
+    }
+    return false;
+}
+
+/* Check for MIDI FX warning in a slot and show warning if found */
+function checkAndShowMidiFxError(slotIndex) {
+    const midiFxError = getSlotParam(slotIndex, "midi_fx1:error");
+    if (midiFxError && midiFxError.length > 0) {
+        const midiFxName = getSlotParam(slotIndex, "midi_fx1:name") || "MIDI FX";
+        warningTitle = `${midiFxName} Warning`;
+        warningLines = wrapText(midiFxError, 18);
+        warningActive = true;
+        announce(`${warningTitle}: ${midiFxError}`);
         needsRedraw = true;
         return true;
     }
@@ -1314,11 +1357,11 @@ function checkAndShowMasterFxError(fxSlot) {
     const fxError = getMasterFxParam(fxSlot, "error");
     if (fxError && fxError.length > 0) {
         const fxName = getMasterFxParam(fxSlot, "name") || `FX ${fxNum}`;
-        assetWarningTitle = `${fxName} Warning`;
-        assetWarningLines = wrapText(fxError, 18);
-        assetWarningActive = true;
+        warningTitle = `${fxName} Warning`;
+        warningLines = wrapText(fxError, 18);
+        warningActive = true;
         /* Announce the error */
-        announce(`${assetWarningTitle}: ${fxError}`);
+        announce(`${warningTitle}: ${fxError}`);
         needsRedraw = true;
         return true;
     }
@@ -1326,10 +1369,10 @@ function checkAndShowMasterFxError(fxSlot) {
 }
 
 /* Dismiss asset warning overlay */
-function dismissAssetWarning() {
-    assetWarningActive = false;
-    assetWarningTitle = "";
-    assetWarningLines = [];
+function dismissWarning() {
+    warningActive = false;
+    warningTitle = "";
+    warningLines = [];
     needsRedraw = true;
 }
 
@@ -1422,7 +1465,21 @@ function getSlotParam(slot, key) {
 function setSlotParam(slot, key, value) {
     if (typeof shadow_set_param !== "function") return false;
     try {
-        return shadow_set_param(slot, key, String(value));
+        const ok = shadow_set_param(slot, key, String(value));
+        if (!ok) return false;
+
+        /* Re-check MIDI FX warnings immediately after sync/module changes. */
+        if (key === "midi_fx1:module") {
+            warningShownForMidiFxSlots.delete(slot);
+        }
+        if (key === "midi_fx1:sync") {
+            warningShownForMidiFxSlots.delete(slot);
+            if (String(value) === "clock") {
+                checkAndShowMidiFxError(slot);
+            }
+        }
+
+        return true;
     } catch (e) {
         return false;
     }
@@ -1883,7 +1940,8 @@ function setMasterFxModule(moduleId) {
 
 function loadPatchByIndex(slot, index) {
     /* Clear warning tracking for this slot so new warnings can show */
-    assetWarningShownForSlots.delete(slot);
+    warningShownForSlots.delete(slot);
+    warningShownForMidiFxSlots.delete(slot);
     return setSlotParam(slot, "load_patch", index);
 }
 
@@ -2562,6 +2620,7 @@ function doSavePreset(slotIndex, name) {
     overwriteTargetIndex = -1;
 
     loadPatchList();
+    announce("Chain Settings");
     /* Save complete */
     needsRedraw = true;
 }
@@ -2598,6 +2657,20 @@ function doDeletePreset(slotIndex) {
     setView(VIEWS.CHAIN_EDIT);
     /* Delete complete */
     needsRedraw = true;
+}
+
+function getSavePreviewText(name) {
+    if (!name || name === "") return "Untitled";
+    return name;
+}
+
+function announceSavePreview(name, selectedIndex, full = true) {
+    const selected = selectedIndex === 0 ? "Edit" : "OK";
+    if (!full) {
+        announce(selected);
+        return;
+    }
+    announce(`Save As, current text: ${getSavePreviewText(name)}. ${selected} selected`);
 }
 
 /* Enter slot settings view */
@@ -2867,6 +2940,58 @@ function handleMasterFxSettingsAction(key) {
                 debugLog("Move Manual not available: " + e);
             }
         }
+        /* Scan installed modules for help.json files (rescan each time to pick up new installs) */
+        if (helpContent && helpContent.sections) {
+            try {
+                /* Remove previous Modules section if present */
+                const oldIdx = helpContent.sections.findIndex(s => s.title === "Modules");
+                if (oldIdx >= 0) helpContent.sections.splice(oldIdx, 1);
+
+                const MODULES_DIR = "/data/UserData/move-anything/modules";
+                const moduleHelpChildren = [];
+                const entries = os.readdir(MODULES_DIR) || [];
+                const dirList = entries[0];
+                if (Array.isArray(dirList)) {
+                    for (const entry of dirList) {
+                        if (entry === "." || entry === "..") continue;
+                        const entryPath = `${MODULES_DIR}/${entry}`;
+                        /* Check top-level module dirs and category subdirs */
+                        const checkHelp = function(dirPath) {
+                            try {
+                                const helpRaw = std.loadFile(`${dirPath}/help.json`);
+                                if (!helpRaw) return;
+                                const helpData = JSON.parse(helpRaw);
+                                if (helpData.title && helpData.children) {
+                                    moduleHelpChildren.push(helpData);
+                                }
+                            } catch (e) { /* skip */ }
+                        };
+                        checkHelp(entryPath);
+                        /* Scan subdirectories (sound_generators/, audio_fx/, etc.) */
+                        try {
+                            const subEntries = os.readdir(entryPath) || [];
+                            const subDirList = subEntries[0];
+                            if (Array.isArray(subDirList)) {
+                                for (const subEntry of subDirList) {
+                                    if (subEntry === "." || subEntry === "..") continue;
+                                    checkHelp(`${entryPath}/${subEntry}`);
+                                }
+                            }
+                        } catch (e) { /* not a directory */ }
+                    }
+                }
+                if (moduleHelpChildren.length > 0) {
+                    moduleHelpChildren.sort((a, b) => a.title.localeCompare(b.title));
+                    const modulesSection = { title: "Modules", children: moduleHelpChildren };
+                    /* Insert after "Move Everything" (index 0) */
+                    const meIdx = helpContent.sections.findIndex(s => s.title === "Move Everything");
+                    helpContent.sections.splice(meIdx >= 0 ? meIdx + 1 : 1, 0, modulesSection);
+                    debugLog("Loaded module help: " + moduleHelpChildren.length + " modules");
+                }
+            } catch (e) {
+                debugLog("Module help scan failed: " + e);
+            }
+        }
         /* Ensure Notice section is always present */
         if (helpContent && helpContent.sections &&
             !helpContent.sections.find(s => s.title === "Notice")) {
@@ -2927,7 +3052,7 @@ function handleMasterFxSettingsAction(key) {
             masterShowingNamePreview = true;
             masterNamePreviewIndex = 1;  /* Default to OK */
             masterOverwriteFromKeyboard = true;
-            announce(`Confirm save as: ${masterPendingSaveName}`);
+            announceSavePreview(masterPendingSaveName, masterNamePreviewIndex);
             needsRedraw = true;
         }
     } else if (key === "save_as") {
@@ -2937,7 +3062,7 @@ function handleMasterFxSettingsAction(key) {
         masterNamePreviewIndex = 1;
         masterOverwriteFromKeyboard = true;
         masterOverwriteTargetIndex = -1;  /* Force create new */
-        announce(`Confirm save as: ${masterPendingSaveName}`);
+        announceSavePreview(masterPendingSaveName, masterNamePreviewIndex);
         needsRedraw = true;
     } else if (key === "check_updates") {
         /* Check for updates now */
@@ -3095,7 +3220,7 @@ function getMasterFxSlotModule(slotIndex) {
 function setMasterFxSlotModule(slotIndex, dspPath) {
     if (typeof shadow_set_param !== "function") return false;
     /* Clear warning tracking for this slot so warning can show again for new module */
-    assetWarningShownForMasterFx.delete(slotIndex);
+    warningShownForMasterFx.delete(slotIndex);
     try {
         return shadow_set_param(0, `master_fx:fx${slotIndex + 1}:module`, dspPath || "");
     } catch (e) {
@@ -3249,6 +3374,7 @@ function saveMasterFxChainConfig() {
          * before loadMasterFxChainFromConfig() has restored them. */
         config.resample_bridge_mode = cachedResampleBridgeMode;
         config.link_audio_routing = cachedLinkAudioRouting;
+        config.link_audio_publish = cachedLinkAudioPublish;
 
         host_write_file(configPath, JSON.stringify(config, null, 2));
     } catch (e) {
@@ -3315,6 +3441,10 @@ function loadMasterFxChainFromConfig() {
         if (config.link_audio_routing !== undefined && typeof shadow_set_param === "function") {
             shadow_set_param(0, "master_fx:link_audio_routing", config.link_audio_routing ? "1" : "0");
             cachedLinkAudioRouting = !!config.link_audio_routing;
+        }
+        if (config.link_audio_publish !== undefined && typeof shadow_set_param === "function") {
+            shadow_set_param(0, "master_fx:link_audio_publish", config.link_audio_publish ? "1" : "0");
+            cachedLinkAudioPublish = !!config.link_audio_publish;
         }
 
         if (!config.master_fx_chain) return;
@@ -5643,6 +5773,10 @@ function getMasterFxSettingValue(setting) {
         const val = shadow_get_param(0, "master_fx:link_audio_routing");
         return (val === "1") ? "On" : "Off";
     }
+    if (setting.key === "link_audio_publish") {
+        const val = shadow_get_param(0, "master_fx:link_audio_publish");
+        return (val === "1") ? "On" : "Off";
+    }
     if (setting.key === "resample_bridge") {
         const modeRaw = shadow_get_param(0, "master_fx:resample_bridge");
         const mode = parseResampleBridgeMode(modeRaw);
@@ -5716,6 +5850,16 @@ function adjustMasterFxSetting(setting, delta) {
         shadow_set_param(0, "master_fx:link_audio_routing", newVal);
         cachedLinkAudioRouting = (newVal === "1");
         saveMasterFxChainConfig();
+        if (newVal === "1") warnIfLinkDisabled("Route thru ME");
+        return;
+    }
+    if (setting.key === "link_audio_publish") {
+        const current = shadow_get_param(0, "master_fx:link_audio_publish");
+        const newVal = (current === "1") ? "0" : "1";
+        shadow_set_param(0, "master_fx:link_audio_publish", newVal);
+        cachedLinkAudioPublish = (newVal === "1");
+        saveMasterFxChainConfig();
+        if (newVal === "1") warnIfLinkDisabled("ME->Link Audio");
         return;
     }
     if (setting.key === "resample_bridge") {
@@ -5729,6 +5873,11 @@ function adjustMasterFxSetting(setting, delta) {
         shadow_set_param(0, "master_fx:resample_bridge", String(values[nextIdx]));
         cachedResampleBridgeMode = values[nextIdx];
         saveMasterFxChainConfig();
+        if (values[nextIdx] === 2) {
+            warningTitle = "ME Mix";
+            warningLines = wrapText("Replaces Mic and Line-in with ME + Move Audio", 18);
+            warningActive = true;
+        }
         return;
     }
 
@@ -5817,25 +5966,29 @@ function updateFocusedSlot(slot) {
     }
 
     /* Check for synth errors when selecting a chain slot (not Master FX) */
-    if (slot >= 0 && slot < SHADOW_UI_SLOTS && !assetWarningShownForSlots.has(slot)) {
-        const synthModule = getSlotParam(slot, "synth_module");
-        if (synthModule && synthModule.length > 0) {
-            /* Slot has a synth - check for errors */
-            if (checkAndShowSynthError(slot)) {
-                assetWarningShownForSlots.add(slot);
+    if (slot >= 0 && slot < SHADOW_UI_SLOTS) {
+        if (!warningShownForSlots.has(slot)) {
+            const synthModule = getSlotParam(slot, "synth_module");
+            if (synthModule && synthModule.length > 0) {
+                /* Slot has a synth - check for errors */
+                if (checkAndShowSynthError(slot)) {
+                    warningShownForSlots.add(slot);
+                    return;
+                }
             }
         }
+
     }
 
     /* Check for Master FX errors when selecting the Master FX slot (slot 4) */
     if (slot === SHADOW_UI_SLOTS) {  /* Slot 4 = Master FX */
         for (let fx = 0; fx < 4; fx++) {
-            if (assetWarningShownForMasterFx.has(fx)) continue;
+            if (warningShownForMasterFx.has(fx)) continue;
             const fxModule = getMasterFxParam(fx, "module");
             if (fxModule && fxModule.length > 0) {
                 /* FX slot has a module loaded - check for errors */
                 if (checkAndShowMasterFxError(fx)) {
-                    assetWarningShownForMasterFx.add(fx);
+                    warningShownForMasterFx.add(fx);
                     break;  /* Show one warning at a time */
                 }
             }
@@ -5856,7 +6009,7 @@ function handleJog(delta) {
             if (masterShowingNamePreview) {
                 /* Navigate Edit/OK */
                 masterNamePreviewIndex = masterNamePreviewIndex === 0 ? 1 : 0;
-                announce(masterNamePreviewIndex === 0 ? "Edit" : "OK");
+                announceSavePreview(masterPendingSaveName, masterNamePreviewIndex, false);
             } else if (masterConfirmingOverwrite || masterConfirmingDelete) {
                 /* Navigate No/Yes */
                 masterConfirmIndex = masterConfirmIndex === 0 ? 1 : 0;
@@ -5992,7 +6145,7 @@ function handleJog(delta) {
         case VIEWS.CHAIN_SETTINGS:
             if (showingNamePreview) {
                 namePreviewIndex = namePreviewIndex === 0 ? 1 : 0;
-                announce(namePreviewIndex === 0 ? "Edit" : "OK");
+                announceSavePreview(pendingSaveName, namePreviewIndex, false);
             } else if (confirmingOverwrite || confirmingDelete) {
                 confirmIndex = confirmIndex === 0 ? 1 : 0;
                 announce(confirmIndex === 0 ? "No" : "Yes");
@@ -6163,14 +6316,17 @@ function handleSelect() {
                     openTextEntry({
                         title: "Save As",
                         initialText: savedName,
+                        onAnnounce: announce,
                         onConfirm: (newName) => {
                             masterPendingSaveName = newName;
                             masterShowingNamePreview = true;
                             masterNamePreviewIndex = 1;
+                            announceSavePreview(masterPendingSaveName, masterNamePreviewIndex);
                             needsRedraw = true;
                         },
                         onCancel: () => {
                             masterShowingNamePreview = true;
+                            announceSavePreview(masterPendingSaveName, masterNamePreviewIndex);
                             needsRedraw = true;
                         }
                     });
@@ -6198,6 +6354,7 @@ function handleSelect() {
                     if (masterOverwriteFromKeyboard) {
                         masterShowingNamePreview = true;
                         masterNamePreviewIndex = 0;
+                        announceSavePreview(masterPendingSaveName, masterNamePreviewIndex);
                     }
                     /* If not from keyboard, just return to settings menu */
                 } else {
@@ -6430,17 +6587,19 @@ function handleSelect() {
                         openTextEntry({
                             title: "Save As",
                             initialText: savedName,
+                            onAnnounce: announce,
                             onConfirm: (newName) => {
                                 pendingSaveName = newName;
                                 /* Return to name preview with edited name */
                                 showingNamePreview = true;
                                 namePreviewIndex = 1;  /* Default to OK */
-                                announce(`Confirm save as: ${pendingSaveName}`);
+                                announceSavePreview(pendingSaveName, namePreviewIndex);
                                 needsRedraw = true;
                             },
                             onCancel: () => {
                                 /* Return to name preview unchanged */
                                 showingNamePreview = true;
+                                announceSavePreview(pendingSaveName, namePreviewIndex);
                                 needsRedraw = true;
                             }
                         });
@@ -6471,6 +6630,7 @@ function handleSelect() {
                             /* Came from Save/Save As flow - return to name preview */
                             showingNamePreview = true;
                             namePreviewIndex = 0;  /* Default to Edit so they can change the name */
+                            announceSavePreview(pendingSaveName, namePreviewIndex);
                         } else {
                             /* Direct Save on existing - just return to settings */
                             pendingSaveName = "";
@@ -6508,6 +6668,7 @@ function handleSelect() {
                             showingNamePreview = true;
                             namePreviewIndex = 1;  /* Default to OK */
                             overwriteFromKeyboard = true;  /* Will use keyboard if Edit is selected */
+                            announceSavePreview(pendingSaveName, namePreviewIndex);
                             needsRedraw = true;
                         } else {
                             /* Existing - confirm overwrite (no keyboard needed) */
@@ -6527,6 +6688,7 @@ function handleSelect() {
                         showingNamePreview = true;
                         namePreviewIndex = 1;  /* Default to OK */
                         overwriteFromKeyboard = true;  /* Will use keyboard if Edit is selected */
+                        announceSavePreview(pendingSaveName, namePreviewIndex);
                         needsRedraw = true;
                     } else if (setting.key === "delete") {
                         if (isExistingPreset(selectedSlot)) {
@@ -6928,6 +7090,7 @@ function handleSelect() {
                     const firstItem = section.items[0];
                     const value = firstItem.type === "action" ? "" : getMasterFxSettingValue(firstItem);
                     announce(section.label + ", " + firstItem.label + (value ? ": " + value : ""));
+                    if (section.id === "audio") warnIfLinkDisabled();
                 }
             }
             break;
@@ -7294,7 +7457,7 @@ function handleBack() {
                 const section = GLOBAL_SETTINGS_SECTIONS[globalSettingsSectionIndex];
                 const item = section.items[globalSettingsItemIndex];
                 const val = getMasterFxSettingValue(item);
-                announce(item.label + ", " + val);
+                announce(item.label + (val ? ", " + val : ""));
             } else if (globalSettingsInSection) {
                 /* Return to section list */
                 globalSettingsInSection = false;
@@ -8557,7 +8720,10 @@ function drawMasterFx() {
         if (moduleData && moduleData.module) {
             /* Get display name from MASTER_FX_OPTIONS */
             const opt = MASTER_FX_OPTIONS.find(o => o.id === moduleData.module);
-            infoLine = opt ? opt.name : moduleData.module;
+            const displayName = opt ? opt.name : moduleData.module;
+            const preset = getMasterFxParam(selectedMasterFxComponent, "preset_name") ||
+                          getMasterFxParam(selectedMasterFxComponent, "preset") || "";
+            infoLine = preset ? `${displayName} (${truncateText(preset, 8)})` : displayName;
         } else {
             infoLine = "(empty)";
         }
@@ -9254,9 +9420,9 @@ globalThis.tick = function() {
         drawTextEntry();
     }
 
-    /* Draw asset warning overlay if active */
-    if (assetWarningActive) {
-        drawMessageOverlay(assetWarningTitle, assetWarningLines);
+    /* Draw warning overlay if active */
+    if (warningActive) {
+        drawMessageOverlay(warningTitle, warningLines);
     }
 
     /* Draw overlay on top of main view (uses shared overlay system) */
@@ -9283,10 +9449,14 @@ globalThis.onMidiMessageInternal = function(data) {
         }
     }
 
-    /* Dismiss asset warning overlay on any button press */
-    if (assetWarningActive && (status & 0xF0) === 0xB0 && d2 > 0) {
-        dismissAssetWarning();
-        return;  /* Consumed - don't process further */
+    /* Dismiss warning overlay on button presses, but not knob turns. */
+    if (warningActive && (status & 0xF0) === 0xB0 && d2 > 0) {
+        const isMainKnobTurn = d1 === MoveMainKnob;
+        const isParamKnobTurn = d1 >= KNOB_CC_START && d1 <= KNOB_CC_END;
+        if (!isMainKnobTurn && !isParamKnobTurn) {
+            dismissWarning();
+            return;  /* Consumed - don't process further */
+        }
     }
 
     /* Debug: track last CC for display (only for CC messages) */
