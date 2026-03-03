@@ -599,8 +599,10 @@ You must keep `CURRENT_SHAPE.md` up to date as a side effect of your normal work
 
 **Litmus test:** After making a change, ask: could an external AI agent now make a wrong assumption about the project because `CURRENT_SHAPE.md` doesn't reflect what changed? If yes, update it.
 
-**What to keep accurate:** Everything that defines how the project works right now — architecture, key files, conventions, constraints, concepts, tools, dependencies, and on-device layout. If any of these changed during your work, the file should reflect reality when you're done.
+**What to keep accurate:** Everything that defines how the project works right now — architecture, key files, conventions, constraints, firmware compatibility, concepts, tools, dependencies, and on-device layout. If any of these changed during your work, the file should reflect reality when you're done.
 
 **How to update:**
 1. Write the relevant section(s) of `CURRENT_SHAPE.md` so they reflect the current state. Overwrite stale content — do not append to existing prose.
-2. If the project's structure or capabilities materially changed, append one bullet to the `## Shifts` section: `- YYYY-MM-DD: <precise one-line summary>`.
+2. Keep the current top-level section schema stable (`Architecture`, `Runtime Model`, `Key Files`, `Conventions`, `Data Contracts`, `Constraints`, `Update-Sensitive Areas`, `Firmware Compatibility`, `Notes`, `Shifts`), but add new top-level sections when genuinely needed.
+3. On every update to `CURRENT_SHAPE.md`, add one bullet to `## Shifts` at the TOP (newest first) using: `- YYYY-MM-DD: <precise one-line summary> (ref: <commit|PR|issue|N/A>)`.
+4. Use `## Notes` for relevant short-lived context that does not belong in the stable sections (for example active migration concerns, temporary caveats, or in-progress compatibility observations).
