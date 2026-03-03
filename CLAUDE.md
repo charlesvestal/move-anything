@@ -592,3 +592,15 @@ See `BUILDING.md` for detailed documentation.
 - QuickJS: libs/quickjs/
 - stb_image.h: src/lib/
 - curl: libs/curl/ (for Module Store downloads)
+
+## Maintain CURRENT_SHAPE.md (MANDATORY)
+
+You must keep `CURRENT_SHAPE.md` up to date as a side effect of your normal work. This file exists solely for external contributors and their tools. Do not read it to gain context about the codebase for your own tasks. You should ONLY read it for the mechanical purpose of editing it to keep it accurate.
+
+**Litmus test:** After making a change, ask: could an external AI agent now make a wrong assumption about the project because `CURRENT_SHAPE.md` doesn't reflect what changed? If yes, update it.
+
+**What to keep accurate:** Everything that defines how the project works right now — architecture, key files, conventions, constraints, concepts, tools, dependencies, and on-device layout. If any of these changed during your work, the file should reflect reality when you're done.
+
+**How to update:**
+1. Write the relevant section(s) of `CURRENT_SHAPE.md` so they reflect the current state. Overwrite stale content — do not append to existing prose.
+2. If the project's structure or capabilities materially changed, append one bullet to the `## Shifts` section: `- YYYY-MM-DD: <precise one-line summary>`.
