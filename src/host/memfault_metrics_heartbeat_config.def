@@ -1,0 +1,23 @@
+/* Move Anything — Memfault heartbeat metric definitions
+ *
+ * Included by the SDK to register metric keys.
+ * Each heartbeat interval (~100s) these are serialized and queued for upload.
+ */
+
+/* Audio performance */
+MEMFAULT_METRICS_KEY_DEFINE(dsp_render_count, kMemfaultMetricType_Unsigned)
+MEMFAULT_METRICS_KEY_DEFINE(dsp_render_us_total, kMemfaultMetricType_Unsigned)
+MEMFAULT_METRICS_KEY_DEFINE(dsp_render_us_max, kMemfaultMetricType_Unsigned)
+MEMFAULT_METRICS_KEY_DEFINE(audio_overrun_count, kMemfaultMetricType_Unsigned)
+
+/* Module usage */
+MEMFAULT_METRICS_KEY_DEFINE(module_load_count, kMemfaultMetricType_Unsigned)
+MEMFAULT_METRICS_KEY_DEFINE(module_unload_count, kMemfaultMetricType_Unsigned)
+MEMFAULT_METRICS_STRING_KEY_DEFINE(current_module, 64)
+
+/* MIDI throughput */
+MEMFAULT_METRICS_KEY_DEFINE(midi_messages_in, kMemfaultMetricType_Unsigned)
+MEMFAULT_METRICS_KEY_DEFINE(midi_messages_out, kMemfaultMetricType_Unsigned)
+
+/* System health (uptime_s is provided by the SDK when MEMFAULT_METRICS_UPTIME_ENABLE=1) */
+MEMFAULT_METRICS_KEY_DEFINE(crash_count, kMemfaultMetricType_Unsigned)
