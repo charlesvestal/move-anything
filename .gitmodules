@@ -1,3 +1,6 @@
 [submodule "libs/link"]
 	path = libs/link
 	url = https://github.com/Ableton/link.git
+[submodule "libs/memfault-firmware-sdk"]
+	path = libs/memfault-firmware-sdk
+	url = https://github.com/memfault/memfault-firmware-sdk.git

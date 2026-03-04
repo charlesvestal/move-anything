@@ -12,6 +12,14 @@ DISABLE_SCREEN_READER="${DISABLE_SCREEN_READER:-0}"
 REBUILD_DOCKER_IMAGE="${REBUILD_DOCKER_IMAGE:-0}"
 REQUIRE_SCREEN_READER="${REQUIRE_SCREEN_READER:-0}"
 BOOTSTRAP_SCRIPT="./scripts/bootstrap-build-deps.sh"
+ENABLE_MEMFAULT="${ENABLE_MEMFAULT:-0}"
+
+# Parse command-line arguments
+for arg in "$@"; do
+    case "$arg" in
+        --enable-memfault) ENABLE_MEMFAULT=1 ;;
+    esac
+done
 
 # Check if we need Docker
 if [ -z "$CROSS_PREFIX" ] && [ ! -f "/.dockerenv" ]; then
@@ -49,6 +57,7 @@ if [ -z "$CROSS_PREFIX" ] && [ ! -f "/.dockerenv" ]; then
         -u "$(id -u):$(id -g)" \
         -e DISABLE_SCREEN_READER="$DISABLE_SCREEN_READER" \
         -e REQUIRE_SCREEN_READER="$REQUIRE_SCREEN_READER" \
+        -e ENABLE_MEMFAULT="$ENABLE_MEMFAULT" \
         "$IMAGE_NAME"
 
     echo ""
@@ -176,6 +185,42 @@ else
     echo "Skipping host (up to date)"
 fi
 
+# Memfault SDK compilation (opt-in via --enable-memfault)
+MEMFAULT_CFLAGS=""
+MEMFAULT_SOURCES=""
+if [ "$ENABLE_MEMFAULT" = "1" ]; then
+    echo "Memfault metrics: enabled"
+    MF_SDK="libs/memfault-firmware-sdk"
+    MEMFAULT_CFLAGS="-DMEMFAULT_ENABLED=1 -I$MF_SDK/components/include -Isrc/host"
+    MEMFAULT_SOURCES="
+        src/host/memfault_port.c
+        src/host/memfault_metrics.c
+        src/host/memfault_upload.c
+        $MF_SDK/components/core/src/memfault_batched_events.c
+        $MF_SDK/components/core/src/memfault_core_utils.c
+        $MF_SDK/components/core/src/memfault_data_export.c
+        $MF_SDK/components/core/src/memfault_data_packetizer.c
+        $MF_SDK/components/core/src/memfault_data_source_rle.c
+        $MF_SDK/components/core/src/memfault_event_storage.c
+        $MF_SDK/components/core/src/memfault_log.c
+        $MF_SDK/components/core/src/memfault_log_data_source.c
+        $MF_SDK/components/core/src/memfault_reboot_tracking_serializer.c
+        $MF_SDK/components/core/src/memfault_sdk_assert.c
+        $MF_SDK/components/core/src/memfault_serializer_helper.c
+        $MF_SDK/components/metrics/src/memfault_metrics.c
+        $MF_SDK/components/metrics/src/memfault_metrics_serializer.c
+        $MF_SDK/components/util/src/memfault_base64.c
+        $MF_SDK/components/util/src/memfault_chunk_transport.c
+        $MF_SDK/components/util/src/memfault_circular_buffer.c
+        $MF_SDK/components/util/src/memfault_crc16_ccitt.c
+        $MF_SDK/components/util/src/memfault_minimal_cbor.c
+        $MF_SDK/components/util/src/memfault_rle.c
+        $MF_SDK/components/util/src/memfault_varint.c
+    "
+else
+    echo "Memfault metrics: disabled"
+fi
+
 # Build shim (with shared memory support for shadow instrument)
 if needs_rebuild build/move-anything-shim.so \
     src/move_anything_shim.c \
@@ -191,7 +236,8 @@ if needs_rebuild build/move-anything-shim.so \
     src/host/shadow_resample.h src/host/shadow_overlay.h src/host/shadow_pin_scanner.h \
     src/host/shadow_led_queue.h src/host/shadow_fd_trace.h src/host/shadow_state.h \
     src/host/plugin_api_v1.h src/host/unified_log.h src/host/tts_engine.h \
-    src/host/link_audio.h; then
+    src/host/link_audio.h \
+    $MEMFAULT_SOURCES; then
     echo "Building shim..."
     "${CROSS_PREFIX}gcc" -g3 -shared -fPIC \
         -o build/move-anything-shim.so \
@@ -211,7 +257,9 @@ if needs_rebuild build/move-anything-shim.so \
         src/host/shadow_midi.c \
         src/host/unified_log.c \
         $SHIM_TTS_SRC \
+        $MEMFAULT_SOURCES \
         $SHIM_DEFINES \
+        $MEMFAULT_CFLAGS \
         $SHIM_INCLUDES \
         $SHIM_LIBS
 else

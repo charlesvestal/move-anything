@@ -54,6 +54,10 @@
 #include "host/shadow_fd_trace.h"
 #include "host/shadow_state.h"
 #include "host/shadow_midi.h"
+#ifdef MEMFAULT_ENABLED
+#include "host/memfault_metrics.h"
+#include "memfault/components.h"
+#endif
 
 /* Debug flags - set to 1 to enable various debug logging */
 #define SHADOW_TIMING_LOG 0      /* ioctl/DSP timing logs to /tmp */
@@ -137,6 +141,9 @@ static volatile float shadow_master_volume;  /* Defined later */
 static bool shadow_ui_enabled = true;      /* Shadow UI enabled by default */
 static bool display_mirror_enabled = false; /* Display mirror off by default */
 static bool set_pages_enabled = true;      /* Set pages enabled by default */
+#ifdef MEMFAULT_ENABLED
+static bool metrics_enabled = false;       /* Memfault metrics off by default */
+#endif
 
 /* Link Audio state, process management — moved to shadow_link_audio.c, shadow_process.c */
 
@@ -521,13 +528,36 @@ static void load_feature_config(void)
         }
     }
 
+#ifdef MEMFAULT_ENABLED
+    /* Parse metrics_enabled (defaults to false) */
+    const char *metrics_key = strstr(config_buf, "\"metrics_enabled\"");
+    if (metrics_key) {
+        const char *colon = strchr(metrics_key, ':');
+        if (colon) {
+            colon++;
+            while (*colon == ' ' || *colon == '\t') colon++;
+            if (strncmp(colon, "true", 4) == 0) {
+                metrics_enabled = true;
+            }
+        }
+    }
+#endif
+
     char log_msg[256];
     snprintf(log_msg, sizeof(log_msg),
-             "Features: shadow_ui=%s, link_audio=%s, display_mirror=%s, set_pages=%s",
+             "Features: shadow_ui=%s, link_audio=%s, display_mirror=%s, set_pages=%s"
+#ifdef MEMFAULT_ENABLED
+             ", metrics=%s"
+#endif
+             ,
              shadow_ui_enabled ? "enabled" : "disabled",
              link_audio.enabled ? "enabled" : "disabled",
              display_mirror_enabled ? "enabled" : "disabled",
-             set_pages_enabled ? "enabled" : "disabled");
+             set_pages_enabled ? "enabled" : "disabled"
+#ifdef MEMFAULT_ENABLED
+             , metrics_enabled ? "enabled" : "disabled"
+#endif
+             );
     shadow_log(log_msg);
 }
 
@@ -1555,6 +1585,39 @@ static void crash_signal_handler(int sig)
     msg[pos] = '\0';
 
     unified_log_crash(msg);
+
+#ifdef MEMFAULT_ENABLED
+    /* Increment persistent crash counter (async-signal-safe: open+read+write+close) */
+    {
+        static const char crash_path[] = "/data/UserData/move-anything/memfault/crash_count";
+        int fd = open(crash_path, O_RDWR | O_CREAT, 0644);
+        if (fd >= 0) {
+            char buf[16] = {0};
+            int n = read(fd, buf, sizeof(buf) - 1);
+            unsigned int count = 0;
+            if (n > 0) {
+                for (int i = 0; i < n && buf[i] >= '0' && buf[i] <= '9'; i++)
+                    count = count * 10 + (buf[i] - '0');
+            }
+            count++;
+            /* Write back */
+            lseek(fd, 0, SEEK_SET);
+            char out[16];
+            int len = 0;
+            if (count == 0) { out[len++] = '0'; }
+            else {
+                char tmp[16]; int tl = 0;
+                unsigned int c = count;
+                while (c > 0) { tmp[tl++] = '0' + (c % 10); c /= 10; }
+                for (int i = tl - 1; i >= 0; i--) out[len++] = tmp[i];
+            }
+            out[len++] = '\n';
+            (void)write(fd, out, len);
+            close(fd);
+        }
+    }
+#endif
+
     _exit(128 + sig);
 }
 
@@ -2363,6 +2426,16 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
         }
         load_feature_config();  /* Load feature flags from config */
 
+#ifdef MEMFAULT_ENABLED
+        if (metrics_enabled) {
+            mf_metrics_init();
+            /* Get device serial for upload URL */
+            sMemfaultDeviceInfo info;
+            memfault_platform_get_device_info(&info);
+            mf_upload_start(info.device_serial);
+        }
+#endif
+
         /* Initialize chain management subsystem (must be before sampler - provides shadow_log) */
         {
             chain_mgmt_host_t cm_host = {
@@ -2966,6 +3039,11 @@ int ioctl(int fd, unsigned long request, ...)
                     la_stale_frames, (int)link_sub_pid, link_sub_restart_count,
                     shadow_control ? shadow_control->pin_challenge_active : -1);
             }
+#ifdef MEMFAULT_ENABLED
+            if (mf_metrics_enabled()) {
+                mf_metrics_collect_heartbeat();
+            }
+#endif
         }
     }
 
@@ -4488,6 +4566,19 @@ do_ioctl:
         render_time_count++;
         if (render_us > render_time_max) render_time_max = render_us;
 
+#ifdef MEMFAULT_ENABLED
+        if (metrics_enabled) {
+            MEMFAULT_METRIC_ADD(dsp_render_count, 1);
+            MEMFAULT_METRIC_ADD(dsp_render_us_total, (uint32_t)render_us);
+            /* Track max via set-if-greater pattern */
+            static uint32_t mf_render_us_max = 0;
+            if ((uint32_t)render_us > mf_render_us_max) {
+                mf_render_us_max = (uint32_t)render_us;
+                MEMFAULT_METRIC_SET_UNSIGNED(dsp_render_us_max, mf_render_us_max);
+            }
+        }
+#endif
+
         /* Log DSP render timing every 1000 blocks (~23 seconds) */
         if (render_time_count >= 1000) {
 #if SHADOW_TIMING_LOG
@@ -4541,6 +4632,12 @@ do_timing:
     if (pre_us > pre_max) pre_max = pre_us;
     if (ioctl_us > ioctl_max) ioctl_max = ioctl_us;
     if (post_us > post_max) post_max = post_us;
+
+#ifdef MEMFAULT_ENABLED
+    if (metrics_enabled && total_us > 2000) {
+        MEMFAULT_METRIC_ADD(audio_overrun_count, 1);
+    }
+#endif
 
 #if SHADOW_TIMING_LOG
     /* Warn immediately if total hook time >2ms */
