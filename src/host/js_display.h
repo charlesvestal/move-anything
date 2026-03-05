@@ -28,7 +28,7 @@ typedef struct FontChar {
 /* Font structure (bitmap or TTF) */
 typedef struct Font {
     int charSpacing;
-    FontChar charData[128];
+    FontChar charData[256];
     int is_ttf;
     stbtt_fontinfo ttf_info;
     unsigned char *ttf_buffer;
@@ -49,7 +49,9 @@ void js_display_set_pixel(int x, int y, int value);
 int  js_display_get_pixel(int x, int y);
 void js_display_draw_rect(int x, int y, int w, int h, int value);
 void js_display_fill_rect(int x, int y, int w, int h, int value);
+void js_display_draw_line(int x0, int y0, int x1, int y1, int value);
 void js_display_print(int x, int y, const char *string, int color);
+int  js_display_text_width(const char *string);
 void js_display_pack(uint8_t *dest);
 
 /* Font loading */
@@ -64,8 +66,10 @@ int js_display_glyph_ttf(Font *fnt, char c, int sx, int sy, int color);
 JSValue js_display_bind_set_pixel(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 JSValue js_display_bind_draw_rect(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 JSValue js_display_bind_fill_rect(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+JSValue js_display_bind_draw_line(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 JSValue js_display_bind_clear_screen(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 JSValue js_display_bind_print(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+JSValue js_display_bind_text_width(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 
 /* Helper to register all display bindings on a JS global object */
 void js_display_register_bindings(JSContext *ctx, JSValue global_obj);

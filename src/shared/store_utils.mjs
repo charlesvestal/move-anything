@@ -23,7 +23,8 @@ export const CATEGORIES = [
     { id: 'midi_fx', name: 'MIDI FX' },
     { id: 'midi_source', name: 'MIDI Sources' },
     { id: 'utility', name: 'Utilities' },
-    { id: 'overtake', name: 'Overtake Modules' }
+    { id: 'overtake', name: 'Overtake Modules' },
+    { id: 'tool', name: 'Tools' }
 ];
 
 /* Compare semver versions: returns 1 if a > b, -1 if a < b, 0 if equal */
@@ -53,6 +54,7 @@ export function getInstallSubdir(componentType) {
         case 'midi_fx': return 'midi_fx';
         case 'utility': return 'utilities';
         case 'overtake': return 'overtake';
+        case 'tool': return 'tools';
         default: return 'other';
     }
 }
@@ -224,16 +226,9 @@ export function loadCatalogFromCache(onProgress, networkAvailable) {
 
         /* For catalog v2+, fetch release info — but skip if network is down */
         if (catalog.catalog_version >= 2 && catalog.modules && networkAvailable) {
-            let consecutiveFailures = 0;
             for (let i = 0; i < catalog.modules.length; i++) {
                 const mod = catalog.modules[i];
                 if (mod.github_repo) {
-                    if (consecutiveFailures >= 2) {
-                        /* Network likely down — skip remaining fetches */
-                        mod.latest_version = mod.latest_version || '?';
-                        mod.download_url = mod.download_url || null;
-                        continue;
-                    }
                     if (onProgress) onProgress('Loading Catalog', mod.name, i + 1, moduleCount);
 
                     /* Pass module id for multi-module repo support */
@@ -248,17 +243,10 @@ export function loadCatalogFromCache(onProgress, networkAvailable) {
                         mod.requires = release.requires;
                         mod.post_install = release.post_install;
                         mod.repo_url = release.repo_url;
-                        consecutiveFailures = 0;
                     } else {
                         mod.latest_version = mod.latest_version || '?';
                         if (mod.github_repo && mod.asset_name) {
                             mod.download_url = `https://github.com/${mod.github_repo}/releases/latest/download/${mod.asset_name}`;
-                        } else {
-                            mod.download_url = null;
-                        }
-                        consecutiveFailures++;
-                        if (consecutiveFailures >= 2) {
-                            console.log('Two consecutive release fetch failures, skipping remaining modules');
                         }
                     }
                 }
@@ -294,7 +282,8 @@ export function loadCatalogFromCache(onProgress, networkAvailable) {
 /* Get modules for a specific category */
 export function getModulesForCategory(catalog, categoryId) {
     if (!catalog || !catalog.modules) return [];
-    return catalog.modules.filter(m => m.component_type === categoryId);
+    return catalog.modules.filter(m => m.component_type === categoryId)
+        .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /* Get module install status */

@@ -6,25 +6,32 @@ import { getMenuLabelScroller } from './text_scroll.mjs';
 import { announceMenuItem, announceParameter } from './screen_reader.mjs';
 import { truncateText } from './chain_ui_views.mjs';
 
-const SCREEN_WIDTH = 128;
-const SCREEN_HEIGHT = 64;
-const TITLE_Y = 2;
-const TITLE_RULE_Y = 12;
-const LIST_TOP_Y = 15;
-const LIST_LINE_HEIGHT = 11;
-const LIST_HIGHLIGHT_HEIGHT = LIST_LINE_HEIGHT + 2;
-const LIST_HIGHLIGHT_OFFSET = 0;
-const LIST_LABEL_X = 4;
-const LIST_VALUE_X = 75;
-const LIST_MAX_VISIBLE = 5;
-const LIST_INDICATOR_X = 120;
-const LIST_INDICATOR_BOTTOM_Y = SCREEN_HEIGHT - 2;
-const FOOTER_TEXT_Y = SCREEN_HEIGHT - 11;
-const FOOTER_RULE_Y = FOOTER_TEXT_Y - 1;
-const LIST_BOTTOM_WITH_FOOTER = FOOTER_RULE_Y - 1;
-const DEFAULT_CHAR_WIDTH = 6;
-const DEFAULT_LABEL_GAP = 6;
-const DEFAULT_VALUE_PADDING_RIGHT = 2;
+/* Screen dimensions */
+export const SCREEN_WIDTH = 128;
+export const SCREEN_HEIGHT = 64;
+
+/* Header and footer positioning */
+export const TITLE_Y = 2;
+export const TITLE_RULE_Y = 12;
+export const FOOTER_TEXT_Y = SCREEN_HEIGHT - 7;
+export const FOOTER_RULE_Y = FOOTER_TEXT_Y - 2;
+
+/* List rendering */
+export const LIST_TOP_Y = 15;
+export const LIST_LINE_HEIGHT = 9;                      // 5x7px font + 2px spacing
+export const LIST_HIGHLIGHT_HEIGHT = LIST_LINE_HEIGHT;
+export const LIST_HIGHLIGHT_OFFSET = 1;                 // Shift rect up 1px to vertically center
+export const LIST_LABEL_X = 4;
+export const LIST_VALUE_X = 92;
+export const LIST_MAX_VISIBLE = 5;
+export const LIST_INDICATOR_X = 120;
+export const LIST_INDICATOR_BOTTOM_Y = SCREEN_HEIGHT - 2;
+export const LIST_BOTTOM_WITH_FOOTER = FOOTER_RULE_Y - 1;
+
+/* Text rendering */
+export const DEFAULT_CHAR_WIDTH = 6;
+export const DEFAULT_LABEL_GAP = 6;
+export const DEFAULT_VALUE_PADDING_RIGHT = 2;
 
 /* Screen reader state - track last announced item to avoid redundant announcements */
 let lastAnnouncedIndex = -1;
@@ -34,7 +41,8 @@ export function drawMenuHeader(title, titleRight = "") {
     print(2, TITLE_Y, title, 1);
 
     if (titleRight) {
-        const rightX = SCREEN_WIDTH - (titleRight.length * DEFAULT_CHAR_WIDTH) - 2;
+        const rightW = (typeof text_width === 'function') ? text_width(titleRight) : (titleRight.length * DEFAULT_CHAR_WIDTH);
+        const rightX = SCREEN_WIDTH - rightW - 2;
         print(Math.max(2, rightX), TITLE_Y, titleRight, 1);
     }
 
@@ -42,8 +50,16 @@ export function drawMenuHeader(title, titleRight = "") {
 }
 
 export function drawMenuFooter(text, y = FOOTER_TEXT_Y) {
-    if (text) {
-        fill_rect(0, FOOTER_RULE_Y, SCREEN_WIDTH, 1, 1);
+    if (!text) return;
+    fill_rect(0, FOOTER_RULE_Y, SCREEN_WIDTH, 1, 1);
+    if (typeof text === 'object' && (text.left !== undefined || text.right !== undefined)) {
+        /* { left: "Back: exit", right: "Jog: browse" } */
+        if (text.left) print(2, y, text.left, 1);
+        if (text.right) {
+            const rightW = (typeof text_width === 'function') ? text_width(text.right) : (text.right.length * DEFAULT_CHAR_WIDTH);
+            print(SCREEN_WIDTH - rightW - 2, y, text.right, 1);
+        }
+    } else {
         print(2, y, text, 1);
     }
 }
@@ -87,7 +103,10 @@ export function drawMenuList({
     getValue,
     getSubLabel = null,
     subLabelOffset = 9,
-    editMode = false
+    editMode = false,
+    scrollSelectedValue = false,
+    prioritizeSelectedValue = false,
+    selectedMinLabelChars = 6
 }) {
     const totalItems = items.length;
     const itemHeight = getSubLabel ? (lineHeight + subLabelOffset) : lineHeight;
@@ -135,12 +154,35 @@ export function drawMenuList({
         const labelPrefix = isSelected ? "> " : "  ";
         let label = getLabel(item, i);
         const fullLabel = label; /* Keep original for scrolling */
-        const value = getValue ? getValue(item, i) : "";
+        const valueRaw = getValue ? getValue(item, i) : "";
+        const fullValue = valueRaw ? String(valueRaw) : "";
+        let displayValue = fullValue;
         let resolvedValueX = valueX;
         let maxLabelChars = 0;
 
-        if (valueAlignRight && value) {
-            resolvedValueX = SCREEN_WIDTH - (value.length * DEFAULT_CHAR_WIDTH) - valuePaddingRight;
+        if (valueAlignRight && fullValue) {
+            let valueXFloor = valueX;
+            if (isSelected && prioritizeSelectedValue) {
+                const minLabelChars = Math.max(0, selectedMinLabelChars | 0);
+                const minLabelWidth = ((labelPrefix.length + minLabelChars) * DEFAULT_CHAR_WIDTH) + labelGap;
+                valueXFloor = labelX + minLabelWidth;
+            }
+
+            resolvedValueX = SCREEN_WIDTH - (fullValue.length * DEFAULT_CHAR_WIDTH) - valuePaddingRight;
+            if (resolvedValueX < valueXFloor) {
+                resolvedValueX = valueXFloor;
+            }
+
+            const maxValueWidth = Math.max(0, SCREEN_WIDTH - valuePaddingRight - resolvedValueX);
+            const maxValueChars = Math.floor(maxValueWidth / DEFAULT_CHAR_WIDTH);
+            if (maxValueChars > 0 && fullValue.length > maxValueChars) {
+                if (isSelected && scrollSelectedValue) {
+                    displayValue = labelScroller.getScrolledText(fullValue, maxValueChars);
+                } else {
+                    displayValue = truncateText(fullValue, maxValueChars);
+                }
+            }
+
             const maxLabelWidth = Math.max(0, resolvedValueX - labelX - labelGap);
             maxLabelChars = Math.floor((maxLabelWidth - (labelPrefix.length * DEFAULT_CHAR_WIDTH)) / DEFAULT_CHAR_WIDTH);
         } else {
@@ -162,19 +204,19 @@ export function drawMenuList({
         if (isSelected) {
             fill_rect(0, y - highlightOffset, SCREEN_WIDTH, itemHighlightHeight, 1);
             print(labelX, y, `${labelPrefix}${label}`, 0);
-            if (value) {
+            if (displayValue) {
                 /* Show brackets around value when in edit mode */
-                const displayValue = editMode ? `[${value}]` : value;
+                const shownValue = editMode ? `[${displayValue}]` : displayValue;
                 /* When valueAlignRight and editMode, shift left to account for added brackets */
                 const editValueX = (editMode && valueAlignRight)
-                    ? resolvedValueX - (2 * DEFAULT_CHAR_WIDTH)  /* Shift left for both brackets */
+                    ? resolvedValueX - (1 * DEFAULT_CHAR_WIDTH)  /* Shift left for right bracket */
                     : resolvedValueX;
-                print(editValueX, y, displayValue, 0);
+                print(editValueX, y, shownValue, 0);
             }
         } else {
             print(labelX, y, `${labelPrefix}${label}`, 1);
-            if (value) {
-                print(resolvedValueX, y, value, 1);
+            if (displayValue) {
+                print(resolvedValueX, y, displayValue, 1);
             }
         }
 
