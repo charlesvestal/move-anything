@@ -155,585 +155,6 @@ static uint32_t shadow_checksum(const uint8_t *buf, size_t len)
     return sum;
 }
 
-/* ============================================================================
- * MIDI DEVICE TRACE (DISCOVERY)
- * ============================================================================
- * Track open/read/write on MIDI-ish device nodes to discover where Move sends
- * external MIDI. Enabled by creating midi_fd_trace_on.
- * ============================================================================ */
-
-#define MAX_TRACKED_FDS 32
-typedef struct {
-    int fd;
-    char path[128];
-} tracked_fd_t;
-
-static tracked_fd_t tracked_fds[MAX_TRACKED_FDS];
-static FILE *midi_fd_trace_log = NULL;
-static FILE *spi_io_log = NULL;
-
-static int trace_midi_fd_enabled(void)
-{
-    static int enabled = -1;
-    static int check_counter = 0;
-    if (check_counter++ % 200 == 0 || enabled < 0) {
-        enabled = (access("/data/UserData/move-anything/midi_fd_trace_on", F_OK) == 0);
-    }
-    return enabled;
-}
-
-static void midi_fd_trace_log_open(void)
-{
-    if (!midi_fd_trace_log) {
-        midi_fd_trace_log = fopen("/data/UserData/move-anything/midi_fd_trace.log", "a");
-    }
-}
-
-static int trace_spi_io_enabled(void)
-{
-    static int enabled = -1;
-    static int check_counter = 0;
-    if (check_counter++ % 200 == 0 || enabled < 0) {
-        enabled = (access("/data/UserData/move-anything/spi_io_on", F_OK) == 0);
-    }
-    return enabled;
-}
-
-static void spi_io_log_open(void)
-{
-    if (!spi_io_log) {
-        spi_io_log = fopen("/data/UserData/move-anything/spi_io.log", "a");
-    }
-}
-
-static void str_to_lower(char *dst, size_t dst_size, const char *src)
-{
-    size_t i = 0;
-    if (!dst_size) return;
-    for (; i + 1 < dst_size && src[i]; i++) {
-        char c = src[i];
-        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
-        dst[i] = c;
-    }
-    dst[i] = '\0';
-}
-
-static int path_matches_midi(const char *path)
-{
-    if (!path || !*path) return 0;
-    char lower[256];
-    str_to_lower(lower, sizeof(lower), path);
-    return strstr(lower, "midi") || strstr(lower, "snd") ||
-           strstr(lower, "seq") || strstr(lower, "usb");
-}
-
-static int path_matches_spi(const char *path)
-{
-    if (!path || !*path) return 0;
-    char lower[256];
-    str_to_lower(lower, sizeof(lower), path);
-    return strstr(lower, "ablspi") || strstr(lower, "spidev") ||
-           strstr(lower, "/spi");
-}
-
-static void track_fd(int fd, const char *path)
-{
-    if (fd < 0 || !path) return;
-    for (int i = 0; i < MAX_TRACKED_FDS; i++) {
-        if (tracked_fds[i].fd == 0) {
-            tracked_fds[i].fd = fd;
-            strncpy(tracked_fds[i].path, path, sizeof(tracked_fds[i].path) - 1);
-            tracked_fds[i].path[sizeof(tracked_fds[i].path) - 1] = '\0';
-            return;
-        }
-    }
-}
-
-static void untrack_fd(int fd)
-{
-    for (int i = 0; i < MAX_TRACKED_FDS; i++) {
-        if (tracked_fds[i].fd == fd) {
-            tracked_fds[i].fd = 0;
-            tracked_fds[i].path[0] = '\0';
-            return;
-        }
-    }
-}
-
-static const char *tracked_path_for_fd(int fd)
-{
-    for (int i = 0; i < MAX_TRACKED_FDS; i++) {
-        if (tracked_fds[i].fd == fd) {
-            return tracked_fds[i].path;
-        }
-    }
-    return NULL;
-}
-
-static void log_fd_bytes(const char *tag, int fd, const char *path,
-                         const unsigned char *buf, size_t len)
-{
-    size_t max = len > 64 ? 64 : len;
-    if (path_matches_midi(path)) {
-        if (!trace_midi_fd_enabled()) return;
-        midi_fd_trace_log_open();
-        if (!midi_fd_trace_log) return;
-        fprintf(midi_fd_trace_log, "%s fd=%d path=%s len=%zu bytes:", tag, fd, path, len);
-        for (size_t i = 0; i < max; i++) {
-            fprintf(midi_fd_trace_log, " %02x", buf[i]);
-        }
-        if (len > max) fprintf(midi_fd_trace_log, " ...");
-        fprintf(midi_fd_trace_log, "\n");
-        fflush(midi_fd_trace_log);
-    }
-    if (path_matches_spi(path)) {
-        if (!trace_spi_io_enabled()) return;
-        spi_io_log_open();
-        if (!spi_io_log) return;
-        fprintf(spi_io_log, "%s fd=%d path=%s len=%zu bytes:", tag, fd, path, len);
-        for (size_t i = 0; i < max; i++) {
-            fprintf(spi_io_log, " %02x", buf[i]);
-        }
-        if (len > max) fprintf(spi_io_log, " ...");
-        fprintf(spi_io_log, "\n");
-        fflush(spi_io_log);
-    }
-}
-
-/* ============================================================================
- * ALSA SEQ TRACE (BINARY PATH DISCOVERY)
- * ============================================================================
- * Trace ALSA sequencer events from Move's own libasound calls to locate
- * post-layout note flow. Enabled by creating shadow_seq_trace_on.
- * ============================================================================ */
-
-static FILE *shadow_seq_trace_log = NULL;
-
-static int shadow_seq_trace_enabled(void)
-{
-    static int enabled = -1;
-    static int check_counter = 0;
-    if (check_counter++ % 200 == 0 || enabled < 0) {
-        enabled = (access("/data/UserData/move-anything/shadow_seq_trace_on", F_OK) == 0);
-        if (!enabled && shadow_seq_trace_log) {
-            fclose(shadow_seq_trace_log);
-            shadow_seq_trace_log = NULL;
-        }
-    }
-    return enabled;
-}
-
-static void shadow_seq_trace_log_open(void)
-{
-    if (!shadow_seq_trace_log) {
-        shadow_seq_trace_log = fopen("/data/UserData/move-anything/shadow_seq_trace.log", "a");
-    }
-}
-
-/* Best-effort decode of snd_seq_event_t without ALSA headers:
- * type/flags/tag/queue in bytes 0..3, source/dest in 12..15, note data in 16..19. */
-static void shadow_seq_trace_event(const char *tag, const void *ev, long ret)
-{
-    if (!shadow_seq_trace_enabled() || !ev) return;
-    shadow_seq_trace_log_open();
-    if (!shadow_seq_trace_log) return;
-
-    const uint8_t *b = (const uint8_t *)ev;
-    uint8_t type = b[0];
-    uint8_t flags = b[1];
-    uint8_t src_client = b[12];
-    uint8_t src_port = b[13];
-    uint8_t dst_client = b[14];
-    uint8_t dst_port = b[15];
-    uint8_t note_ch = b[16];
-    uint8_t note = b[17];
-    uint8_t vel = b[18];
-    uint8_t off_vel = b[19];
-
-    fprintf(shadow_seq_trace_log,
-            "%s ret=%ld type=%u flags=0x%02x src=%u:%u dst=%u:%u ch=%u note=%u vel=%u off=%u raw:",
-            tag, ret, type, flags, src_client, src_port, dst_client, dst_port,
-            note_ch, note, vel, off_vel);
-    for (int i = 0; i < 28; i++) {
-        fprintf(shadow_seq_trace_log, " %02x", b[i]);
-    }
-    fprintf(shadow_seq_trace_log, "\n");
-    fflush(shadow_seq_trace_log);
-}
-
-static void shadow_seq_trace_bytes(const char *tag, const unsigned char *buf, size_t len, long ret)
-{
-    if (!shadow_seq_trace_enabled() || !buf || len == 0) return;
-    shadow_seq_trace_log_open();
-    if (!shadow_seq_trace_log) return;
-
-    size_t max = len > 24 ? 24 : len;
-    fprintf(shadow_seq_trace_log, "%s ret=%ld len=%zu bytes:", tag, ret, len);
-    for (size_t i = 0; i < max; i++) {
-        fprintf(shadow_seq_trace_log, " %02x", buf[i]);
-    }
-    if (len > max) fprintf(shadow_seq_trace_log, " ...");
-    fprintf(shadow_seq_trace_log, "\n");
-    fflush(shadow_seq_trace_log);
-}
-
-/* ============================================================================
- * MAILBOX DIFF PROBE (XMOS PATH DISCOVERY)
- * ============================================================================
- * Compare mailbox snapshots to find where MIDI-like bytes appear when playing.
- * Enabled by creating mailbox_diff_on; optional mailbox_snapshot_on dumps once.
- * ============================================================================ */
-
-static FILE *mailbox_diff_log = NULL;
-static void mailbox_diff_log_open(void)
-{
-    if (!mailbox_diff_log) {
-        mailbox_diff_log = fopen("/data/UserData/move-anything/mailbox_diff.log", "a");
-    }
-}
-
-static int mailbox_diff_enabled(void)
-{
-    static int enabled = -1;
-    static int check_counter = 0;
-    if (check_counter++ % 200 == 0 || enabled < 0) {
-        enabled = (access("/data/UserData/move-anything/mailbox_diff_on", F_OK) == 0);
-    }
-    return enabled;
-}
-
-static void mailbox_snapshot_once(void)
-{
-    if (!global_mmap_addr) return;
-    if (access("/data/UserData/move-anything/mailbox_snapshot_on", F_OK) != 0) return;
-
-    FILE *snap = fopen("/data/UserData/move-anything/mailbox_snapshot.log", "w");
-    if (snap) {
-        fprintf(snap, "Mailbox snapshot (4096 bytes):\n");
-        for (int i = 0; i < MAILBOX_SIZE; i++) {
-            if (i % 256 == 0) fprintf(snap, "\n=== OFFSET %d (0x%x) ===\n", i, i);
-            fprintf(snap, "%02x ", (unsigned char)global_mmap_addr[i]);
-            if ((i + 1) % 32 == 0) fprintf(snap, "\n");
-        }
-        fclose(snap);
-    }
-    unlink("/data/UserData/move-anything/mailbox_snapshot_on");
-}
-
-static void mailbox_diff_probe(void)
-{
-    static unsigned char prev[MAILBOX_SIZE];
-    static int has_prev = 0;
-    static unsigned int counter = 0;
-
-    if (!global_mmap_addr) return;
-    mailbox_snapshot_once();
-
-    if (!mailbox_diff_enabled()) return;
-    if (++counter % 10 != 0) return;
-
-    mailbox_diff_log_open();
-    if (!mailbox_diff_log) return;
-
-    if (!has_prev) {
-        memcpy(prev, global_mmap_addr, MAILBOX_SIZE);
-        fprintf(mailbox_diff_log, "INIT snapshot\n");
-        fflush(mailbox_diff_log);
-        has_prev = 1;
-        return;
-    }
-
-    for (int i = 0; i < MAILBOX_SIZE - 2; i++) {
-        unsigned char b = global_mmap_addr[i];
-        unsigned char p = prev[i];
-        if (b == p) continue;
-
-        if ((b >= 0x80 && b <= 0xEF) || (p >= 0x80 && p <= 0xEF)) {
-            fprintf(mailbox_diff_log,
-                    "DIFF[%d]: %02x->%02x next=%02x %02x\n",
-                    i, p, b, global_mmap_addr[i + 1], global_mmap_addr[i + 2]);
-        }
-    }
-
-    fflush(mailbox_diff_log);
-    memcpy(prev, global_mmap_addr, MAILBOX_SIZE);
-}
-
-/* Scan full mailbox for strict 3-byte MIDI with channel 3 status bytes. */
-static FILE *mailbox_midi_log = NULL;
-static void mailbox_midi_scan_strict(void)
-{
-    static int enabled = -1;
-    static int check_counter = 0;
-    if (check_counter++ % 200 == 0 || enabled < 0) {
-        enabled = (access("/data/UserData/move-anything/midi_strict_on", F_OK) == 0);
-    }
-
-    if (!enabled || !global_mmap_addr) return;
-
-    if (!mailbox_midi_log) {
-        mailbox_midi_log = fopen("/data/UserData/move-anything/midi_strict.log", "a");
-    }
-    if (!mailbox_midi_log) return;
-
-    for (int i = 0; i < MAILBOX_SIZE - 2; i++) {
-        uint8_t status = global_mmap_addr[i];
-        if (status != 0x92 && status != 0x82) continue;
-
-        uint8_t d1 = global_mmap_addr[i + 1];
-        uint8_t d2 = global_mmap_addr[i + 2];
-        if (d1 >= 0x80 || d2 >= 0x80) continue;
-
-        const char *region = "OTHER";
-        if (i >= MIDI_OUT_OFFSET && i < MIDI_OUT_OFFSET + MIDI_BUFFER_SIZE) {
-            region = "MIDI_OUT";
-        } else if (i >= MIDI_IN_OFFSET && i < MIDI_IN_OFFSET + MIDI_BUFFER_SIZE) {
-            region = "MIDI_IN";
-        } else if (i >= AUDIO_OUT_OFFSET && i < AUDIO_OUT_OFFSET + AUDIO_BUFFER_SIZE) {
-            region = "AUDIO_OUT";
-        } else if (i >= AUDIO_IN_OFFSET && i < AUDIO_IN_OFFSET + AUDIO_BUFFER_SIZE) {
-            region = "AUDIO_IN";
-        }
-
-        if (i > 0) {
-            uint8_t b0 = global_mmap_addr[i - 1];
-            fprintf(mailbox_midi_log, "MIDI[%d] %s: %02x %02x %02x %02x\n",
-                    i, region, b0, status, d1, d2);
-        } else {
-            fprintf(mailbox_midi_log, "MIDI[%d] %s: %02x %02x %02x\n",
-                    i, region, status, d1, d2);
-        }
-    }
-
-    fflush(mailbox_midi_log);
-}
-
-/*
- * USB-MIDI Packet Format (per USB Device Class Definition for MIDI Devices 1.0)
- * https://www.usb.org/sites/default/files/midi10.pdf
- *
- * Each packet is 4 bytes:
- *   Byte 0: [Cable Number (4 bits)] [CIN (4 bits)]
- *   Byte 1: MIDI Status byte
- *   Byte 2: MIDI Data 1
- *   Byte 3: MIDI Data 2
- *
- * CIN (Code Index Number) for channel voice messages:
- *   0x08 = Note Off
- *   0x09 = Note On
- *   0x0A = Poly Aftertouch
- *   0x0B = Control Change
- *   0x0C = Program Change
- *   0x0D = Channel Pressure
- *   0x0E = Pitch Bend
- */
-
-/* Scan for USB-MIDI 4-byte packets anywhere in the mailbox. */
-static FILE *mailbox_usb_log = NULL;
-static void mailbox_usb_midi_scan(void)
-{
-    static int enabled = -1;
-    static int check_counter = 0;
-    if (check_counter++ % 200 == 0 || enabled < 0) {
-        enabled = (access("/data/UserData/move-anything/usb_midi_on", F_OK) == 0);
-    }
-
-    if (!enabled || !global_mmap_addr) return;
-
-    if (!mailbox_usb_log) {
-        mailbox_usb_log = fopen("/data/UserData/move-anything/usb_midi.log", "a");
-    }
-    if (!mailbox_usb_log) return;
-
-    for (int i = 0; i < MAILBOX_SIZE - 4; i += 4) {
-        uint8_t cin = global_mmap_addr[i] & 0x0F;
-        if (cin < 0x08 || cin > 0x0E) continue;
-
-        uint8_t status = global_mmap_addr[i + 1];
-        uint8_t d1 = global_mmap_addr[i + 2];
-        uint8_t d2 = global_mmap_addr[i + 3];
-        if (status < 0x80 || status > 0xEF) continue;
-        if (d1 >= 0x80 || d2 >= 0x80) continue;
-
-        const char *region = "OTHER";
-        if (i >= MIDI_OUT_OFFSET && i < MIDI_OUT_OFFSET + MIDI_BUFFER_SIZE) {
-            region = "MIDI_OUT";
-        } else if (i >= MIDI_IN_OFFSET && i < MIDI_IN_OFFSET + MIDI_BUFFER_SIZE) {
-            region = "MIDI_IN";
-        } else if (i >= AUDIO_OUT_OFFSET && i < AUDIO_OUT_OFFSET + AUDIO_BUFFER_SIZE) {
-            region = "AUDIO_OUT";
-        } else if (i >= AUDIO_IN_OFFSET && i < AUDIO_IN_OFFSET + AUDIO_BUFFER_SIZE) {
-            region = "AUDIO_IN";
-        }
-
-        fprintf(mailbox_usb_log, "USB[%d] %s: %02x %02x %02x %02x\n",
-                i, region,
-                global_mmap_addr[i],
-                status, d1, d2);
-    }
-
-    fflush(mailbox_usb_log);
-}
-
-/* Scan MIDI_IN/OUT regions only for strict 3-byte MIDI status/data patterns. */
-static FILE *midi_region_log = NULL;
-static void mailbox_midi_region_scan(void)
-{
-    static int enabled = -1;
-    static int check_counter = 0;
-    if (check_counter++ % 200 == 0 || enabled < 0) {
-        enabled = (access("/data/UserData/move-anything/midi_region_on", F_OK) == 0);
-    }
-
-    if (!enabled || !global_mmap_addr) return;
-
-    if (!midi_region_log) {
-        midi_region_log = fopen("/data/UserData/move-anything/midi_region.log", "a");
-    }
-    if (!midi_region_log) return;
-
-    for (int i = 0; i < MIDI_BUFFER_SIZE - 2; i++) {
-        uint8_t status = global_mmap_addr[MIDI_OUT_OFFSET + i];
-        uint8_t d1 = global_mmap_addr[MIDI_OUT_OFFSET + i + 1];
-        uint8_t d2 = global_mmap_addr[MIDI_OUT_OFFSET + i + 2];
-        if (status >= 0x80 && status <= 0xEF && d1 < 0x80 && d2 < 0x80) {
-            fprintf(midi_region_log, "OUT[%d]: %02x %02x %02x\n", i, status, d1, d2);
-        }
-    }
-
-    for (int i = 0; i < MIDI_BUFFER_SIZE - 2; i++) {
-        uint8_t status = global_mmap_addr[MIDI_IN_OFFSET + i];
-        uint8_t d1 = global_mmap_addr[MIDI_IN_OFFSET + i + 1];
-        uint8_t d2 = global_mmap_addr[MIDI_IN_OFFSET + i + 2];
-        if (status >= 0x80 && status <= 0xEF && d1 < 0x80 && d2 < 0x80) {
-            fprintf(midi_region_log, "IN [%d]: %02x %02x %02x\n", i, status, d1, d2);
-        }
-    }
-
-    fflush(midi_region_log);
-}
-
-/* Log MIDI_OUT changes across frames to reverse-engineer encoding. */
-static FILE *midi_frame_log = NULL;
-static void mailbox_midi_out_frame_log(void)
-{
-    static int enabled = -1;
-    static int check_counter = 0;
-    static int frame_count = 0;
-    static uint8_t prev[MIDI_BUFFER_SIZE];
-    static int has_prev = 0;
-
-    if (check_counter++ % 50 == 0 || enabled < 0) {
-        enabled = (access("/data/UserData/move-anything/midi_frame_on", F_OK) == 0);
-        if (!enabled) {
-            frame_count = 0;
-            has_prev = 0;
-        }
-    }
-
-    if (!enabled || !global_mmap_addr) return;
-
-    if (!midi_frame_log) {
-        midi_frame_log = fopen("/data/UserData/move-anything/midi_frame.log", "a");
-    }
-    if (!midi_frame_log) return;
-
-    uint8_t *src = global_mmap_addr + MIDI_OUT_OFFSET;
-    if (!has_prev) {
-        memcpy(prev, src, MIDI_BUFFER_SIZE);
-        fprintf(midi_frame_log, "FRAME %d (init)\n", frame_count);
-        fflush(midi_frame_log);
-        has_prev = 1;
-        return;
-    }
-
-    fprintf(midi_frame_log, "FRAME %d\n", frame_count);
-    for (int i = 0; i < MIDI_BUFFER_SIZE; i++) {
-        if (prev[i] != src[i]) {
-            fprintf(midi_frame_log, "  %03d %02x->%02x\n", i, prev[i], src[i]);
-        }
-    }
-    fflush(midi_frame_log);
-    memcpy(prev, src, MIDI_BUFFER_SIZE);
-
-    frame_count++;
-    if (frame_count >= 30) {
-        unlink("/data/UserData/move-anything/midi_frame_on");
-    }
-}
-
-/* ============================================================================
- * SPI IOCTL TRACE (XMOS PATH DISCOVERY)
- * ============================================================================
- * Log SPI transfers when enabled by spi_trace_on to locate MIDI bytes.
- * ============================================================================ */
-
-static FILE *spi_trace_log = NULL;
-static void spi_trace_log_open(void)
-{
-    if (!spi_trace_log) {
-        spi_trace_log = fopen("/data/UserData/move-anything/spi_trace.log", "a");
-    }
-}
-
-static int spi_trace_enabled(void)
-{
-    static int enabled = -1;
-    static int check_counter = 0;
-    if (check_counter++ % 200 == 0 || enabled < 0) {
-        enabled = (access("/data/UserData/move-anything/spi_trace_on", F_OK) == 0);
-    }
-    return enabled;
-}
-
-static void spi_trace_log_buf(const char *tag, const uint8_t *buf, size_t len)
-{
-    if (!spi_trace_log) return;
-    size_t max = len > 64 ? 64 : len;
-    fprintf(spi_trace_log, "%s len=%zu bytes:", tag, len);
-    for (size_t i = 0; i < max; i++) {
-        fprintf(spi_trace_log, " %02x", buf[i]);
-    }
-    if (len > max) fprintf(spi_trace_log, " ...");
-    fprintf(spi_trace_log, "\n");
-}
-
-static void spi_trace_ioctl(unsigned long request, char *argp)
-{
-    if (!spi_trace_enabled()) return;
-    spi_trace_log_open();
-    if (!spi_trace_log) return;
-
-    static unsigned int counter = 0;
-    if (++counter % 10 != 0) return;
-
-    unsigned int size = _IOC_SIZE(request);
-    fprintf(spi_trace_log, "IOCTL req=0x%lx size=%u\n", request, size);
-
-    if (_IOC_TYPE(request) == SPI_IOC_MAGIC && size >= sizeof(struct spi_ioc_transfer)) {
-        int n = (int)(size / sizeof(struct spi_ioc_transfer));
-        struct spi_ioc_transfer *xfers = (struct spi_ioc_transfer *)argp;
-        for (int i = 0; i < n; i++) {
-            const struct spi_ioc_transfer *x = &xfers[i];
-            fprintf(spi_trace_log, "  XFER[%d] len=%u tx=%p rx=%p\n",
-                    i, x->len, (void *)(uintptr_t)x->tx_buf, (void *)(uintptr_t)x->rx_buf);
-            if (x->tx_buf && x->len) {
-                uint8_t tmp[256];
-                size_t copy_len = x->len > sizeof(tmp) ? sizeof(tmp) : x->len;
-                memcpy(tmp, (const void *)(uintptr_t)x->tx_buf, copy_len);
-                spi_trace_log_buf("  TX", tmp, copy_len);
-            }
-            if (x->rx_buf && x->len) {
-                uint8_t tmp[256];
-                size_t copy_len = x->len > sizeof(tmp) ? sizeof(tmp) : x->len;
-                memcpy(tmp, (const void *)(uintptr_t)x->rx_buf, copy_len);
-                spi_trace_log_buf("  RX", tmp, copy_len);
-            }
-        }
-    }
-
-    fflush(spi_trace_log);
-}
 
 /* ============================================================================
  * IN-PROCESS SHADOW CHAIN (MULTI-PATCH)
@@ -1199,2513 +620,6 @@ static void shadow_read_initial_volume(void)
 
 
 
-                /* Extract master_fx string (legacy single-slot) */
-                char *mfx = strstr(json, "\"master_fx\":");
-                if (mfx) {
-                    mfx = strchr(mfx, ':');
-                    if (mfx) {
-                        mfx++;
-                        while (*mfx == ' ' || *mfx == '"') mfx++;
-                        char *end = mfx;
-                        while (*end && *end != '"' && *end != ',' && *end != '\n') end++;
-                        int len = end - mfx;
-                        if (len < (int)sizeof(master_fx) - 1) {
-                            strncpy(master_fx, mfx, len);
-                            master_fx[len] = '\0';
-                        }
-                    }
-                }
-
-                /* Extract master_fx_path string */
-                char *mfxp = strstr(json, "\"master_fx_path\":");
-                if (mfxp) {
-                    mfxp = strchr(mfxp, ':');
-                    if (mfxp) {
-                        mfxp++;
-                        while (*mfxp == ' ' || *mfxp == '"') mfxp++;
-                        char *end = mfxp;
-                        while (*end && *end != '"' && *end != ',' && *end != '\n') end++;
-                        int len = end - mfxp;
-                        if (len < (int)sizeof(master_fx_path) - 1) {
-                            strncpy(master_fx_path, mfxp, len);
-                            master_fx_path[len] = '\0';
-                        }
-                    }
-                }
-
-                /* Extract master_fx_chain object (written by shadow_ui.js) */
-                char *mfc = strstr(json, "\"master_fx_chain\":");
-                if (mfc) {
-                    char *obj_start = strchr(mfc, '{');
-                    if (obj_start) {
-                        int depth = 1;
-                        char *obj_end = obj_start + 1;
-                        while (*obj_end && depth > 0) {
-                            if (*obj_end == '{') depth++;
-                            else if (*obj_end == '}') depth--;
-                            obj_end++;
-                        }
-                        int len = obj_end - obj_start;
-                        if (len < (int)sizeof(master_fx_chain_buf) - 1) {
-                            strncpy(master_fx_chain_buf, obj_start, len);
-                            master_fx_chain_buf[len] = '\0';
-                        }
-                    }
-                }
-
-                /* Extract overlay_knobs_mode integer */
-                char *okm = strstr(json, "\"overlay_knobs_mode\":");
-                if (okm) {
-                    okm = strchr(okm, ':');
-                    if (okm) {
-                        okm++;
-                        while (*okm == ' ') okm++;
-                        overlay_knobs_mode = atoi(okm);
-                    }
-                }
-
-                /* Extract resample_bridge_mode integer */
-                char *rbm = strstr(json, "\"resample_bridge_mode\":");
-                if (rbm) {
-                    rbm = strchr(rbm, ':');
-                    if (rbm) {
-                        rbm++;
-                        while (*rbm == ' ') rbm++;
-                        resample_bridge_mode = atoi(rbm);
-                    }
-                }
-
-                /* Extract link_audio_routing boolean */
-                char *lar = strstr(json, "\"link_audio_routing\":");
-                if (lar) {
-                    lar = strchr(lar, ':');
-                    if (lar) {
-                        lar++;
-                        while (*lar == ' ') lar++;
-                        link_audio_routing_saved = (strncmp(lar, "true", 4) == 0) ? 1 : 0;
-                    }
-                }
-
-                free(json);
-            }
-        }
-        fclose(f);
-    }
-
-    /* Write complete config file */
-    f = fopen(SHADOW_CONFIG_PATH, "w");
-    if (!f) {
-        shadow_log("shadow_save_state: failed to open for writing");
-        return;
-    }
-
-    fprintf(f, "{\n");
-    if (patches_buf[0]) {
-        fprintf(f, "  \"patches\": %s,\n", patches_buf);
-    }
-    fprintf(f, "  \"master_fx\": \"%s\",\n", master_fx);
-    if (master_fx_path[0]) {
-        fprintf(f, "  \"master_fx_path\": \"%s\",\n", master_fx_path);
-    }
-    if (master_fx_chain_buf[0]) {
-        fprintf(f, "  \"master_fx_chain\": %s,\n", master_fx_chain_buf);
-    }
-    if (overlay_knobs_mode >= 0) {
-        fprintf(f, "  \"overlay_knobs_mode\": %d,\n", overlay_knobs_mode);
-    }
-    if (resample_bridge_mode >= 0) {
-        fprintf(f, "  \"resample_bridge_mode\": %d,\n", resample_bridge_mode);
-    }
-    if (link_audio_routing_saved >= 0) {
-        fprintf(f, "  \"link_audio_routing\": %s,\n", link_audio_routing_saved ? "true" : "false");
-    }
-    fprintf(f, "  \"slot_volumes\": [%.3f, %.3f, %.3f, %.3f],\n",
-            shadow_chain_slots[0].volume,
-            shadow_chain_slots[1].volume,
-            shadow_chain_slots[2].volume,
-            shadow_chain_slots[3].volume);
-    fprintf(f, "  \"slot_forward_channels\": [%d, %d, %d, %d]\n",
-            shadow_chain_slots[0].forward_channel,
-            shadow_chain_slots[1].forward_channel,
-            shadow_chain_slots[2].forward_channel,
-            shadow_chain_slots[3].forward_channel);
-    fprintf(f, "}\n");
-    fclose(f);
-
-    char msg[256];
-    snprintf(msg, sizeof(msg), "Saved slot volumes: [%.2f, %.2f, %.2f, %.2f] fwd: [%d, %d, %d, %d]",
-             shadow_chain_slots[0].volume,
-             shadow_chain_slots[1].volume,
-             shadow_chain_slots[2].volume,
-             shadow_chain_slots[3].volume,
-             shadow_chain_slots[0].forward_channel,
-             shadow_chain_slots[1].forward_channel,
-             shadow_chain_slots[2].forward_channel,
-             shadow_chain_slots[3].forward_channel);
-    shadow_log(msg);
-}
-
-static void shadow_load_state(void)
-{
-    FILE *f = fopen(SHADOW_CONFIG_PATH, "r");
-    if (!f) {
-        return;
-    }
-
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    if (size <= 0 || size > 8192) {
-        fclose(f);
-        return;
-    }
-
-    char *json = malloc(size + 1);
-    if (!json) {
-        fclose(f);
-        return;
-    }
-
-    size_t nread = fread(json, 1, size, f);
-    json[nread] = '\0';
-    fclose(f);
-
-    /* Parse slot_volumes array */
-    const char *key = "\"slot_volumes\":";
-    char *pos = strstr(json, key);
-    if (pos) {
-        pos = strchr(pos, '[');
-        if (pos) {
-            float v0, v1, v2, v3;
-            if (sscanf(pos, "[%f, %f, %f, %f]", &v0, &v1, &v2, &v3) == 4) {
-                shadow_chain_slots[0].volume = v0;
-                shadow_chain_slots[1].volume = v1;
-                shadow_chain_slots[2].volume = v2;
-                shadow_chain_slots[3].volume = v3;
-
-                char msg[128];
-                snprintf(msg, sizeof(msg), "Loaded slot volumes: [%.2f, %.2f, %.2f, %.2f]",
-                         v0, v1, v2, v3);
-                shadow_log(msg);
-            }
-        }
-    }
-
-    /* Parse slot_forward_channels array */
-    const char *fwd_key = "\"slot_forward_channels\":";
-    char *fwd_pos = strstr(json, fwd_key);
-    if (fwd_pos) {
-        fwd_pos = strchr(fwd_pos, '[');
-        if (fwd_pos) {
-            int f0, f1, f2, f3;
-            if (sscanf(fwd_pos, "[%d, %d, %d, %d]", &f0, &f1, &f2, &f3) == 4) {
-                shadow_chain_slots[0].forward_channel = f0;
-                shadow_chain_slots[1].forward_channel = f1;
-                shadow_chain_slots[2].forward_channel = f2;
-                shadow_chain_slots[3].forward_channel = f3;
-
-                char msg[128];
-                snprintf(msg, sizeof(msg), "Loaded slot fwd channels: [%d, %d, %d, %d]",
-                         f0, f1, f2, f3);
-                shadow_log(msg);
-            }
-        }
-    }
-
-    free(json);
-}
-
-/* Parse volume from display buffer (vertical line position)
- * The volume overlay is a vertical line that moves left-to-right.
- * We scan the middle row (row 32) for a white pixel.
- * X position (0-127) maps to volume. */
-
-static int shadow_chain_parse_channel(int ch) {
-    /* Config uses 1-based MIDI channels; convert to 0-based for status nibble.
-     * 0 = all channels (stored as -1 internally). */
-    if (ch == 0) {
-        return -1;  /* All channels */
-    }
-    if (ch >= 1 && ch <= 16) {
-        return ch - 1;
-    }
-    return ch;
-}
-
-static int shadow_inprocess_log_enabled(void) {
-    static int enabled = -1;
-    static int check_counter = 0;
-    if (enabled < 0 || (check_counter++ % 200 == 0)) {
-        enabled = (access("/data/UserData/move-anything/shadow_inprocess_log_on", F_OK) == 0);
-    }
-    return enabled;
-}
-
-static void shadow_log(const char *msg) {
-    /* Write to unified log */
-    unified_log("shim", LOG_LEVEL_DEBUG, "%s", msg ? msg : "(null)");
-}
-
-static FILE *shadow_midi_out_log = NULL;
-
-static int shadow_midi_out_log_enabled(void)
-{
-    static int enabled = 0;
-    static int announced = 0;
-    enabled = (access("/data/UserData/move-anything/shadow_midi_out_log_on", F_OK) == 0);
-    if (!enabled && shadow_midi_out_log) {
-        fclose(shadow_midi_out_log);
-        shadow_midi_out_log = NULL;
-    }
-    if (enabled && !announced) {
-        shadow_log("shadow_midi_out_log enabled");
-        announced = 1;
-    }
-    return enabled;
-}
-
-static void shadow_midi_out_logf(const char *fmt, ...)
-{
-    if (!shadow_midi_out_log_enabled()) return;
-    if (!shadow_midi_out_log) {
-        shadow_midi_out_log = fopen("/data/UserData/move-anything/shadow_midi_out.log", "a");
-        if (!shadow_midi_out_log) return;
-    }
-
-    va_list args;
-    va_start(args, fmt);
-    vfprintf(shadow_midi_out_log, fmt, args);
-    va_end(args);
-    fputc('\n', shadow_midi_out_log);
-    fflush(shadow_midi_out_log);
-}
-
-static void shadow_chain_defaults(void) {
-    for (int i = 0; i < SHADOW_CHAIN_INSTANCES; i++) {
-        shadow_chain_slots[i].instance = NULL;
-        shadow_chain_slots[i].active = 0;
-        shadow_chain_slots[i].patch_index = -1;
-        shadow_chain_slots[i].channel = shadow_chain_parse_channel(1 + i);
-        shadow_chain_slots[i].volume = 1.0f;
-        shadow_chain_slots[i].pre_mute_volume = 0.0f;
-        shadow_chain_slots[i].muted = 0;
-        shadow_chain_slots[i].forward_channel = -1;
-        capture_clear(&shadow_chain_slots[i].capture);
-        strncpy(shadow_chain_slots[i].patch_name,
-                shadow_chain_default_patches[i],
-                sizeof(shadow_chain_slots[i].patch_name) - 1);
-        shadow_chain_slots[i].patch_name[sizeof(shadow_chain_slots[i].patch_name) - 1] = '\0';
-    }
-    /* Clear all master FX slots */
-    for (int i = 0; i < MASTER_FX_SLOTS; i++) {
-        memset(&shadow_master_fx_slots[i], 0, sizeof(master_fx_slot_t));
-    }
-}
-
-static void shadow_ui_state_update_slot(int slot) {
-    if (!shadow_ui_state) return;
-    if (slot < 0 || slot >= SHADOW_UI_SLOTS) return;
-    int ch = shadow_chain_slots[slot].channel;
-    shadow_ui_state->slot_channels[slot] = (ch < 0) ? 0 : (uint8_t)(ch + 1);
-    shadow_ui_state->slot_volumes[slot] = (uint8_t)(shadow_chain_slots[slot].volume * 100.0f);
-    shadow_ui_state->slot_forward_ch[slot] = (int8_t)shadow_chain_slots[slot].forward_channel;
-    strncpy(shadow_ui_state->slot_names[slot],
-            shadow_chain_slots[slot].patch_name,
-            SHADOW_UI_NAME_LEN - 1);
-    shadow_ui_state->slot_names[slot][SHADOW_UI_NAME_LEN - 1] = '\0';
-}
-
-static void shadow_ui_state_refresh(void) {
-    if (!shadow_ui_state) return;
-    shadow_ui_state->slot_count = SHADOW_UI_SLOTS;
-    for (int i = 0; i < SHADOW_UI_SLOTS; i++) {
-        shadow_ui_state_update_slot(i);
-    }
-}
-
-static void shadow_chain_load_config(void) {
-    shadow_chain_defaults();
-
-    FILE *f = fopen(SHADOW_CHAIN_CONFIG_PATH, "r");
-    if (!f) {
-        shadow_ui_state_refresh();
-        return;
-    }
-
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    if (size <= 0 || size > 4096) {
-        fclose(f);
-        shadow_ui_state_refresh();
-        return;
-    }
-
-    char *json = malloc(size + 1);
-    if (!json) {
-        fclose(f);
-        shadow_ui_state_refresh();
-        return;
-    }
-
-    size_t nread = fread(json, 1, size, f);
-    json[nread] = '\0';
-    fclose(f);
-
-    char *cursor = json;
-    for (int i = 0; i < SHADOW_CHAIN_INSTANCES; i++) {
-        char *name_pos = strstr(cursor, "\"name\"");
-        if (!name_pos) break;
-        char *colon = strchr(name_pos, ':');
-        if (colon) {
-            char *q1 = strchr(colon, '"');
-            if (q1) {
-                q1++;
-                char *q2 = strchr(q1, '"');
-                if (q2 && q2 > q1) {
-                    size_t len = (size_t)(q2 - q1);
-                    if (len < sizeof(shadow_chain_slots[i].patch_name)) {
-                        memcpy(shadow_chain_slots[i].patch_name, q1, len);
-                        shadow_chain_slots[i].patch_name[len] = '\0';
-                    }
-                }
-            }
-        }
-
-        char *chan_pos = strstr(name_pos, "\"channel\"");
-        if (chan_pos) {
-            char *chan_colon = strchr(chan_pos, ':');
-            if (chan_colon) {
-                int ch = atoi(chan_colon + 1);
-                if (ch >= 0 && ch <= 16) {
-                    shadow_chain_slots[i].channel = shadow_chain_parse_channel(ch);
-                }
-            }
-            cursor = chan_pos + 8;
-        } else {
-            cursor = name_pos + 6;
-        }
-
-        /* Parse volume (0.0 - 1.0) */
-        char *vol_pos = strstr(name_pos, "\"volume\"");
-        if (vol_pos) {
-            char *vol_colon = strchr(vol_pos, ':');
-            if (vol_colon) {
-                float vol = atof(vol_colon + 1);
-                if (vol >= 0.0f && vol <= 1.0f) {
-                    shadow_chain_slots[i].volume = vol;
-                }
-            }
-        }
-
-        /* Parse forward_channel (-2 = passthrough, -1 = auto, 1-16 = channel) */
-        char *fwd_pos = strstr(name_pos, "\"forward_channel\"");
-        if (fwd_pos) {
-            char *fwd_colon = strchr(fwd_pos, ':');
-            if (fwd_colon) {
-                int ch = atoi(fwd_colon + 1);
-                if (ch >= -2 && ch <= 16) {
-                    shadow_chain_slots[i].forward_channel = (ch > 0) ? ch - 1 : ch;
-                }
-            }
-        }
-    }
-
-    free(json);
-    shadow_ui_state_refresh();
-}
-
-static int shadow_chain_find_patch_index(void *instance, const char *name) {
-    if (!shadow_plugin_v2 || !shadow_plugin_v2->get_param || !instance || !name || !name[0]) {
-        return -1;
-    }
-    char buf[128];
-    int len = shadow_plugin_v2->get_param(instance, "patch_count", buf, sizeof(buf));
-    if (len <= 0) return -1;
-    buf[len < (int)sizeof(buf) ? len : (int)sizeof(buf) - 1] = '\0';
-    int count = atoi(buf);
-    if (count <= 0) return -1;
-
-    for (int i = 0; i < count; i++) {
-        char key[32];
-        snprintf(key, sizeof(key), "patch_name_%d", i);
-        len = shadow_plugin_v2->get_param(instance, key, buf, sizeof(buf));
-        if (len <= 0) continue;
-        buf[len < (int)sizeof(buf) ? len : (int)sizeof(buf) - 1] = '\0';
-        if (strcmp(buf, name) == 0) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-/* Unload a specific master FX slot */
-static void shadow_master_fx_slot_unload(int slot) {
-    if (slot < 0 || slot >= MASTER_FX_SLOTS) return;
-    master_fx_slot_t *s = &shadow_master_fx_slots[slot];
-
-    if (s->instance && s->api && s->api->destroy_instance) {
-        s->api->destroy_instance(s->instance);
-    }
-    s->instance = NULL;
-    s->api = NULL;
-    s->on_midi = NULL;
-    if (s->handle) {
-        dlclose(s->handle);
-        s->handle = NULL;
-    }
-    s->module_path[0] = '\0';
-    s->module_id[0] = '\0';
-    capture_clear(&s->capture);
-}
-
-/* Unload all master FX slots */
-static void shadow_master_fx_unload_all(void) {
-    for (int i = 0; i < MASTER_FX_SLOTS; i++) {
-        shadow_master_fx_slot_unload(i);
-    }
-}
-
-/* Load a master FX module into a specific slot by full DSP path.
- * Returns 0 on success, -1 on failure. */
-static int shadow_master_fx_slot_load_with_config(int slot, const char *dsp_path, const char *config_json);
-
-static int shadow_master_fx_slot_load(int slot, const char *dsp_path) {
-    return shadow_master_fx_slot_load_with_config(slot, dsp_path, NULL);
-}
-
-static int shadow_master_fx_slot_load_with_config(int slot, const char *dsp_path, const char *config_json) {
-    if (slot < 0 || slot >= MASTER_FX_SLOTS) return -1;
-    master_fx_slot_t *s = &shadow_master_fx_slots[slot];
-
-    if (!dsp_path || !dsp_path[0]) {
-        shadow_master_fx_slot_unload(slot);
-        return 0;  /* Empty = disable this slot */
-    }
-
-    /* Already loaded? (skip check if config_json provided - need fresh instance) */
-    if (!config_json && strcmp(s->module_path, dsp_path) == 0 && s->instance) {
-        return 0;
-    }
-
-    /* Unload previous */
-    shadow_master_fx_slot_unload(slot);
-
-    s->handle = dlopen(dsp_path, RTLD_NOW | RTLD_LOCAL);
-    if (!s->handle) {
-        fprintf(stderr, "Shadow master FX[%d]: failed to load %s: %s\n", slot, dsp_path, dlerror());
-        return -1;
-    }
-
-    /* Look for audio FX v2 init function */
-    audio_fx_init_v2_fn init_fn = (audio_fx_init_v2_fn)dlsym(s->handle, AUDIO_FX_INIT_V2_SYMBOL);
-    if (!init_fn) {
-        fprintf(stderr, "Shadow master FX[%d]: %s not found in %s\n", slot, AUDIO_FX_INIT_V2_SYMBOL, dsp_path);
-        dlclose(s->handle);
-        s->handle = NULL;
-        return -1;
-    }
-
-    s->api = init_fn(&shadow_host_api);
-    if (!s->api || !s->api->create_instance) {
-        fprintf(stderr, "Shadow master FX[%d]: init failed for %s\n", slot, dsp_path);
-        dlclose(s->handle);
-        s->handle = NULL;
-        s->api = NULL;
-        return -1;
-    }
-
-    /* Extract module directory from dsp_path (remove filename) */
-    char module_dir[256];
-    strncpy(module_dir, dsp_path, sizeof(module_dir) - 1);
-    module_dir[sizeof(module_dir) - 1] = '\0';
-    char *last_slash = strrchr(module_dir, '/');
-    if (last_slash) {
-        *last_slash = '\0';
-    }
-
-    s->instance = s->api->create_instance(module_dir, config_json);
-    if (!s->instance) {
-        fprintf(stderr, "Shadow master FX[%d]: create_instance failed for %s\n", slot, dsp_path);
-        dlclose(s->handle);
-        s->handle = NULL;
-        s->api = NULL;
-        return -1;
-    }
-
-    strncpy(s->module_path, dsp_path, sizeof(s->module_path) - 1);
-    s->module_path[sizeof(s->module_path) - 1] = '\0';
-
-    /* Extract module ID from path (e.g., "/path/to/cloudseed/dsp.so" -> "cloudseed") */
-    const char *id_start = strrchr(module_dir, '/');
-    if (id_start) {
-        strncpy(s->module_id, id_start + 1, sizeof(s->module_id) - 1);
-    } else {
-        strncpy(s->module_id, module_dir, sizeof(s->module_id) - 1);
-    }
-    s->module_id[sizeof(s->module_id) - 1] = '\0';
-
-    /* Load capture rules from module.json capabilities */
-    char module_json_path[512];
-    snprintf(module_json_path, sizeof(module_json_path), "%s/module.json", module_dir);
-    s->chain_params_cached = 0;
-    s->chain_params_cache[0] = '\0';
-    FILE *f = fopen(module_json_path, "r");
-    if (f) {
-        fseek(f, 0, SEEK_END);
-        long size = ftell(f);
-        fseek(f, 0, SEEK_SET);
-        if (size > 0 && size < 16384) {
-            char *json = malloc(size + 1);
-            if (json) {
-                size_t nread = fread(json, 1, size, f);
-                json[nread] = '\0';
-                const char *caps = strstr(json, "\"capabilities\"");
-                if (caps) {
-                    capture_parse_json(&s->capture, caps);
-                }
-                /* Cache chain_params to avoid file I/O in audio thread */
-                const char *chain_params = strstr(json, "\"chain_params\"");
-                if (chain_params) {
-                    const char *arr_start = strchr(chain_params, '[');
-                    if (arr_start) {
-                        int depth = 1;
-                        const char *arr_end = arr_start + 1;
-                        while (*arr_end && depth > 0) {
-                            if (*arr_end == '[') depth++;
-                            else if (*arr_end == ']') depth--;
-                            arr_end++;
-                        }
-                        int len = (int)(arr_end - arr_start);
-                        if (len > 0 && len < (int)sizeof(s->chain_params_cache) - 1) {
-                            memcpy(s->chain_params_cache, arr_start, len);
-                            s->chain_params_cache[len] = '\0';
-                            s->chain_params_cached = 1;
-                        }
-                    }
-                }
-                free(json);
-            }
-        }
-        fclose(f);
-    }
-
-    /* Check for optional MIDI handler (e.g. ducker) */
-    {
-        typedef void (*fx_on_midi_fn)(void *, const uint8_t *, int, int);
-        s->on_midi = (fx_on_midi_fn)dlsym(s->handle, "move_audio_fx_on_midi");
-    }
-
-    fprintf(stderr, "Shadow master FX[%d]: loaded %s\n", slot, dsp_path);
-    return 0;
-}
-
-/* Legacy wrapper: load into slot 0 for backward compatibility */
-static int shadow_master_fx_load(const char *dsp_path) {
-    return shadow_master_fx_slot_load(0, dsp_path);
-}
-
-/* Legacy wrapper: unload slot 0 */
-static void shadow_master_fx_unload(void) {
-    shadow_master_fx_slot_unload(0);
-}
-
-/* Forward MIDI to master FX slots that have on_midi (e.g. ducker) */
-static void shadow_master_fx_forward_midi(const uint8_t *msg, int len, int source) {
-    for (int i = 0; i < MASTER_FX_SLOTS; i++) {
-        master_fx_slot_t *s = &shadow_master_fx_slots[i];
-        if (s->on_midi && s->instance) {
-            s->on_midi(s->instance, msg, len, source);
-        }
-    }
-}
-
-/* Forward declaration for capture loading */
-static void shadow_slot_load_capture(int slot, int patch_index);
-
-static int shadow_inprocess_load_chain(void) {
-    if (shadow_inprocess_ready) return 0;
-
-    shadow_dsp_handle = dlopen(SHADOW_CHAIN_DSP_PATH, RTLD_NOW | RTLD_LOCAL);
-    if (!shadow_dsp_handle) {
-        fprintf(stderr, "Shadow inprocess: failed to load %s: %s\n",
-                SHADOW_CHAIN_DSP_PATH, dlerror());
-        return -1;
-    }
-
-    memset(&shadow_host_api, 0, sizeof(shadow_host_api));
-    shadow_host_api.api_version = MOVE_PLUGIN_API_VERSION;
-    shadow_host_api.sample_rate = MOVE_SAMPLE_RATE;
-    shadow_host_api.frames_per_block = MOVE_FRAMES_PER_BLOCK;
-    shadow_host_api.mapped_memory = global_mmap_addr;
-    shadow_host_api.audio_out_offset = MOVE_AUDIO_OUT_OFFSET;
-    shadow_host_api.audio_in_offset = MOVE_AUDIO_IN_OFFSET;
-    shadow_host_api.log = shadow_log;
-
-    move_plugin_init_v2_fn init_v2 = (move_plugin_init_v2_fn)dlsym(
-        shadow_dsp_handle, MOVE_PLUGIN_INIT_V2_SYMBOL);
-    if (!init_v2) {
-        fprintf(stderr, "Shadow inprocess: %s not found\n", MOVE_PLUGIN_INIT_V2_SYMBOL);
-        dlclose(shadow_dsp_handle);
-        shadow_dsp_handle = NULL;
-        return -1;
-    }
-
-    shadow_plugin_v2 = init_v2(&shadow_host_api);
-    if (!shadow_plugin_v2 || !shadow_plugin_v2->create_instance) {
-        fprintf(stderr, "Shadow inprocess: chain v2 init failed\n");
-        dlclose(shadow_dsp_handle);
-        shadow_dsp_handle = NULL;
-        shadow_plugin_v2 = NULL;
-        return -1;
-    }
-
-    /* Look up optional chain exports for Link Audio routing + same-frame FX */
-    shadow_chain_set_inject_audio = (void (*)(void *, int16_t *, int))
-        dlsym(shadow_dsp_handle, "chain_set_inject_audio");
-    shadow_chain_set_external_fx_mode = (void (*)(void *, int))
-        dlsym(shadow_dsp_handle, "chain_set_external_fx_mode");
-    shadow_chain_process_fx = (void (*)(void *, int16_t *, int))
-        dlsym(shadow_dsp_handle, "chain_process_fx");
-
-    unified_log("shim", LOG_LEVEL_INFO, "chain dlsym: inject=%p ext_fx_mode=%p process_fx=%p same_frame=%d",
-            (void*)shadow_chain_set_inject_audio,
-            (void*)shadow_chain_set_external_fx_mode,
-            (void*)shadow_chain_process_fx,
-            (shadow_chain_set_external_fx_mode && shadow_chain_process_fx) ? 1 : 0);
-
-    /* Run batch migration if this is the first boot with per-set state support.
-     * Copies default slot_state/ to set_state/<UUID>/ for all existing sets. */
-    shadow_batch_migrate_sets();
-
-    /* Determine boot state directory: per-set if active_set.txt exists, else default */
-    char boot_state_dir[512];
-    snprintf(boot_state_dir, sizeof(boot_state_dir), "%s", SLOT_STATE_DIR);
-    {
-        FILE *asf = fopen(ACTIVE_SET_PATH, "r");
-        if (asf) {
-            char boot_uuid[128] = "";
-            if (fgets(boot_uuid, sizeof(boot_uuid), asf)) {
-                /* Trim whitespace */
-                char *end = boot_uuid + strlen(boot_uuid) - 1;
-                while (end > boot_uuid && (*end == '\n' || *end == '\r' || *end == ' ')) *end-- = '\0';
-                if (boot_uuid[0]) {
-                    char set_dir[512];
-                    snprintf(set_dir, sizeof(set_dir), SET_STATE_DIR "/%s", boot_uuid);
-                    /* Only adopt per-set dir if it has actual state files */
-                    char test_slot[768];
-                    snprintf(test_slot, sizeof(test_slot), "%s/slot_0.json", set_dir);
-                    char test_cfg[768];
-                    snprintf(test_cfg, sizeof(test_cfg), "%s/shadow_chain_config.json", set_dir);
-                    struct stat st;
-                    if (stat(test_slot, &st) == 0 || stat(test_cfg, &st) == 0) {
-                        snprintf(boot_state_dir, sizeof(boot_state_dir), "%s", set_dir);
-                        /* Store UUID + name so set-change detection doesn't re-trigger */
-                        snprintf(sampler_current_set_uuid, sizeof(sampler_current_set_uuid),
-                                 "%s", boot_uuid);
-                        /* Read set name from line 2 */
-                        char boot_name[128] = "";
-                        if (fgets(boot_name, sizeof(boot_name), asf)) {
-                            char *ne = boot_name + strlen(boot_name) - 1;
-                            while (ne > boot_name && (*ne == '\n' || *ne == '\r' || *ne == ' ')) *ne-- = '\0';
-                            if (boot_name[0]) {
-                                snprintf(sampler_current_set_name, sizeof(sampler_current_set_name),
-                                         "%s", boot_name);
-                            }
-                        }
-                        char m[256];
-                        snprintf(m, sizeof(m), "Boot: using per-set state dir %s", set_dir);
-                        shadow_log(m);
-                    }
-                }
-            }
-            fclose(asf);
-        }
-    }
-
-    shadow_chain_load_config();
-    /* If per-set config was loaded, it overrides the global config values */
-    if (strcmp(boot_state_dir, SLOT_STATE_DIR) != 0) {
-        shadow_load_config_from_dir(boot_state_dir);
-    }
-
-    for (int i = 0; i < SHADOW_CHAIN_INSTANCES; i++) {
-        shadow_chain_slots[i].instance = shadow_plugin_v2->create_instance(
-            SHADOW_CHAIN_MODULE_DIR, NULL);
-        if (!shadow_chain_slots[i].instance) {
-            continue;
-        }
-
-        /* Check for autosave file first (preserves unsaved work across reboots) */
-        char autosave_path[256];
-        snprintf(autosave_path, sizeof(autosave_path),
-                 "%s/slot_%d.json", boot_state_dir, i);
-        FILE *af = fopen(autosave_path, "r");
-        if (af) {
-            /* Check if autosave has content (not just "{}") */
-            fseek(af, 0, SEEK_END);
-            long asize = ftell(af);
-            fclose(af);
-            if (asize > 10) {  /* More than just "{}\n" */
-                shadow_plugin_v2->set_param(
-                    shadow_chain_slots[i].instance, "load_file", autosave_path);
-                shadow_chain_slots[i].active = 1;
-                shadow_chain_slots[i].patch_index = -1;
-                /* Query channel settings from loaded autosave */
-                if (shadow_chain_slots[i].forward_channel == -1 && shadow_plugin_v2->get_param) {
-                    char fwd_buf[16];
-                    int len = shadow_plugin_v2->get_param(shadow_chain_slots[i].instance,
-                        "synth:default_forward_channel", fwd_buf, sizeof(fwd_buf));
-                    if (len > 0) {
-                        fwd_buf[len < (int)sizeof(fwd_buf) ? len : (int)sizeof(fwd_buf) - 1] = '\0';
-                        int default_fwd = atoi(fwd_buf);
-                        if (default_fwd >= 0 && default_fwd <= 15) {
-                            shadow_chain_slots[i].forward_channel = default_fwd;
-                        }
-                    }
-                }
-                if (shadow_plugin_v2->get_param) {
-                    char ch_buf[16];
-                    int len;
-                    len = shadow_plugin_v2->get_param(shadow_chain_slots[i].instance,
-                        "patch:receive_channel", ch_buf, sizeof(ch_buf));
-                    if (len > 0) {
-                        ch_buf[len < (int)sizeof(ch_buf) ? len : (int)sizeof(ch_buf) - 1] = '\0';
-                        int recv_ch = atoi(ch_buf);
-                        if (recv_ch != 0) {
-                            shadow_chain_slots[i].channel = (recv_ch >= 1 && recv_ch <= 16) ? recv_ch - 1 : -1;
-                        }
-                    }
-                    len = shadow_plugin_v2->get_param(shadow_chain_slots[i].instance,
-                        "patch:forward_channel", ch_buf, sizeof(ch_buf));
-                    if (len > 0) {
-                        ch_buf[len < (int)sizeof(ch_buf) ? len : (int)sizeof(ch_buf) - 1] = '\0';
-                        int fwd_ch = atoi(ch_buf);
-                        if (fwd_ch != 0) {
-                            shadow_chain_slots[i].forward_channel = (fwd_ch > 0) ? fwd_ch - 1 : fwd_ch;
-                        }
-                    }
-                }
-                {
-                    char msg[256];
-                    snprintf(msg, sizeof(msg), "Shadow inprocess: slot %d loaded from autosave", i);
-                    shadow_log(msg);
-                }
-                continue;
-            }
-        }
-
-        /* Fall back to name-based lookup from config */
-        /* Check for "none" - means slot should be inactive */
-        if (strcasecmp(shadow_chain_slots[i].patch_name, "none") == 0 ||
-            shadow_chain_slots[i].patch_name[0] == '\0') {
-            shadow_chain_slots[i].active = 0;
-            shadow_chain_slots[i].patch_index = -1;
-            continue;
-        }
-        int idx = shadow_chain_find_patch_index(shadow_chain_slots[i].instance,
-                                                shadow_chain_slots[i].patch_name);
-        shadow_chain_slots[i].patch_index = idx;
-        if (idx >= 0 && shadow_plugin_v2->set_param) {
-            char idx_str[16];
-            snprintf(idx_str, sizeof(idx_str), "%d", idx);
-            shadow_plugin_v2->set_param(shadow_chain_slots[i].instance, "load_patch", idx_str);
-            shadow_chain_slots[i].active = 1;
-            /* Load capture rules from the patch file */
-            shadow_slot_load_capture(i, idx);
-            /* Query synth's default forward channel after patch load.
-             * Only apply if slot is still at Auto (-1); preserve explicit user settings. */
-            if (shadow_chain_slots[i].forward_channel == -1 && shadow_plugin_v2->get_param) {
-                char fwd_buf[16];
-                int len = shadow_plugin_v2->get_param(shadow_chain_slots[i].instance,
-                    "synth:default_forward_channel", fwd_buf, sizeof(fwd_buf));
-                if (len > 0) {
-                    fwd_buf[len < (int)sizeof(fwd_buf) ? len : (int)sizeof(fwd_buf) - 1] = '\0';
-                    int default_fwd = atoi(fwd_buf);
-                    if (default_fwd >= 0 && default_fwd <= 15) {
-                        shadow_chain_slots[i].forward_channel = default_fwd;
-                    }
-                }
-            }
-            /* Apply channel settings saved in the patch preset (overrides config/defaults).
-             * 0 = not saved in preset, keep config values. */
-            if (shadow_plugin_v2->get_param) {
-                char ch_buf[16];
-                int len;
-                len = shadow_plugin_v2->get_param(shadow_chain_slots[i].instance,
-                    "patch:receive_channel", ch_buf, sizeof(ch_buf));
-                if (len > 0) {
-                    ch_buf[len < (int)sizeof(ch_buf) ? len : (int)sizeof(ch_buf) - 1] = '\0';
-                    int recv_ch = atoi(ch_buf);
-                    if (recv_ch != 0) {
-                        shadow_chain_slots[i].channel = (recv_ch >= 1 && recv_ch <= 16) ? recv_ch - 1 : -1;
-                    }
-                }
-                len = shadow_plugin_v2->get_param(shadow_chain_slots[i].instance,
-                    "patch:forward_channel", ch_buf, sizeof(ch_buf));
-                if (len > 0) {
-                    ch_buf[len < (int)sizeof(ch_buf) ? len : (int)sizeof(ch_buf) - 1] = '\0';
-                    int fwd_ch = atoi(ch_buf);
-                    if (fwd_ch != 0) {
-                        shadow_chain_slots[i].forward_channel = (fwd_ch > 0) ? fwd_ch - 1 : fwd_ch;
-                    }
-                }
-            }
-        } else {
-            char msg[128];
-            snprintf(msg, sizeof(msg), "Shadow inprocess: patch not found: %s",
-                     shadow_chain_slots[i].patch_name);
-            shadow_log(msg);
-        }
-    }
-
-    /* Load master FX slots from state files (written by shadow_ui.js autosave) */
-    for (int mfx = 0; mfx < MASTER_FX_SLOTS; mfx++) {
-        char mfx_path[256];
-        snprintf(mfx_path, sizeof(mfx_path), "%s/master_fx_%d.json", boot_state_dir, mfx);
-        FILE *mf = fopen(mfx_path, "r");
-        if (!mf) continue;
-
-        fseek(mf, 0, SEEK_END);
-        long msize = ftell(mf);
-        fseek(mf, 0, SEEK_SET);
-
-        if (msize <= 10) {  /* Empty marker "{}\n" */
-            fclose(mf);
-            continue;
-        }
-
-        char *mjson = malloc(msize + 1);
-        if (!mjson) { fclose(mf); continue; }
-        size_t mnread = fread(mjson, 1, msize, mf);
-        mjson[mnread] = '\0';
-        fclose(mf);
-
-        /* Extract module_path */
-        char dsp_path[256] = "";
-        {
-            char *mp = strstr(mjson, "\"module_path\":");
-            if (mp) {
-                mp = strchr(mp, ':');
-                if (mp) {
-                    mp++;
-                    while (*mp == ' ' || *mp == '"') mp++;
-                    char *end = mp;
-                    while (*end && *end != '"') end++;
-                    int len = end - mp;
-                    if (len > 0 && len < (int)sizeof(dsp_path) - 1) {
-                        strncpy(dsp_path, mp, len);
-                        dsp_path[len] = '\0';
-                    }
-                }
-            }
-        }
-
-        if (!dsp_path[0]) {
-            free(mjson);
-            continue;
-        }
-
-        /* Extract plugin_id from params BEFORE loading module.
-         * Pass it as config_json to create_instance so the CLAP host
-         * starts with the correct sub-plugin immediately (no default→switch). */
-        char config_json_buf[512] = "";
-        char *params_start = strstr(mjson, "\"params\":");
-        if (params_start) {
-            char *pid_key = strstr(params_start, "\"plugin_id\"");
-            if (pid_key) {
-                char *pc = strchr(pid_key + 11, ':');
-                if (pc) {
-                    pc++;
-                    while (*pc == ' ') pc++;
-                    if (*pc == '"') {
-                        pc++;
-                        char *pe = strchr(pc, '"');
-                        if (pe) {
-                            int plen = pe - pc;
-                            if (plen > 0 && plen < 256) {
-                                char pid_val[256];
-                                strncpy(pid_val, pc, plen);
-                                pid_val[plen] = '\0';
-                                snprintf(config_json_buf, sizeof(config_json_buf),
-                                         "{\"plugin_id\":\"%s\"}", pid_val);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        /* Load the module (with plugin_id config if available) */
-        int load_result = shadow_master_fx_slot_load_with_config(mfx, dsp_path,
-            config_json_buf[0] ? config_json_buf : NULL);
-        if (load_result != 0) {
-            char msg[256];
-            snprintf(msg, sizeof(msg), "MFX boot: slot %d failed to load %s", mfx, dsp_path);
-            shadow_log(msg);
-            free(mjson);
-            continue;
-        }
-
-        master_fx_slot_t *s = &shadow_master_fx_slots[mfx];
-
-        /* Restore state if available */
-        char *state_start = strstr(mjson, "\"state\":");
-        if (state_start && s->api && s->instance && s->api->set_param) {
-            char *obj_start = strchr(state_start, '{');
-            if (obj_start) {
-                int depth = 1;
-                char *obj_end = obj_start + 1;
-                while (*obj_end && depth > 0) {
-                    if (*obj_end == '{') depth++;
-                    else if (*obj_end == '}') depth--;
-                    obj_end++;
-                }
-                int slen = obj_end - obj_start;
-                char *state_buf = malloc(slen + 1);
-                if (state_buf) {
-                    memcpy(state_buf, obj_start, slen);
-                    state_buf[slen] = '\0';
-                    s->api->set_param(s->instance, "state", state_buf);
-                    free(state_buf);
-                }
-            }
-        } else if (params_start && s->api && s->instance && s->api->set_param) {
-            /* Fall back to individual params */
-            char *obj_start = strchr(params_start, '{');
-            if (obj_start) {
-                int depth = 1;
-                char *obj_end = obj_start + 1;
-                while (*obj_end && depth > 0) {
-                    if (*obj_end == '{') depth++;
-                    else if (*obj_end == '}') depth--;
-                    obj_end++;
-                }
-                /* Parse individual key:value pairs from the params object */
-                char *p = obj_start + 1;
-                while (p < obj_end - 1) {
-                    /* Find key */
-                    char *kstart = strchr(p, '"');
-                    if (!kstart || kstart >= obj_end) break;
-                    kstart++;
-                    char *kend = strchr(kstart, '"');
-                    if (!kend || kend >= obj_end) break;
-
-                    char param_key[128];
-                    int klen = kend - kstart;
-                    if (klen >= (int)sizeof(param_key)) { p = kend + 1; continue; }
-                    strncpy(param_key, kstart, klen);
-                    param_key[klen] = '\0';
-
-                    /* Find value (after colon) */
-                    char *colon = strchr(kend, ':');
-                    if (!colon || colon >= obj_end) break;
-                    colon++;
-                    while (*colon == ' ') colon++;
-
-                    char param_val[256];
-                    if (*colon == '"') {
-                        /* String value */
-                        colon++;
-                        char *vend = strchr(colon, '"');
-                        if (!vend || vend >= obj_end) break;
-                        int vlen = vend - colon;
-                        if (vlen >= (int)sizeof(param_val)) { p = vend + 1; continue; }
-                        strncpy(param_val, colon, vlen);
-                        param_val[vlen] = '\0';
-                        p = vend + 1;
-                    } else {
-                        /* Numeric value */
-                        char *vend = colon;
-                        while (*vend && *vend != ',' && *vend != '}' && *vend != '\n') vend++;
-                        int vlen = vend - colon;
-                        if (vlen >= (int)sizeof(param_val)) { p = vend; continue; }
-                        strncpy(param_val, colon, vlen);
-                        param_val[vlen] = '\0';
-                        /* Trim trailing whitespace */
-                        while (vlen > 0 && (param_val[vlen-1] == ' ' || param_val[vlen-1] == '\r')) {
-                            param_val[--vlen] = '\0';
-                        }
-                        p = vend;
-                    }
-
-                    /* Skip plugin_id - already applied via config_json */
-                    if (strcmp(param_key, "plugin_id") != 0) {
-                        s->api->set_param(s->instance, param_key, param_val);
-                    }
-                }
-            }
-        }
-
-        {
-            char msg[256];
-            snprintf(msg, sizeof(msg), "MFX boot: slot %d loaded %s%s",
-                     mfx, s->module_id,
-                     state_start ? " (with state)" : (strstr(mjson, "\"params\":") ? " (with params)" : ""));
-            shadow_log(msg);
-        }
-        free(mjson);
-    }
-
-    shadow_ui_state_refresh();
-
-    /* Pre-create directories so mkdir fork() doesn't glitch audio later */
-    {
-        struct stat st;
-        if (stat(SAMPLER_RECORDINGS_DIR, &st) != 0) {
-            const char *mkdir_argv[] = { "mkdir", "-p", SAMPLER_RECORDINGS_DIR, NULL };
-            shim_run_command(mkdir_argv);
-        }
-        if (stat(SKIPBACK_DIR, &st) != 0) {
-            const char *mkdir_argv[] = { "mkdir", "-p", SKIPBACK_DIR, NULL };
-            shim_run_command(mkdir_argv);
-        }
-        if (stat(SLOT_STATE_DIR, &st) != 0) {
-            const char *mkdir_argv[] = { "mkdir", "-p", SLOT_STATE_DIR, NULL };
-            shim_run_command(mkdir_argv);
-        }
-        if (stat(SET_STATE_DIR, &st) != 0) {
-            const char *mkdir_argv[] = { "mkdir", "-p", SET_STATE_DIR, NULL };
-            shim_run_command(mkdir_argv);
-        }
-    }
-
-    shadow_inprocess_ready = 1;
-    /* Start countdown for delayed mod wheel reset after Move's startup MIDI settles */
-    shadow_startup_modwheel_countdown = STARTUP_MODWHEEL_RESET_FRAMES;
-    if (shadow_control) {
-        /* Allow display hotkey when running in-process DSP. */
-        shadow_control->shadow_ready = 1;
-    }
-    /* Launch shadow UI only if enabled */
-    if (shadow_ui_enabled) {
-        launch_shadow_ui();
-    }
-    shadow_log("Shadow inprocess: chain loaded");
-    return 0;
-}
-
-static int shadow_chain_slot_for_channel(int ch) {
-    for (int i = 0; i < SHADOW_CHAIN_INSTANCES; i++) {
-        if (shadow_chain_slots[i].channel != ch && shadow_chain_slots[i].channel != -1) continue;
-        if (shadow_chain_slots[i].active) {
-            return i;
-        }
-        if (shadow_plugin_v2 && shadow_plugin_v2->get_param &&
-            shadow_chain_slots[i].instance) {
-            char buf[64];
-            int len = shadow_plugin_v2->get_param(shadow_chain_slots[i].instance,
-                                                  "synth_module", buf, sizeof(buf));
-            if (len > 0) {
-                if (len < (int)sizeof(buf)) buf[len] = '\0';
-                else buf[sizeof(buf) - 1] = '\0';
-                if (buf[0] != '\0') {
-                    shadow_chain_slots[i].active = 1;
-                    shadow_ui_state_update_slot(i);
-                    return i;
-                }
-            }
-        }
-    }
-    return -1;
-}
-
-/* Apply forward channel remapping for a slot.
- * If forward_channel >= 0, remap to that specific channel.
- * If forward_channel == -1 (auto), use the slot's receive channel. */
-static inline uint8_t shadow_chain_remap_channel(int slot, uint8_t status) {
-    int fwd_ch = shadow_chain_slots[slot].forward_channel;
-    if (fwd_ch == -2) {
-        /* Passthrough: preserve original MIDI channel */
-        return status;
-    }
-    if (fwd_ch >= 0 && fwd_ch <= 15) {
-        /* Specific forward channel */
-        return (status & 0xF0) | (uint8_t)fwd_ch;
-    }
-    /* Auto (-1): use the receive channel, but if recv=All (-1), passthrough */
-    if (shadow_chain_slots[slot].channel < 0) {
-        return status;  /* Recv=All + Fwd=Auto → passthrough */
-    }
-    return (status & 0xF0) | (uint8_t)shadow_chain_slots[slot].channel;
-}
-
-/* Dispatch MIDI to all matching slots (supports recv=All broadcasting) */
-static void shadow_chain_dispatch_midi_to_slots(const uint8_t *pkt, int log_on, int *midi_log_count) {
-    uint8_t status_usb = pkt[1];
-    uint8_t type = status_usb & 0xF0;
-    uint8_t midi_ch = status_usb & 0x0F;
-    uint8_t note = pkt[2];
-    int dispatched = 0;
-
-    for (int i = 0; i < SHADOW_CHAIN_INSTANCES; i++) {
-        /* Check channel match: slot receives this channel, or slot is set to All (-1) */
-        if (shadow_chain_slots[i].channel != (int)midi_ch && shadow_chain_slots[i].channel != -1)
-            continue;
-
-        /* Lazy activation check */
-        if (!shadow_chain_slots[i].active) {
-            if (shadow_plugin_v2 && shadow_plugin_v2->get_param &&
-                shadow_chain_slots[i].instance) {
-                char buf[64];
-                int len = shadow_plugin_v2->get_param(shadow_chain_slots[i].instance,
-                                                      "synth_module", buf, sizeof(buf));
-                if (len > 0) {
-                    if (len < (int)sizeof(buf)) buf[len] = '\0';
-                    else buf[sizeof(buf) - 1] = '\0';
-                    if (buf[0] != '\0') {
-                        shadow_chain_slots[i].active = 1;
-                        shadow_ui_state_update_slot(i);
-                    }
-                }
-            }
-            if (!shadow_chain_slots[i].active) continue;
-        }
-
-        /* Wake slot from idle on any MIDI dispatch */
-        if (shadow_slot_idle[i] || shadow_slot_fx_idle[i]) {
-            shadow_slot_idle[i] = 0;
-            shadow_slot_silence_frames[i] = 0;
-            shadow_slot_fx_idle[i] = 0;
-            shadow_slot_fx_silence_frames[i] = 0;
-        }
-
-        /* Send MIDI to this slot */
-        if (shadow_plugin_v2 && shadow_plugin_v2->on_midi) {
-            uint8_t msg[3] = { shadow_chain_remap_channel(i, pkt[1]), pkt[2], pkt[3] };
-            shadow_plugin_v2->on_midi(shadow_chain_slots[i].instance, msg, 3,
-                                      MOVE_MIDI_SOURCE_EXTERNAL);
-        }
-        dispatched++;
-    }
-
-    /* Broadcast MIDI to ALL active slots for audio FX (e.g. ducker).
-     * FX_BROADCAST only forwards to audio FX, not synth/MIDI FX, so this
-     * is safe even for slots that already received normal MIDI dispatch. */
-    if (shadow_plugin_v2 && shadow_plugin_v2->on_midi) {
-        for (int i = 0; i < SHADOW_CHAIN_INSTANCES; i++) {
-            if (!shadow_chain_slots[i].active || !shadow_chain_slots[i].instance)
-                continue;
-            uint8_t msg[3] = { pkt[1], pkt[2], pkt[3] };
-            shadow_plugin_v2->on_midi(shadow_chain_slots[i].instance, msg, 3,
-                                      MOVE_MIDI_SOURCE_FX_BROADCAST);
-        }
-    }
-
-    /* Forward MIDI to master FX (e.g. ducker) regardless of slot routing */
-    {
-        uint8_t msg[3] = { pkt[1], pkt[2], pkt[3] };
-        shadow_master_fx_forward_midi(msg, 3, MOVE_MIDI_SOURCE_EXTERNAL);
-    }
-
-    if (log_on && type == 0x90 && pkt[3] > 0 && *midi_log_count < 100) {
-        char dbg[256];
-        snprintf(dbg, sizeof(dbg),
-            "midi_out: note=%u vel=%u ch=%u dispatched=%d",
-            note, pkt[3], midi_ch, dispatched);
-        shadow_log(dbg);
-        shadow_midi_out_logf("midi_out: note=%u vel=%u ch=%u dispatched=%d",
-            note, pkt[3], midi_ch, dispatched);
-        (*midi_log_count)++;
-    }
-}
-
-static int shadow_is_internal_control_note(uint8_t note)
-{
-    /* Capacitive touch (0-9) and track buttons (40-43) are internal.
-     * Note: Step buttons (16-31) are NOT included - they overlap with musical notes E0-G1. */
-    return (note < 10) || (note >= 40 && note <= 43);
-}
-
-/* Subtractive MIDI FX for Move's internal synths (chord expansion).
- * Post-ioctl: rewrites cable-0 pad notes in MIDI_IN before Move sees them.
- * When a chord is active, each pad note-on/off is replaced in-place with the
- * root plus interval notes — all as cable-0, same format as real pad input.
- *
- * This avoids the timing/ordering invariant violations that crashed Move when
- * extra notes were injected additively as cable-2 events. */
-
-#define SHADOW_MIDI_FX_EXTRAS_MAX 4
-#define SHADOW_MIDI_FX_HELD_MAX 16
-
-typedef struct {
-    uint8_t active;
-    uint8_t root_note;     /* Original pad note */
-    uint8_t channel;       /* MIDI channel (low nibble of status) */
-    uint8_t extras[SHADOW_MIDI_FX_EXTRAS_MAX];  /* Generated chord interval notes */
-    int extra_count;
-} shadow_midi_fx_held_t;
-
-static shadow_midi_fx_held_t shadow_midi_fx_held[SHADOW_MIDI_FX_HELD_MAX];
-
-static int shadow_move_transform_slot(void)
-{
-    int slot = shadow_selected_slot;
-    if (shadow_control && shadow_control->ui_slot >= 0 &&
-        shadow_control->ui_slot < SHADOW_CHAIN_INSTANCES) {
-        slot = shadow_control->ui_slot;
-    }
-    if (slot < 0 || slot >= SHADOW_CHAIN_INSTANCES) return -1;
-    return slot;
-}
-
-static int shadow_slot_get_param_string(int slot, const char *key, char *buf, int buf_len)
-{
-    if (!buf || buf_len < 2 || !key || !key[0]) return 0;
-    if (slot < 0 || slot >= SHADOW_CHAIN_INSTANCES) return 0;
-    if (!shadow_plugin_v2 || !shadow_plugin_v2->get_param) return 0;
-    if (!shadow_chain_slots[slot].instance) return 0;
-
-    int len = shadow_plugin_v2->get_param(shadow_chain_slots[slot].instance, key, buf, buf_len);
-    if (len <= 0) return 0;
-    if (len >= buf_len) len = buf_len - 1;
-    buf[len] = '\0';
-    return 1;
-}
-
-static int shadow_chord_extra_intervals(const char *type, int *intervals, int max_intervals)
-{
-    if (!type || !intervals || max_intervals <= 0) return 0;
-
-    if (strcmp(type, "major") == 0) {
-        if (max_intervals >= 2) { intervals[0] = 4; intervals[1] = 7; return 2; }
-        intervals[0] = 4; return 1;
-    }
-    if (strcmp(type, "minor") == 0) {
-        if (max_intervals >= 2) { intervals[0] = 3; intervals[1] = 7; return 2; }
-        intervals[0] = 3; return 1;
-    }
-    if (strcmp(type, "dim") == 0) {
-        if (max_intervals >= 2) { intervals[0] = 3; intervals[1] = 6; return 2; }
-        intervals[0] = 3; return 1;
-    }
-    if (strcmp(type, "aug") == 0) {
-        if (max_intervals >= 2) { intervals[0] = 4; intervals[1] = 8; return 2; }
-        intervals[0] = 4; return 1;
-    }
-    if (strcmp(type, "sus2") == 0) {
-        if (max_intervals >= 2) { intervals[0] = 2; intervals[1] = 7; return 2; }
-        intervals[0] = 2; return 1;
-    }
-    if (strcmp(type, "sus4") == 0) {
-        if (max_intervals >= 2) { intervals[0] = 5; intervals[1] = 7; return 2; }
-        intervals[0] = 5; return 1;
-    }
-    if (strcmp(type, "maj7") == 0) {
-        if (max_intervals >= 3) { intervals[0] = 4; intervals[1] = 7; intervals[2] = 11; return 3; }
-        if (max_intervals >= 2) { intervals[0] = 4; intervals[1] = 7; return 2; }
-        intervals[0] = 4; return 1;
-    }
-    if (strcmp(type, "min7") == 0) {
-        if (max_intervals >= 3) { intervals[0] = 3; intervals[1] = 7; intervals[2] = 10; return 3; }
-        if (max_intervals >= 2) { intervals[0] = 3; intervals[1] = 7; return 2; }
-        intervals[0] = 3; return 1;
-    }
-    if (strcmp(type, "dom7") == 0) {
-        if (max_intervals >= 3) { intervals[0] = 4; intervals[1] = 7; intervals[2] = 10; return 3; }
-        if (max_intervals >= 2) { intervals[0] = 4; intervals[1] = 7; return 2; }
-        intervals[0] = 4; return 1;
-    }
-    if (strcmp(type, "dim7") == 0) {
-        if (max_intervals >= 3) { intervals[0] = 3; intervals[1] = 6; intervals[2] = 9; return 3; }
-        if (max_intervals >= 2) { intervals[0] = 3; intervals[1] = 6; return 2; }
-        intervals[0] = 3; return 1;
-    }
-    if (strcmp(type, "power") == 0) {
-        intervals[0] = 7;
-        return 1;
-    }
-    if (strcmp(type, "5th") == 0) {
-        if (max_intervals >= 2) { intervals[0] = 7; intervals[1] = 12; return 2; }
-        intervals[0] = 7; return 1;
-    }
-    if (strcmp(type, "octave") == 0) {
-        intervals[0] = 12;
-        return 1;
-    }
-    if (strcmp(type, "add9") == 0) {
-        if (max_intervals >= 3) { intervals[0] = 4; intervals[1] = 7; intervals[2] = 14; return 3; }
-        if (max_intervals >= 2) { intervals[0] = 4; intervals[1] = 7; return 2; }
-        intervals[0] = 4; return 1;
-    }
-    return 0;
-}
-
-static int shadow_get_move_chord_intervals(int slot, int *intervals, int max_intervals)
-{
-    if (!intervals || max_intervals <= 0) return 0;
-    if (slot < 0 || slot >= SHADOW_CHAIN_INSTANCES) return 0;
-
-    char module_buf[64];
-    if (!shadow_slot_get_param_string(slot, "midi_fx1_module", module_buf, sizeof(module_buf))) {
-        return 0;
-    }
-    if (strcmp(module_buf, "chord") != 0) return 0;
-
-    char chord_type[32];
-    if (!shadow_slot_get_param_string(slot, "midi_fx1:type", chord_type, sizeof(chord_type))) {
-        return 0;
-    }
-    if (strcmp(chord_type, "none") == 0) return 0;
-
-    return shadow_chord_extra_intervals(chord_type, intervals, max_intervals);
-}
-
-/* Check if a slot has any MIDI FX loaded */
-static int shadow_slot_has_midi_fx(int slot)
-{
-    char buf[8];
-    if (!shadow_slot_get_param_string(slot, "midi_fx_count", buf, sizeof(buf))) return 0;
-    return atoi(buf) > 0;
-}
-
-/* Process a MIDI message through a slot's MIDI FX chain.
- * Returns number of output messages written to out_notes/out_vels.
- * Each output is a note+velocity pair (channel preserved from input).
- * If no MIDI FX loaded or on error, returns 0 (caller should pass through). */
-#define SHADOW_MIDI_FX_OUT_MAX 16
-static int shadow_slot_process_midi_fx(int slot, uint8_t status, uint8_t note, uint8_t vel,
-                                       uint8_t *out_notes, uint8_t *out_vels, int max_out)
-{
-    if (max_out <= 0) return 0;
-
-    /* Build get_param key: "midi_fx_process:SS DD DD" */
-    char key[48];
-    snprintf(key, sizeof(key), "midi_fx_process:%02X %02X %02X", status, note, vel);
-
-    char buf[256];
-    if (!shadow_slot_get_param_string(slot, key, buf, sizeof(buf))) return 0;
-    if (buf[0] == '\0') return 0;
-
-    /* Parse output: "SS DD DD,SS DD DD,..." */
-    int count = 0;
-    char *p = buf;
-    while (*p && count < max_out) {
-        unsigned int s, d1, d2;
-        if (sscanf(p, "%x %x %x", &s, &d1, &d2) != 3) break;
-        out_notes[count] = (uint8_t)d1;
-        out_vels[count] = (uint8_t)d2;
-        count++;
-        /* Advance past comma */
-        char *comma = strchr(p, ',');
-        if (!comma) break;
-        p = comma + 1;
-    }
-    return count;
-}
-
-static int shadow_midi_fx_log_enabled(void)
-{
-    static int enabled = -1;
-    static int check_counter = 0;
-    if (enabled < 0 || (check_counter++ % 200 == 0)) {
-        enabled = (access("/data/UserData/move-anything/shadow_midi_fx_log_on", F_OK) == 0);
-    }
-    return enabled;
-}
-
-/* Post-ioctl: rewrite cable-0 pad notes in MIDI_IN buffer.
- * Called after MIDI_IN has been copied from hardware to shadow_mailbox.
- *
- * Approach 3: Staggered cable-0 injection.
- *
- * Key insight: Move processes cable-0 events from the SPI mailbox MIDI_IN.
- * Cable-2 events in this buffer are NOT how external USB MIDI reaches Move
- * (Move receives external MIDI through a different path). Modifying existing
- * cable-0 events in-place is safe, but writing multiple new cable-0 events
- * into empty buffer slots in a single frame crashes ProcessEventsStepper.
- *
- * Strategy:
- * - Root note: leave the original pad event IN PLACE (instant, zero latency)
- * - Chord intervals: queue for injection one-per-frame in subsequent ioctl cycles
- * - Each frame writes at most ONE queued event, overwriting the pad event position
- * - Latency cost: ~3ms per interval (1 frame at 44100/128)
- *
- * Diagnostic modes (flag files):
- *   move_midi_fx_mode_block     — suppress pad note entirely (zero it out)
- *   move_chord_mode_transpose — change note number in-place (+first interval)
- *   (default)                 — staggered chord expansion
- *
- * sh_midi: pointer to shadow_mailbox + MIDI_IN_OFFSET (already copied from hw).
- * Returns number of events modified/written (0 = no chord active). */
-
-/* Chord mode: 0=MIDI FX processing, 1=block only (diagnostic) */
-static int shadow_midi_fx_mode(void)
-{
-    static int mode = -1;
-    static int check_counter = 0;
-    if (mode < 0 || (check_counter++ % 200 == 0)) {
-        if (access("/data/UserData/move-anything/move_midi_fx_mode_block", F_OK) == 0)
-            mode = 1;
-        else
-            mode = 0;
-    }
-    return mode;
-}
-
-/* Queue for staggered chord injection: one event per ioctl frame.
- * Events are cable-0, written at position 0 of the MIDI_IN buffer. */
-#define SHADOW_MIDI_FX_QUEUE_MAX 32
-typedef struct {
-    uint8_t note;
-    uint8_t vel;   /* 0 = note-off, >0 = note-on */
-    uint8_t ch;    /* channel (low nibble) */
-} shadow_midi_fx_queue_entry_t;
-
-static shadow_midi_fx_queue_entry_t shadow_midi_fx_queue[SHADOW_MIDI_FX_QUEUE_MAX];
-static int shadow_midi_fx_queue_head = 0;
-static int shadow_midi_fx_queue_tail = 0;
-
-static int shadow_midi_fx_queue_count(void)
-{
-    int c = shadow_midi_fx_queue_tail - shadow_midi_fx_queue_head;
-    if (c < 0) c += SHADOW_MIDI_FX_QUEUE_MAX;
-    return c;
-}
-
-static int shadow_midi_fx_queue_push(uint8_t note, uint8_t vel, uint8_t ch)
-{
-    int next = (shadow_midi_fx_queue_tail + 1) % SHADOW_MIDI_FX_QUEUE_MAX;
-    if (next == shadow_midi_fx_queue_head) return 0;  /* full */
-    shadow_midi_fx_queue[shadow_midi_fx_queue_tail].note = note;
-    shadow_midi_fx_queue[shadow_midi_fx_queue_tail].vel = vel;
-    shadow_midi_fx_queue[shadow_midi_fx_queue_tail].ch = ch;
-    shadow_midi_fx_queue_tail = next;
-    return 1;
-}
-
-static int shadow_midi_fx_queue_pop(shadow_midi_fx_queue_entry_t *out)
-{
-    if (shadow_midi_fx_queue_head == shadow_midi_fx_queue_tail) return 0;
-    *out = shadow_midi_fx_queue[shadow_midi_fx_queue_head];
-    shadow_midi_fx_queue_head = (shadow_midi_fx_queue_head + 1) % SHADOW_MIDI_FX_QUEUE_MAX;
-    return 1;
-}
-
-static int shadow_midi_fx_rewrite(uint8_t *sh_midi)
-{
-    if (!sh_midi) return 0;
-
-    int transform_slot = shadow_move_transform_slot();
-    int has_midi_fx = (transform_slot >= 0) ? shadow_slot_has_midi_fx(transform_slot) : 0;
-
-    /* Force transform slot out of idle gate when MIDI FX needs tick().
-     * The idle gate skips render_block (and therefore tick) for silent slots,
-     * which starves time-based MIDI FX like arp and strum. */
-    if (has_midi_fx && transform_slot >= 0 && transform_slot < SHADOW_CHAIN_INSTANCES) {
-        shadow_slot_idle[transform_slot] = 0;
-        shadow_slot_silence_frames[transform_slot] = 0;
-    }
-
-    int log_on = shadow_midi_fx_log_enabled();
-    int mode = shadow_midi_fx_mode();
-    int modified = 0;
-
-    /* Periodic trace */
-    {
-        static int trace_counter = 0;
-        if (log_on && (trace_counter++ % 500 == 0)) {
-            char module_buf[64] = {0};
-            int has_instance = (transform_slot >= 0 && transform_slot < SHADOW_CHAIN_INSTANCES &&
-                                shadow_chain_slots[transform_slot].instance != NULL);
-            if (has_instance) {
-                shadow_slot_get_param_string(transform_slot, "midi_fx1_module", module_buf, sizeof(module_buf));
-            }
-            char dbg[256];
-            snprintf(dbg, sizeof(dbg),
-                     "move-midifx trace: mode=%d slot=%d inst=%d midi_fx=%d module='%s' q=%d held=",
-                     mode, transform_slot, has_instance, has_midi_fx, module_buf,
-                     shadow_midi_fx_queue_count());
-            int off = strlen(dbg);
-            for (int i = 0; i < SHADOW_MIDI_FX_HELD_MAX && off < (int)sizeof(dbg) - 8; i++) {
-                if (shadow_midi_fx_held[i].active)
-                    off += snprintf(dbg + off, sizeof(dbg) - off, "%d ", shadow_midi_fx_held[i].root_note);
-            }
-            shadow_log(dbg);
-        }
-    }
-
-    int has_real_pad_note = 0;  /* Track whether this frame has a real pad note */
-
-    if (!has_midi_fx) {
-        /* No MIDI FX loaded — if we have held notes from a previous session,
-         * queue note-offs for the extras */
-        for (int i = 0; i < SHADOW_MIDI_FX_HELD_MAX; i++) {
-            if (!shadow_midi_fx_held[i].active) continue;
-            for (int e = 0; e < shadow_midi_fx_held[i].extra_count; e++) {
-                shadow_midi_fx_queue_push(shadow_midi_fx_held[i].extras[e], 0,
-                                        shadow_midi_fx_held[i].channel);
-            }
-            if (log_on) {
-                char dbg[128];
-                snprintf(dbg, sizeof(dbg),
-                         "move-midifx cleanup: queued %d offs for root=%d",
-                         shadow_midi_fx_held[i].extra_count, shadow_midi_fx_held[i].root_note);
-                shadow_log(dbg);
-            }
-            shadow_midi_fx_held[i].active = 0;
-        }
-        return modified;
-    }
-
-    /* Chord is active — scan MIDI_IN for cable-0 pad notes */
-    uint8_t ch = 0;  /* cable-0 pad notes are always channel 0 */
-
-    for (int j = 0; j < MIDI_BUFFER_SIZE; j += 4) {
-        uint8_t hdr = sh_midi[j];
-        uint8_t cin = hdr & 0x0F;
-        uint8_t cable = (hdr >> 4) & 0x0F;
-        uint8_t status = sh_midi[j + 1];
-        uint8_t type = status & 0xF0;
-        uint8_t note = sh_midi[j + 2];
-        uint8_t vel = sh_midi[j + 3];
-
-        /* Only transform cable-0 note events */
-        if (cable != 0x00) continue;
-        if (cin != 0x08 && cin != 0x09) continue;
-        if (type != 0x80 && type != 0x90) continue;
-
-        /* Only transform pad notes (68-99) */
-        if (note < 68 || note > 99) continue;
-
-        int is_note_on = (type == 0x90 && vel > 0);
-        int is_note_off = (type == 0x80 || (type == 0x90 && vel == 0));
-        ch = status & 0x0F;  /* preserve original channel from pad event */
-        has_real_pad_note = 1;
-
-        /* === MODE 1: BLOCK — just suppress the pad note === */
-        if (mode == 1) {
-            sh_midi[j]     = 0;
-            sh_midi[j + 1] = 0;
-            sh_midi[j + 2] = 0;
-            sh_midi[j + 3] = 0;
-            modified++;
-            if (log_on) {
-                char dbg[128];
-                snprintf(dbg, sizeof(dbg),
-                         "move-midifx BLOCK %s note=%d ch=%d",
-                         is_note_on ? "ON" : "OFF", note, ch);
-                shadow_log(dbg);
-            }
-            continue;
-        }
-
-        /* === MODE 0: MIDI FX PROCESSING ===
-         * Block the original pad note, run it through the chain's MIDI FX
-         * pipeline (chord, arp, transpose, velocity, etc.), and queue all
-         * output notes for staggered cable-0 injection.
-         * Each frame injects at most one cable-0 note event. */
-        if (is_note_on) {
-            /* Process note-on through chain's MIDI FX */
-            uint8_t out_notes[SHADOW_MIDI_FX_OUT_MAX];
-            uint8_t out_vels[SHADOW_MIDI_FX_OUT_MAX];
-            int out_count = shadow_slot_process_midi_fx(
-                transform_slot, status, note, vel,
-                out_notes, out_vels, SHADOW_MIDI_FX_OUT_MAX);
-
-            /* Find a free slot in held table */
-            int hi = -1;
-            for (int i = 0; i < SHADOW_MIDI_FX_HELD_MAX; i++) {
-                if (!shadow_midi_fx_held[i].active) { hi = i; break; }
-            }
-            if (hi < 0) continue;  /* Table full, pass note through unchanged */
-
-            /* ALWAYS block the original cable-0 pad note when MIDI FX is active.
-             * Even if process_midi returned 0 (arp stores note for tick output),
-             * the original must not reach Move's native synth. */
-            sh_midi[j]     = 0;
-            sh_midi[j + 1] = 0;
-            sh_midi[j + 2] = 0;
-            sh_midi[j + 3] = 0;
-
-            /* Record held note — needed even when out_count=0 (arp/strum)
-             * so that note-off is properly blocked and forwarded to MIDI FX. */
-            shadow_midi_fx_held[hi].active = 1;
-            shadow_midi_fx_held[hi].root_note = note;
-            shadow_midi_fx_held[hi].channel = ch;
-            shadow_midi_fx_held[hi].extra_count = 0;
-
-            /* Queue any immediate MIDI FX output notes */
-            for (int i = 0; i < out_count; i++) {
-                shadow_midi_fx_queue_push(out_notes[i], out_vels[i], ch);
-                /* Track non-root notes for note-off cleanup */
-                if (out_notes[i] != note &&
-                    shadow_midi_fx_held[hi].extra_count < SHADOW_MIDI_FX_EXTRAS_MAX) {
-                    shadow_midi_fx_held[hi].extras[shadow_midi_fx_held[hi].extra_count++] = out_notes[i];
-                }
-            }
-
-            modified++;
-            if (log_on) {
-                char dbg[256];
-                snprintf(dbg, sizeof(dbg),
-                         "move-midifx FX ON root=%d ch=%d -> %d immediate q=%d",
-                         note, ch, out_count, shadow_midi_fx_queue_count());
-                shadow_log(dbg);
-            }
-        } else if (is_note_off) {
-            /* Process note-off through chain's MIDI FX */
-            uint8_t out_notes[SHADOW_MIDI_FX_OUT_MAX];
-            uint8_t out_vels[SHADOW_MIDI_FX_OUT_MAX];
-            int out_count = shadow_slot_process_midi_fx(
-                transform_slot, status, note, vel,
-                out_notes, out_vels, SHADOW_MIDI_FX_OUT_MAX);
-
-            /* Find held entry for this root note */
-            int found_held = 0;
-            for (int i = 0; i < SHADOW_MIDI_FX_HELD_MAX; i++) {
-                if (!shadow_midi_fx_held[i].active) continue;
-                if (shadow_midi_fx_held[i].root_note != note) continue;
-                if (shadow_midi_fx_held[i].channel != ch) continue;
-                found_held = 1;
-
-                if (out_count > 0) {
-                    /* Queue MIDI FX output note-offs */
-                    for (int o = 0; o < out_count; o++) {
-                        shadow_midi_fx_queue_push(out_notes[o], 0, ch);
-                    }
-                } else {
-                    /* MIDI FX returned nothing — send note-offs for root + extras.
-                     * For arp: tick() handles note-off timing internally,
-                     * so only queue root off if there are no extras (arp-generated
-                     * notes are cleaned up by the arp's own note-off via tick). */
-                    if (shadow_midi_fx_held[i].extra_count > 0) {
-                        shadow_midi_fx_queue_push(note, 0, ch);
-                        for (int e = 0; e < shadow_midi_fx_held[i].extra_count; e++) {
-                            shadow_midi_fx_queue_push(shadow_midi_fx_held[i].extras[e], 0, ch);
-                        }
-                    }
-                    /* For arp (extra_count=0): don't queue note-off here.
-                     * The arp's tick() will generate its own note-offs. */
-                }
-
-                if (log_on) {
-                    char dbg[256];
-                    snprintf(dbg, sizeof(dbg),
-                             "move-midifx FX OFF root=%d ch=%d fx_out=%d extras=%d q=%d",
-                             note, ch, out_count, shadow_midi_fx_held[i].extra_count,
-                             shadow_midi_fx_queue_count());
-                    shadow_log(dbg);
-                }
-
-                shadow_midi_fx_held[i].active = 0;
-                modified++;
-                break;
-            }
-
-            /* ALWAYS block pad note-off when MIDI FX is active, even if
-             * no held entry was found (shouldn't happen, but be safe). */
-            if (found_held || has_midi_fx) {
-                sh_midi[j]     = 0;
-                sh_midi[j + 1] = 0;
-                sh_midi[j + 2] = 0;
-                sh_midi[j + 3] = 0;
-                if (!found_held) modified++;
-            }
-        }
-    }
-
-    /* === POLL TICK OUTPUT: pick up time-based MIDI FX output (strum, arp) ===
-     * Each frame, read any notes generated by the MIDI FX tick() function
-     * (called during render_block) and queue them for injection. */
-    if (transform_slot >= 0) {
-        char tick_buf[256];
-        if (shadow_slot_get_param_string(transform_slot, "midi_fx_tick_output",
-                                          tick_buf, sizeof(tick_buf)) && tick_buf[0]) {
-            char *p = tick_buf;
-            while (*p) {
-                unsigned int s, d1, d2;
-                if (sscanf(p, "%x %x %x", &s, &d1, &d2) != 3) break;
-                uint8_t type = (uint8_t)s & 0xF0;
-                uint8_t tick_ch = (uint8_t)s & 0x0F;
-                uint8_t tick_vel = (type == 0x90 && d2 > 0) ? (uint8_t)d2 : 0;
-                shadow_midi_fx_queue_push((uint8_t)d1, tick_vel, tick_ch);
-                if (log_on) {
-                    char dbg[128];
-                    snprintf(dbg, sizeof(dbg),
-                             "move-midifx TICK %s note=%d ch=%d vel=%d q=%d",
-                             tick_vel > 0 ? "ON" : "OFF", d1, tick_ch, d2,
-                             shadow_midi_fx_queue_count());
-                    shadow_log(dbg);
-                }
-                char *comma = strchr(p, ',');
-                if (!comma) break;
-                p = comma + 1;
-            }
-        }
-    }
-
-    /* === DRAIN QUEUE: inject one queued event per frame ===
-     * ONLY when this frame has NO real pad note events AND
-     * the first buffer slot (pos=0) is empty. Always inject at pos=0
-     * to guarantee consistent event ordering for ProcessEventsStepper.
-     * Never inject at higher positions — Move may crash if events
-     * appear after other data in the same frame. */
-    if (!has_real_pad_note && shadow_midi_fx_queue_count() > 0 &&
-        !sh_midi[0] && !sh_midi[1] && !sh_midi[2] && !sh_midi[3]) {
-        shadow_midi_fx_queue_entry_t ev;
-        if (shadow_midi_fx_queue_pop(&ev)) {
-            if (ev.vel > 0) {
-                sh_midi[0] = 0x09;  /* cable 0, CIN=note-on */
-                sh_midi[1] = 0x90 | ev.ch;
-                sh_midi[2] = ev.note;
-                sh_midi[3] = ev.vel;
-            } else {
-                sh_midi[0] = 0x08;  /* cable 0, CIN=note-off */
-                sh_midi[1] = 0x80 | ev.ch;
-                sh_midi[2] = ev.note;
-                sh_midi[3] = 0;
-            }
-            modified++;
-            if (log_on) {
-                char dbg[128];
-                snprintf(dbg, sizeof(dbg),
-                         "move-midifx INJECT %s note=%d ch=%d q=%d",
-                         ev.vel > 0 ? "ON" : "OFF", ev.note, ev.ch,
-                         shadow_midi_fx_queue_count());
-                shadow_log(dbg);
-            }
-        }
-    }
-
-    return modified;
-}
-
-/* Note: shadow_allow_midi_to_dsp and shadow_route_knob_cc_to_focused_slot removed.
- * MIDI_IN is no longer routed directly to DSP. Shadow UI handles knobs via set_param. */
-
-static uint32_t shadow_ui_request_seen = 0;
-/* SHADOW_PATCH_INDEX_NONE from shadow_constants.h */
-
-/* Helper to write debug to log file (shadow_log isn't available yet) */
-static void capture_debug_log(const char *msg) {
-    FILE *log = fopen("/data/UserData/move-anything/shadow_capture_debug.log", "a");
-    if (log) {
-        fprintf(log, "%s\n", msg);
-        fclose(log);
-    }
-}
-
-/* Load capture rules for a slot by reading its patch file */
-static void shadow_slot_load_capture(int slot, int patch_index)
-{
-    char dbg[512];
-    snprintf(dbg, sizeof(dbg), "shadow_slot_load_capture: slot=%d patch_index=%d", slot, patch_index);
-    capture_debug_log(dbg);
-
-    if (slot < 0 || slot >= SHADOW_CHAIN_INSTANCES) return;
-    if (!shadow_chain_slots[slot].instance) {
-        capture_debug_log("  -> no instance");
-        return;
-    }
-    if (!shadow_plugin_v2 || !shadow_plugin_v2->get_param) {
-        capture_debug_log("  -> no plugin_v2/get_param");
-        return;
-    }
-
-    /* Clear existing capture rules */
-    capture_clear(&shadow_chain_slots[slot].capture);
-
-    /* Get the patch file path from chain module */
-    char key[32];
-    char path[512];
-    snprintf(key, sizeof(key), "patch_path_%d", patch_index);
-    int len = shadow_plugin_v2->get_param(shadow_chain_slots[slot].instance, key, path, sizeof(path));
-    snprintf(dbg, sizeof(dbg), "  -> get_param(%s) len=%d", key, len);
-    capture_debug_log(dbg);
-    if (len <= 0) return;
-    path[len < (int)sizeof(path) ? len : (int)sizeof(path) - 1] = '\0';
-    snprintf(dbg, sizeof(dbg), "  -> path: %s", path);
-    capture_debug_log(dbg);
-
-    /* Read the patch file */
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        capture_debug_log("  -> fopen failed");
-        return;
-    }
-    
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    
-    if (size <= 0 || size > 16384) {
-        fclose(f);
-        return;
-    }
-    
-    char *json = malloc(size + 1);
-    if (!json) {
-        fclose(f);
-        return;
-    }
-    
-    size_t nread = fread(json, 1, size, f);
-    json[nread] = '\0';
-    fclose(f);
-
-    /* Parse capture rules from JSON */
-    capture_parse_json(&shadow_chain_slots[slot].capture, json);
-    free(json);
-
-    /* Log capture rules summary */
-    int has_notes = 0, has_ccs = 0;
-    for (int b = 0; b < 16; b++) {
-        if (shadow_chain_slots[slot].capture.notes[b]) has_notes = 1;
-        if (shadow_chain_slots[slot].capture.ccs[b]) has_ccs = 1;
-    }
-    snprintf(dbg, sizeof(dbg), "  -> capture parsed: has_notes=%d has_ccs=%d", has_notes, has_ccs);
-    capture_debug_log(dbg);
-    /* Debug: check if note 16 is captured */
-    snprintf(dbg, sizeof(dbg), "  -> note 16 captured: %d", capture_has_note(&shadow_chain_slots[slot].capture, 16));
-    capture_debug_log(dbg);
-    if (has_notes || has_ccs) {
-        snprintf(dbg, sizeof(dbg), "Slot %d capture loaded: notes=%d ccs=%d",
-                 slot, has_notes, has_ccs);
-        shadow_log(dbg);
-    }
-}
-
-static void shadow_inprocess_handle_ui_request(void) {
-    if (!shadow_control || !shadow_plugin_v2 || !shadow_plugin_v2->set_param) return;
-
-    uint32_t request_id = shadow_control->ui_request_id;
-    if (request_id == shadow_ui_request_seen) return;
-    shadow_ui_request_seen = request_id;
-
-    int slot = shadow_control->ui_slot;
-    int patch_index = shadow_control->ui_patch_index;
-
-    {
-        char dbg[128];
-        snprintf(dbg, sizeof(dbg), "UI request: slot=%d patch=%d instance=%p",
-                 slot, patch_index, shadow_chain_slots[slot < SHADOW_CHAIN_INSTANCES ? slot : 0].instance);
-        shadow_log(dbg);
-    }
-
-    if (slot < 0 || slot >= SHADOW_CHAIN_INSTANCES) return;
-    if (patch_index < 0) return;
-    if (!shadow_chain_slots[slot].instance) {
-        shadow_log("UI request: slot instance is NULL, aborting");
-        return;
-    }
-
-    /* Handle "none" special value - clear the slot */
-    if (patch_index == SHADOW_PATCH_INDEX_NONE) {
-        /* Unload synth and FX modules */
-        if (shadow_plugin_v2->set_param && shadow_chain_slots[slot].instance) {
-            shadow_plugin_v2->set_param(shadow_chain_slots[slot].instance, "synth:module", "");
-            shadow_plugin_v2->set_param(shadow_chain_slots[slot].instance, "fx1:module", "");
-            shadow_plugin_v2->set_param(shadow_chain_slots[slot].instance, "fx2:module", "");
-        }
-        shadow_chain_slots[slot].active = 0;
-        shadow_chain_slots[slot].patch_index = -1;
-        capture_clear(&shadow_chain_slots[slot].capture);
-        strncpy(shadow_chain_slots[slot].patch_name, "", sizeof(shadow_chain_slots[slot].patch_name) - 1);
-        shadow_chain_slots[slot].patch_name[sizeof(shadow_chain_slots[slot].patch_name) - 1] = '\0';
-        /* Update UI state */
-        if (shadow_ui_state && slot < SHADOW_UI_SLOTS) {
-            strncpy(shadow_ui_state->slot_names[slot], "", SHADOW_UI_NAME_LEN - 1);
-            shadow_ui_state->slot_names[slot][SHADOW_UI_NAME_LEN - 1] = '\0';
-        }
-        return;
-    }
-
-    if (shadow_plugin_v2->get_param) {
-        char buf[32];
-        int len = shadow_plugin_v2->get_param(shadow_chain_slots[slot].instance,
-                                              "patch_count", buf, sizeof(buf));
-        if (len > 0) {
-            buf[len < (int)sizeof(buf) ? len : (int)sizeof(buf) - 1] = '\0';
-            int patch_count = atoi(buf);
-            if (patch_count > 0 && patch_index >= patch_count) {
-                return;
-            }
-        }
-    }
-
-    char idx_str[16];
-    snprintf(idx_str, sizeof(idx_str), "%d", patch_index);
-    shadow_plugin_v2->set_param(shadow_chain_slots[slot].instance, "load_patch", idx_str);
-    shadow_chain_slots[slot].patch_index = patch_index;
-    shadow_chain_slots[slot].active = 1;
-
-    if (shadow_plugin_v2->get_param) {
-        char key[32];
-        char buf[128];
-        int len = 0;
-        snprintf(key, sizeof(key), "patch_name_%d", patch_index);
-        len = shadow_plugin_v2->get_param(shadow_chain_slots[slot].instance, key, buf, sizeof(buf));
-        if (len > 0) {
-            buf[len < (int)sizeof(buf) ? len : (int)sizeof(buf) - 1] = '\0';
-            strncpy(shadow_chain_slots[slot].patch_name, buf, sizeof(shadow_chain_slots[slot].patch_name) - 1);
-            shadow_chain_slots[slot].patch_name[sizeof(shadow_chain_slots[slot].patch_name) - 1] = '\0';
-        }
-    }
-
-    /* Load capture rules from the patch file */
-    shadow_slot_load_capture(slot, patch_index);
-
-    /* Apply channel settings saved in the patch preset.
-     * 0 = not saved in preset, keep current values. */
-    if (shadow_plugin_v2->get_param) {
-        char ch_buf[16];
-        int len;
-        len = shadow_plugin_v2->get_param(shadow_chain_slots[slot].instance,
-            "patch:receive_channel", ch_buf, sizeof(ch_buf));
-        if (len > 0) {
-            ch_buf[len < (int)sizeof(ch_buf) ? len : (int)sizeof(ch_buf) - 1] = '\0';
-            int recv_ch = atoi(ch_buf);
-            if (recv_ch != 0) {
-                shadow_chain_slots[slot].channel = (recv_ch >= 1 && recv_ch <= 16) ? recv_ch - 1 : -1;
-            }
-        }
-        len = shadow_plugin_v2->get_param(shadow_chain_slots[slot].instance,
-            "patch:forward_channel", ch_buf, sizeof(ch_buf));
-        if (len > 0) {
-            ch_buf[len < (int)sizeof(ch_buf) ? len : (int)sizeof(ch_buf) - 1] = '\0';
-            int fwd_ch = atoi(ch_buf);
-            if (fwd_ch != 0) {
-                shadow_chain_slots[slot].forward_channel = (fwd_ch > 0) ? fwd_ch - 1 : fwd_ch;
-            }
-        }
-    }
-
-    shadow_ui_state_update_slot(slot);
-}
-
-/* Handle slot-level param (volume, forward_channel, etc.) - returns 1 if handled */
-static int shadow_handle_slot_param_set(int slot, const char *key, const char *value) {
-    if (strcmp(key, "slot:volume") == 0) {
-        float vol = atof(value);
-        if (vol < 0.0f) vol = 0.0f;
-        if (vol > 1.0f) vol = 1.0f;
-        shadow_chain_slots[slot].volume = vol;
-        shadow_ui_state_update_slot(slot);
-        return 1;
-    }
-    if (strcmp(key, "slot:forward_channel") == 0) {
-        int ch = atoi(value);
-        if (ch < -2) ch = -2;
-        if (ch > 15) ch = 15;
-        shadow_chain_slots[slot].forward_channel = ch;
-        shadow_ui_state_update_slot(slot);
-        return 1;
-    }
-    if (strcmp(key, "slot:receive_channel") == 0) {
-        int ch = atoi(value);
-        if (ch == 0) {
-            shadow_chain_slots[slot].channel = -1;  /* All channels */
-            shadow_ui_state_update_slot(slot);
-        } else if (ch >= 1 && ch <= 16) {
-            shadow_chain_slots[slot].channel = ch - 1;  /* Store 0-based */
-            shadow_ui_state_update_slot(slot);
-        }
-        return 1;
-    }
-    return 0;  /* Not a slot param */
-}
-
-/* Handle slot-level param get - returns length if handled, -1 if not */
-static int shadow_handle_slot_param_get(int slot, const char *key, char *buf, int buf_len) {
-    if (strcmp(key, "slot:volume") == 0) {
-        return snprintf(buf, buf_len, "%.2f", shadow_chain_slots[slot].volume);
-    }
-    if (strcmp(key, "slot:forward_channel") == 0) {
-        return snprintf(buf, buf_len, "%d", shadow_chain_slots[slot].forward_channel);
-    }
-    if (strcmp(key, "slot:receive_channel") == 0) {
-        int ch = shadow_chain_slots[slot].channel;
-        return snprintf(buf, buf_len, "%d", (ch < 0) ? 0 : ch + 1);  /* 0=All, 1-16=specific */
-    }
-    return -1;  /* Not a slot param */
-}
-
-static int shadow_param_publish_response(uint32_t req_id) {
-    if (!shadow_param) return 0;
-    if (shadow_param->request_id != req_id) {
-        return 0;
-    }
-    shadow_param->response_id = req_id;
-    shadow_param->response_ready = 1;
-    shadow_param->request_type = 0;
-    return 1;
-}
-
-static void shadow_inprocess_handle_param_request(void) {
-    if (!shadow_param) return;
-
-    uint8_t req_type = shadow_param->request_type;
-    if (req_type == 0) return;  /* No pending request */
-    uint32_t req_id = shadow_param->request_id;
-
-    /* Handle master FX chain params: master_fx:fx1:module, master_fx:fx2:wet, etc. */
-    if (strncmp(shadow_param->key, "master_fx:", 10) == 0) {
-        const char *fx_key = shadow_param->key + 10;
-        int mfx_slot = -1;  /* -1 = legacy (slot 0), 0-3 = specific slot */
-        int has_slot_prefix = 0;
-        const char *param_key = fx_key;
-
-        /* Parse slot: fx1:, fx2:, fx3:, fx4: */
-        if (strncmp(fx_key, "fx1:", 4) == 0) { mfx_slot = 0; param_key = fx_key + 4; has_slot_prefix = 1; }
-        else if (strncmp(fx_key, "fx2:", 4) == 0) { mfx_slot = 1; param_key = fx_key + 4; has_slot_prefix = 1; }
-        else if (strncmp(fx_key, "fx3:", 4) == 0) { mfx_slot = 2; param_key = fx_key + 4; has_slot_prefix = 1; }
-        else if (strncmp(fx_key, "fx4:", 4) == 0) { mfx_slot = 3; param_key = fx_key + 4; has_slot_prefix = 1; }
-        else { mfx_slot = 0; param_key = fx_key; }  /* Legacy: default to slot 0 */
-
-        master_fx_slot_t *mfx = &shadow_master_fx_slots[mfx_slot];
-
-        if (req_type == 1) {  /* SET */
-            if (!has_slot_prefix && strcmp(param_key, "resample_bridge") == 0) {
-                native_resample_bridge_mode_t new_mode =
-                    native_resample_bridge_mode_from_text(shadow_param->value);
-                if (new_mode != native_resample_bridge_mode) {
-                    char msg[128];
-                    snprintf(msg, sizeof(msg), "Native resample bridge mode: %s",
-                             native_resample_bridge_mode_name(new_mode));
-                    shadow_log(msg);
-                }
-                native_resample_bridge_mode = new_mode;
-                shadow_param->error = 0;
-                shadow_param->result_len = 0;
-            } else if (!has_slot_prefix && strcmp(param_key, "link_audio_routing") == 0) {
-                int val = atoi(shadow_param->value);
-                link_audio_routing_enabled = val ? 1 : 0;
-                {
-                    char msg[64];
-                    snprintf(msg, sizeof(msg), "Link Audio routing: %s",
-                             link_audio_routing_enabled ? "ON" : "OFF");
-                    shadow_log(msg);
-                }
-                shadow_param->error = 0;
-                shadow_param->result_len = 0;
-            } else if (strcmp(param_key, "module") == 0) {
-                /* Load or unload master FX slot */
-                int result = shadow_master_fx_slot_load(mfx_slot, shadow_param->value);
-                shadow_param->error = (result == 0) ? 0 : 7;
-                shadow_param->result_len = 0;
-            } else if (strcmp(param_key, "param") == 0 && mfx->api && mfx->instance) {
-                /* Set master FX param: value is "key=value" */
-                char *eq = strchr(shadow_param->value, '=');
-                if (eq && mfx->api->set_param) {
-                    *eq = '\0';
-                    mfx->api->set_param(mfx->instance, shadow_param->value, eq + 1);
-                    *eq = '=';
-                    shadow_param->error = 0;
-                } else {
-                    shadow_param->error = 8;
-                }
-                shadow_param->result_len = 0;
-            } else if (mfx->api && mfx->instance && mfx->api->set_param) {
-                /* Direct param set: master_fx:fx1:wet -> set_param("wet", value) */
-                mfx->api->set_param(mfx->instance, param_key, shadow_param->value);
-                shadow_param->error = 0;
-                shadow_param->result_len = 0;
-            } else {
-                shadow_param->error = 9;
-                shadow_param->result_len = -1;
-            }
-        } else if (req_type == 2) {  /* GET */
-            if (!has_slot_prefix && strcmp(param_key, "resample_bridge") == 0) {
-                int mode = (int)native_resample_bridge_mode;
-                if (mode < 0 || mode > 2) mode = 0;
-                shadow_param->result_len = snprintf(shadow_param->value, SHADOW_PARAM_VALUE_LEN, "%d", mode);
-                shadow_param->error = 0;
-            } else if (!has_slot_prefix && strcmp(param_key, "link_audio_routing") == 0) {
-                shadow_param->result_len = snprintf(shadow_param->value, SHADOW_PARAM_VALUE_LEN, "%d",
-                                                    link_audio_routing_enabled);
-                shadow_param->error = 0;
-            } else if (strcmp(param_key, "module") == 0) {
-                strncpy(shadow_param->value, mfx->module_path, SHADOW_PARAM_VALUE_LEN - 1);
-                shadow_param->value[SHADOW_PARAM_VALUE_LEN - 1] = '\0';
-                shadow_param->error = 0;
-                shadow_param->result_len = strlen(shadow_param->value);
-            } else if (strcmp(param_key, "name") == 0) {
-                /* Return module ID (display name) */
-                strncpy(shadow_param->value, mfx->module_id, SHADOW_PARAM_VALUE_LEN - 1);
-                shadow_param->value[SHADOW_PARAM_VALUE_LEN - 1] = '\0';
-                shadow_param->error = 0;
-                shadow_param->result_len = strlen(shadow_param->value);
-            } else if (strcmp(param_key, "error") == 0) {
-                /* Return load error from master FX module (if any) */
-                shadow_param->value[0] = '\0';
-                shadow_param->error = 0;
-                shadow_param->result_len = 0;
-                if (mfx->api && mfx->instance && mfx->api->get_param) {
-                    int len = mfx->api->get_param(mfx->instance, "load_error",
-                                                   shadow_param->value, SHADOW_PARAM_VALUE_LEN);
-                    if (len > 0) {
-                        shadow_param->result_len = len;
-                    }
-                }
-            } else if (strcmp(param_key, "chain_params") == 0) {
-                /* Try module's get_param first (for dynamic params like CLAP FX) */
-                if (mfx->api && mfx->instance && mfx->api->get_param) {
-                    int len = mfx->api->get_param(mfx->instance, "chain_params",
-                                                   shadow_param->value, SHADOW_PARAM_VALUE_LEN);
-                    if (len > 2) {  /* More than empty "[]" */
-                        shadow_param->error = 0;
-                        shadow_param->result_len = len;
-                        shadow_param_publish_response(req_id);
-                        return;
-                    }
-                }
-
-                /* Use cached chain_params (avoids file I/O in audio thread) */
-                if (mfx->chain_params_cached && mfx->chain_params_cache[0]) {
-                    int len = strlen(mfx->chain_params_cache);
-                    if (len < SHADOW_PARAM_VALUE_LEN - 1) {
-                        memcpy(shadow_param->value, mfx->chain_params_cache, len + 1);
-                        shadow_param->error = 0;
-                        shadow_param->result_len = len;
-                        shadow_param_publish_response(req_id);
-                        return;
-                    }
-                }
-                /* Fall through if chain_params not cached */
-                shadow_param->value[0] = '[';
-                shadow_param->value[1] = ']';
-                shadow_param->value[2] = '\0';
-                shadow_param->error = 0;
-                shadow_param->result_len = 2;
-            } else if (strcmp(param_key, "ui_hierarchy") == 0) {
-                /* Try module's get_param first (for dynamic hierarchies like CLAP FX) */
-                if (mfx->api && mfx->instance && mfx->api->get_param) {
-                    int len = mfx->api->get_param(mfx->instance, "ui_hierarchy",
-                                                   shadow_param->value, SHADOW_PARAM_VALUE_LEN);
-                    if (len > 2) {
-                        shadow_param->error = 0;
-                        shadow_param->result_len = len;
-                        shadow_param_publish_response(req_id);
-                        return;
-                    }
-                }
-                /* Fall back to reading ui_hierarchy from module.json */
-                char module_dir[256];
-                strncpy(module_dir, mfx->module_path, sizeof(module_dir) - 1);
-                module_dir[sizeof(module_dir) - 1] = '\0';
-                char *last_slash = strrchr(module_dir, '/');
-                if (last_slash) *last_slash = '\0';
-
-                char json_path[512];
-                snprintf(json_path, sizeof(json_path), "%s/module.json", module_dir);
-
-                FILE *f = fopen(json_path, "r");
-                if (f) {
-                    fseek(f, 0, SEEK_END);
-                    long size = ftell(f);
-                    fseek(f, 0, SEEK_SET);
-                    /* Allow larger files - we only extract ui_hierarchy object */
-                    if (size > 0 && size < 32768) {
-                        char *json = malloc(size + 1);
-                        if (json) {
-                            size_t nread = fread(json, 1, size, f);
-                            json[nread] = '\0';
-
-                            /* Find ui_hierarchy in capabilities */
-                            const char *ui_hier = strstr(json, "\"ui_hierarchy\"");
-                            if (ui_hier) {
-                                const char *obj_start = strchr(ui_hier + 14, '{');
-                                if (obj_start) {
-                                    int depth = 1;
-                                    const char *obj_end = obj_start + 1;
-                                    while (*obj_end && depth > 0) {
-                                        if (*obj_end == '{') depth++;
-                                        else if (*obj_end == '}') depth--;
-                                        obj_end++;
-                                    }
-                                    int len = (int)(obj_end - obj_start);
-                                    if (len > 0 && len < SHADOW_PARAM_VALUE_LEN - 1) {
-                                        memcpy(shadow_param->value, obj_start, len);
-                                        shadow_param->value[len] = '\0';
-                                        shadow_param->error = 0;
-                                        shadow_param->result_len = len;
-                                        free(json);
-                                        fclose(f);
-                                        shadow_param_publish_response(req_id);
-                                        return;
-                                    }
-                                }
-                            }
-                            free(json);
-                        }
-                    }
-                    fclose(f);
-                }
-                /* ui_hierarchy not found - return null (will fall back to chain_params in JS) */
-                shadow_param->error = 12;
-                shadow_param->result_len = -1;
-            } else if (mfx->api && mfx->instance && mfx->api->get_param) {
-                /* Get master FX param by key */
-                int len = mfx->api->get_param(mfx->instance, param_key,
-                                               shadow_param->value, SHADOW_PARAM_VALUE_LEN);
-                if (len >= 0) {
-                    shadow_param->error = 0;
-                    shadow_param->result_len = len;
-                } else {
-                    shadow_param->error = 10;
-                    shadow_param->result_len = -1;
-                }
-            } else {
-                shadow_param->error = 11;
-                shadow_param->result_len = -1;
-            }
-        } else {
-            shadow_param->error = 6;
-            shadow_param->result_len = -1;
-        }
-        shadow_param_publish_response(req_id);
-        return;
-    }
-
-    /* Handle overtake DSP params: overtake_dsp:load, overtake_dsp:unload, overtake_dsp:<param> */
-    if (strncmp(shadow_param->key, "overtake_dsp:", 13) == 0) {
-        const char *param_key = shadow_param->key + 13;
-        if (req_type == 1) {  /* SET */
-            if (strcmp(param_key, "load") == 0) {
-                shadow_overtake_dsp_load(shadow_param->value);
-                shadow_param->error = 0;
-                shadow_param->result_len = 0;
-            } else if (strcmp(param_key, "unload") == 0) {
-                shadow_overtake_dsp_unload();
-                shadow_param->error = 0;
-                shadow_param->result_len = 0;
-            } else if (overtake_dsp_gen && overtake_dsp_gen_inst && overtake_dsp_gen->set_param) {
-                overtake_dsp_gen->set_param(overtake_dsp_gen_inst, param_key, shadow_param->value);
-                shadow_param->error = 0;
-                shadow_param->result_len = 0;
-            } else if (overtake_dsp_fx && overtake_dsp_fx_inst && overtake_dsp_fx->set_param) {
-                overtake_dsp_fx->set_param(overtake_dsp_fx_inst, param_key, shadow_param->value);
-                shadow_param->error = 0;
-                shadow_param->result_len = 0;
-            } else {
-                shadow_param->error = 13;
-                shadow_param->result_len = -1;
-            }
-        } else if (req_type == 2) {  /* GET */
-            int len = -1;
-            if (overtake_dsp_gen && overtake_dsp_gen_inst && overtake_dsp_gen->get_param) {
-                len = overtake_dsp_gen->get_param(overtake_dsp_gen_inst, param_key,
-                                                   shadow_param->value, SHADOW_PARAM_VALUE_LEN);
-            } else if (overtake_dsp_fx && overtake_dsp_fx_inst && overtake_dsp_fx->get_param) {
-                len = overtake_dsp_fx->get_param(overtake_dsp_fx_inst, param_key,
-                                                  shadow_param->value, SHADOW_PARAM_VALUE_LEN);
-            }
-            if (len >= 0) {
-                shadow_param->error = 0;
-                shadow_param->result_len = len;
-            } else {
-                shadow_param->error = 14;
-                shadow_param->result_len = -1;
-            }
-        }
-        shadow_param_publish_response(req_id);
-        return;
-    }
-
-    int slot = shadow_param->slot;
-    if (slot < 0 || slot >= SHADOW_CHAIN_INSTANCES) {
-        shadow_param->error = 1;
-        shadow_param->result_len = -1;
-        shadow_param_publish_response(req_id);
-        return;
-    }
-
-    /* Handle slot-level params first */
-    if (req_type == 1) {  /* SET param */
-        if (shadow_handle_slot_param_set(slot, shadow_param->key, shadow_param->value)) {
-            shadow_param->error = 0;
-            shadow_param->result_len = 0;
-            shadow_param_publish_response(req_id);
-            return;
-        }
-    }
-    else if (req_type == 2) {  /* GET param */
-        int len = shadow_handle_slot_param_get(slot, shadow_param->key,
-                                                shadow_param->value, SHADOW_PARAM_VALUE_LEN);
-        if (len >= 0) {
-            shadow_param->error = 0;
-            shadow_param->result_len = len;
-            shadow_param_publish_response(req_id);
-            return;
-        }
-    }
-
-    /* Not a slot param - forward to plugin */
-    if (!shadow_plugin_v2 || !shadow_chain_slots[slot].instance) {
-        shadow_param->error = 2;
-        shadow_param->result_len = -1;
-        shadow_param_publish_response(req_id);
-        return;
-    }
-
-    if (req_type == 1) {  /* SET param */
-        if (shadow_plugin_v2->set_param) {
-            /* Make local copies - shared memory may be modified during set_param.
-             * value_copy is static because SHADOW_PARAM_VALUE_LEN (64KB) is too large
-             * for the stack. Safe because this runs in single-threaded ioctl context. */
-            char key_copy[SHADOW_PARAM_KEY_LEN];
-            static char value_copy[SHADOW_PARAM_VALUE_LEN];
-            strncpy(key_copy, shadow_param->key, sizeof(key_copy) - 1);
-            key_copy[sizeof(key_copy) - 1] = '\0';
-            strncpy(value_copy, shadow_param->value, sizeof(value_copy) - 1);
-            value_copy[sizeof(value_copy) - 1] = '\0';
-
-            shadow_plugin_v2->set_param(shadow_chain_slots[slot].instance,
-                                        key_copy, value_copy);
-            shadow_param->error = 0;
-            shadow_param->result_len = 0;
-
-            /* Activate slot when synth module is loaded.
-             * Don't deactivate when synth is removed — the slot may still
-             * have FX that need to process inject audio (Link Audio).
-             * Deactivation only happens when the whole patch is cleared. */
-            if (strcmp(key_copy, "synth:module") == 0) {
-                if (value_copy[0] != '\0') {
-                    shadow_chain_slots[slot].active = 1;
-
-                    /* Query synth's default forward channel and apply if slot is still at Auto.
-                     * Only apply if slot is still at Auto (-1); preserve explicit user settings. */
-                    if (shadow_chain_slots[slot].forward_channel == -1 && shadow_plugin_v2->get_param) {
-                        char fwd_buf[16];
-                        int len = shadow_plugin_v2->get_param(shadow_chain_slots[slot].instance,
-                            "synth:default_forward_channel", fwd_buf, sizeof(fwd_buf));
-                        if (len > 0) {
-                            fwd_buf[len < (int)sizeof(fwd_buf) ? len : (int)sizeof(fwd_buf) - 1] = '\0';
-                            int default_fwd = atoi(fwd_buf);
-                            if (default_fwd >= 0 && default_fwd <= 15) {
-                                shadow_chain_slots[slot].forward_channel = default_fwd;
-                                shadow_ui_state_update_slot(slot);
-                            }
-                        }
-                    }
-                }
-                /* synth cleared: slot stays active for FX processing */
-            }
-            /* Also activate when FX modules are loaded on an inactive slot */
-            if (!shadow_chain_slots[slot].active &&
-                (strcmp(key_copy, "fx1:module") == 0 ||
-                 strcmp(key_copy, "fx2:module") == 0) &&
-                value_copy[0] != '\0') {
-                shadow_chain_slots[slot].active = 1;
-            }
-            /* Activate slot when a patch is loaded via set_param */
-            if (strcmp(key_copy, "load_patch") == 0 ||
-                strcmp(key_copy, "patch") == 0) {
-                int idx = atoi(value_copy);
-                if (idx < 0 || idx == SHADOW_PATCH_INDEX_NONE) {
-                    shadow_chain_slots[slot].active = 0;
-                    shadow_chain_slots[slot].patch_index = -1;
-                    capture_clear(&shadow_chain_slots[slot].capture);
-                    shadow_chain_slots[slot].patch_name[0] = '\0';
-                } else {
-                    shadow_chain_slots[slot].active = 1;
-                    shadow_chain_slots[slot].patch_index = idx;
-                    shadow_slot_load_capture(slot, idx);
-
-                    /* Query synth's default forward channel after patch load.
-                     * Only apply if slot is still at Auto (-1); preserve explicit user settings. */
-                    if (shadow_chain_slots[slot].forward_channel == -1 && shadow_plugin_v2->get_param) {
-                        char fwd_buf[16];
-                        int len = shadow_plugin_v2->get_param(shadow_chain_slots[slot].instance,
-                            "synth:default_forward_channel", fwd_buf, sizeof(fwd_buf));
-                        if (len > 0) {
-                            fwd_buf[len < (int)sizeof(fwd_buf) ? len : (int)sizeof(fwd_buf) - 1] = '\0';
-                            int default_fwd = atoi(fwd_buf);
-                            if (default_fwd >= 0 && default_fwd <= 15) {
-                                shadow_chain_slots[slot].forward_channel = default_fwd;
-                            }
-                        }
-                    }
-                }
-                shadow_ui_state_update_slot(slot);
-            }
-
-            if (shadow_midi_out_log_enabled()) {
-                if (strcmp(key_copy, "synth:module") == 0 ||
-                    strcmp(key_copy, "fx1:module") == 0 ||
-                    strcmp(key_copy, "fx2:module") == 0 ||
-                    strcmp(key_copy, "midi_fx1:module") == 0) {
-                    shadow_midi_out_logf("param_set: slot=%d key=%s val=%s active=%d",
-                        slot, key_copy, value_copy, shadow_chain_slots[slot].active);
-                }
-            }
-        } else {
-            shadow_param->error = 3;
-            shadow_param->result_len = -1;
-        }
-    }
-    else if (req_type == 2) {  /* GET param */
-        if (shadow_plugin_v2->get_param) {
-            /* Clear buffer before get_param to prevent any stale data */
-            memset(shadow_param->value, 0, 256);  /* Clear first 256 bytes */
-            int len = shadow_plugin_v2->get_param(shadow_chain_slots[slot].instance,
-                                                  shadow_param->key,
-                                                  shadow_param->value,
-                                                  SHADOW_PARAM_VALUE_LEN);
-            if (len >= 0) {
-                if (len < SHADOW_PARAM_VALUE_LEN) {
-                    shadow_param->value[len] = '\0';
-                } else {
-                    shadow_param->value[SHADOW_PARAM_VALUE_LEN - 1] = '\0';
-                }
-                shadow_param->error = 0;
-                shadow_param->result_len = len;
-            } else {
-                shadow_param->error = 4;
-                shadow_param->result_len = -1;
-            }
-        } else {
-            shadow_param->error = 5;
-            shadow_param->result_len = -1;
-        }
-    }
-    else {
-        shadow_param->error = 6;  /* Unknown request type */
-        shadow_param->result_len = -1;
-    }
-
-    shadow_param_publish_response(req_id);
-}
-
-/* Forward CC, pitch bend, aftertouch from external MIDI (MIDI_IN cable 2) to MIDI_OUT.
- * Move echoes notes but not these message types, so we inject them into MIDI_OUT
- * so the DSP routing can pick them up alongside the echoed notes. */
-static void shadow_forward_external_cc_to_out(void) {
-    if (!shadow_inprocess_ready || !global_mmap_addr) return;
-
-    uint8_t *in_src = global_mmap_addr + MIDI_IN_OFFSET;
-    uint8_t *out_dst = global_mmap_addr + MIDI_OUT_OFFSET;
-
-    for (int i = 0; i < MIDI_BUFFER_SIZE; i += 4) {
-        uint8_t cin = in_src[i] & 0x0F;
-        uint8_t cable = (in_src[i] >> 4) & 0x0F;
-
-        /* Only process external MIDI (cable 2) */
-        if (cable != 0x02) continue;
-        if (cin < 0x08 || cin > 0x0E) continue;
-
-        uint8_t status = in_src[i + 1];
-        uint8_t type = status & 0xF0;
-
-        /* Only forward CC (0xB0), pitch bend (0xE0), channel aftertouch (0xD0), poly aftertouch (0xA0) */
-        if (type != 0xB0 && type != 0xE0 && type != 0xD0 && type != 0xA0) continue;
-
-        /* Find an empty slot in MIDI_OUT and inject the message */
-        for (int j = 0; j < MIDI_BUFFER_SIZE; j += 4) {
-            if (out_dst[j] == 0 && out_dst[j+1] == 0 && out_dst[j+2] == 0 && out_dst[j+3] == 0) {
-                /* Copy the packet, keeping cable 2 */
-                out_dst[j] = in_src[i];
-                out_dst[j + 1] = in_src[i + 1];
-                out_dst[j + 2] = in_src[i + 2];
-                out_dst[j + 3] = in_src[i + 3];
-                break;
-            }
-        }
-    }
-}
 
 static void shadow_inprocess_process_midi(void) {
     if (!shadow_inprocess_ready || !global_mmap_addr) return;
@@ -5794,482 +2708,6 @@ ssize_t read(int fd, void *buf, size_t count)
     return ret;
 }
 
-/* ALSA seq wrappers for binary-level MIDI path tracing. */
-int snd_seq_event_output(void *seq, void *ev)
-{
-    static int (*real_snd_seq_event_output)(void *, void *) = NULL;
-    if (!real_snd_seq_event_output) {
-        real_snd_seq_event_output = (int (*)(void *, void *))dlsym(RTLD_NEXT, "snd_seq_event_output");
-    }
-    int ret = real_snd_seq_event_output ? real_snd_seq_event_output(seq, ev) : -1;
-    if (ev) shadow_seq_trace_event("SEQ_OUT", ev, (long)ret);
-    return ret;
-}
-
-int snd_seq_event_output_direct(void *seq, void *ev)
-{
-    static int (*real_snd_seq_event_output_direct)(void *, void *) = NULL;
-    if (!real_snd_seq_event_output_direct) {
-        real_snd_seq_event_output_direct =
-            (int (*)(void *, void *))dlsym(RTLD_NEXT, "snd_seq_event_output_direct");
-    }
-    int ret = real_snd_seq_event_output_direct ? real_snd_seq_event_output_direct(seq, ev) : -1;
-    if (ev) shadow_seq_trace_event("SEQ_OUT_DIRECT", ev, (long)ret);
-    return ret;
-}
-
-int snd_seq_event_input(void *seq, void **ev)
-{
-    static int (*real_snd_seq_event_input)(void *, void **) = NULL;
-    if (!real_snd_seq_event_input) {
-        real_snd_seq_event_input = (int (*)(void *, void **))dlsym(RTLD_NEXT, "snd_seq_event_input");
-    }
-    int ret = real_snd_seq_event_input ? real_snd_seq_event_input(seq, ev) : -1;
-    if (ret >= 0 && ev && *ev) shadow_seq_trace_event("SEQ_IN", *ev, (long)ret);
-    return ret;
-}
-
-long snd_midi_event_encode(void *dev, const unsigned char *buf, long count, void *ev)
-{
-    static long (*real_snd_midi_event_encode)(void *, const unsigned char *, long, void *) = NULL;
-    if (!real_snd_midi_event_encode) {
-        real_snd_midi_event_encode =
-            (long (*)(void *, const unsigned char *, long, void *))dlsym(RTLD_NEXT, "snd_midi_event_encode");
-    }
-    long ret = real_snd_midi_event_encode ? real_snd_midi_event_encode(dev, buf, count, ev) : -1;
-    if (buf && count > 0) shadow_seq_trace_bytes("MIDI_ENC_BYTES", buf, (size_t)count, ret);
-    if (ev) shadow_seq_trace_event("MIDI_ENC_EVENT", ev, ret);
-    return ret;
-}
-
-long snd_midi_event_decode(void *dev, unsigned char *buf, long count, const void *ev)
-{
-    static long (*real_snd_midi_event_decode)(void *, unsigned char *, long, const void *) = NULL;
-    if (!real_snd_midi_event_decode) {
-        real_snd_midi_event_decode =
-            (long (*)(void *, unsigned char *, long, const void *))dlsym(RTLD_NEXT, "snd_midi_event_decode");
-    }
-    long ret = real_snd_midi_event_decode ? real_snd_midi_event_decode(dev, buf, count, ev) : -1;
-    if (ev) shadow_seq_trace_event("MIDI_DEC_EVENT", ev, ret);
-    if (buf && ret > 0) shadow_seq_trace_bytes("MIDI_DEC_BYTES", buf, (size_t)ret, ret);
-    return ret;
-}
-
-void launchChildAndKillThisProcess(char *pBinPath, char*pBinName, char* pArgs)
-{
-    int pid = fork();
-
-    if (pid < 0)
-    {
-        printf("Fork failed\n");
-        exit(1);
-    }
-    else if (pid == 0)
-    {
-        // Child process
-        setsid();
-        // Perform detached task
-        printf("Child process running in the background...\n");
-
-        printf("Args: %s\n", pArgs);
-
-        // Close all file descriptors, otherwise /dev/ablspi0.0 is held open
-        // and the control surface code can't open it.
-        printf("Closing file descriptors...\n");
-        int fdlimit = (int)sysconf(_SC_OPEN_MAX);
-        for (int i = STDERR_FILENO + 1; i < fdlimit; i++)
-        {
-            close(i);
-        }
-
-        // Let's a go!
-        execl(pBinPath, pBinName, pArgs, (char *)0);
-        /* execl only returns on error */
-        perror("execl failed");
-        _exit(1);
-    }
-    else
-    {
-        // parent
-        kill(getpid(), SIGINT);
-    }
-}
-
-static int shadow_ui_started = 0;
-static pid_t shadow_ui_pid = -1;
-static const char *shadow_ui_pid_path = "/data/UserData/move-anything/shadow_ui.pid";
-
-/* Link Audio subscriber process management */
-static volatile int link_sub_started = 0;
-static volatile pid_t link_sub_pid = -1;
-static volatile uint32_t link_sub_ever_received = 0;  /* high-water mark of packets_intercepted */
-static volatile int link_sub_restart_count = 0;       /* total restarts for logging */
-static volatile int link_sub_monitor_started = 0;
-static volatile int link_sub_monitor_running = 0;
-static pthread_t link_sub_monitor_thread;
-
-/* Recovery constants for background monitor thread */
-#define LINK_SUB_STALE_THRESHOLD_MS 5000
-#define LINK_SUB_WAIT_MS            3000
-#define LINK_SUB_COOLDOWN_MS        10000
-#define LINK_SUB_ALIVE_CHECK_MS     5000
-#define LINK_SUB_MONITOR_POLL_US    100000
-
-static int shadow_ui_pid_alive(pid_t pid)
-{
-    if (pid <= 0) return 0;
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
-    FILE *f = fopen(path, "r");
-    if (!f) return 0;
-    int rpid = 0;
-    char comm[64] = {0};
-    char state = 0;
-    int matched = fscanf(f, "%d %63s %c", &rpid, comm, &state);
-    fclose(f);
-    if (matched != 3) return 0;
-    if (rpid != (int)pid) return 0;
-    if (state == 'Z') return 0;
-    /* Guard against PID reuse: verify the process is actually shadow_ui */
-    if (!strstr(comm, "shadow_ui")) return 0;
-    return 1;
-}
-
-static pid_t shadow_ui_read_pid(void)
-{
-    FILE *pid_file = fopen(shadow_ui_pid_path, "r");
-    if (!pid_file) return -1;
-    long pid = -1;
-    if (fscanf(pid_file, "%ld", &pid) != 1) {
-        pid = -1;
-    }
-    fclose(pid_file);
-    return (pid_t)pid;
-}
-
-static void shadow_ui_refresh_pid(void)
-{
-    if (shadow_ui_pid_alive(shadow_ui_pid)) {
-        shadow_ui_started = 1;
-        return;
-    }
-    pid_t pid = shadow_ui_read_pid();
-    if (shadow_ui_pid_alive(pid)) {
-        shadow_ui_pid = pid;
-        shadow_ui_started = 1;
-        return;
-    }
-    if (pid > 0) {
-        unlink(shadow_ui_pid_path);
-    }
-    shadow_ui_pid = -1;
-    shadow_ui_started = 0;
-}
-
-static void shadow_ui_reap(void)
-{
-    if (shadow_ui_pid <= 0) return;
-    int status = 0;
-    pid_t res = waitpid(shadow_ui_pid, &status, WNOHANG);
-    if (res == shadow_ui_pid) {
-        shadow_ui_pid = -1;
-        shadow_ui_started = 0;
-    }
-}
-
-static void launch_shadow_ui(void)
-{
-    /* Quick check before reap/refresh — if we just forked, trust the state
-     * even if /proc hasn't appeared yet (avoids double-fork race). */
-    if (shadow_ui_started && shadow_ui_pid > 0) return;
-    shadow_ui_reap();
-    shadow_ui_refresh_pid();
-    if (shadow_ui_started && shadow_ui_pid > 0) return;
-    if (access("/data/UserData/move-anything/shadow/shadow_ui", X_OK) != 0) {
-        return;
-    }
-
-    int pid = fork();
-    if (pid < 0) {
-        return;
-    }
-    if (pid == 0) {
-        setsid();
-        int fdlimit = (int)sysconf(_SC_OPEN_MAX);
-        for (int i = STDERR_FILENO + 1; i < fdlimit; i++) {
-            close(i);
-        }
-        execl("/data/UserData/move-anything/shadow/shadow_ui", "shadow_ui", (char *)0);
-        _exit(1);
-    }
-    shadow_ui_started = 1;
-    shadow_ui_pid = pid;
-}
-
-/* --- Link Audio subscriber process management --- */
-
-static int link_sub_pid_alive(pid_t pid)
-{
-    if (pid <= 0) return 0;
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
-    FILE *f = fopen(path, "r");
-    if (!f) return 0;
-    int rpid = 0;
-    char comm[64] = {0};
-    char state = 0;
-    int matched = fscanf(f, "%d %63s %c", &rpid, comm, &state);
-    fclose(f);
-    if (matched != 3) return 0;
-    if (rpid != (int)pid) return 0;
-    if (state == 'Z') return 0;
-    if (!strstr(comm, "link-sub")) return 0;
-    return 1;
-}
-
-static void link_sub_reap(void)
-{
-    if (link_sub_pid <= 0) return;
-    int status = 0;
-    pid_t res = waitpid(link_sub_pid, &status, WNOHANG);
-    if (res == link_sub_pid) {
-        link_sub_pid = -1;
-        link_sub_started = 0;
-    }
-}
-
-static void link_sub_kill(void)
-{
-    if (link_sub_pid > 0) {
-        kill(link_sub_pid, SIGTERM);
-    }
-}
-
-/* Kill any orphaned link-subscriber processes left from a previous shim instance.
- * This happens when the shim exits (e.g. entering standalone mode) but the
- * detached link-subscriber survives.  On restart, static state is reset so
- * the shim doesn't know about the orphan and would spawn a duplicate. */
-static void link_sub_kill_orphans(void)
-{
-    DIR *dp = opendir("/proc");
-    if (!dp) return;
-    struct dirent *ent;
-    pid_t my_pid = getpid();
-    while ((ent = readdir(dp)) != NULL) {
-        /* Only look at numeric directory names (PIDs) */
-        int pid = atoi(ent->d_name);
-        if (pid <= 1) continue;
-        if (pid == my_pid) continue;
-        if (pid == link_sub_pid) continue;  /* Already tracked */
-
-        char path[64];
-        snprintf(path, sizeof(path), "/proc/%d/stat", pid);
-        FILE *f = fopen(path, "r");
-        if (!f) continue;
-        int rpid = 0;
-        char comm[64] = {0};
-        char state = 0;
-        int matched = fscanf(f, "%d %63s %c", &rpid, comm, &state);
-        fclose(f);
-        if (matched != 3) continue;
-        if (state == 'Z') continue;
-        if (!strstr(comm, "link-sub")) continue;
-
-        /* Found an orphaned link-subscriber */
-        unified_log("shim", LOG_LEVEL_INFO,
-                    "Killing orphaned link-subscriber pid=%d", pid);
-        kill(pid, SIGTERM);
-        /* Give it a moment, then force-kill if still alive */
-        usleep(50000);  /* 50ms */
-        kill(pid, SIGKILL);
-        waitpid(pid, NULL, WNOHANG);
-    }
-    closedir(dp);
-}
-
-static void launch_link_subscriber(void)
-{
-    if (link_sub_started && link_sub_pid > 0) return;
-    link_sub_reap();
-    if (link_sub_started && link_sub_pid > 0) return;
-
-    /* Kill any orphans from a previous shim instance before spawning */
-    link_sub_kill_orphans();
-
-    const char *sub_path = "/data/UserData/move-anything/link-subscriber";
-    if (access(sub_path, X_OK) != 0) return;
-
-    int pid = fork();
-    if (pid < 0) return;
-    if (pid == 0) {
-        setsid();
-        int null_fd = open("/dev/null", O_WRONLY);
-        if (null_fd >= 0) {
-            dup2(null_fd, STDOUT_FILENO);
-            dup2(null_fd, STDERR_FILENO);
-            if (null_fd > STDERR_FILENO) {
-                close(null_fd);
-            }
-        }
-        int fdlimit = (int)sysconf(_SC_OPEN_MAX);
-        for (int i = STDERR_FILENO + 1; i < fdlimit; i++) {
-            close(i);
-        }
-        execl(sub_path, "link-subscriber", (char *)0);
-        _exit(1);
-    }
-    link_sub_started = 1;
-    link_sub_pid = pid;
-    unified_log("shim", LOG_LEVEL_INFO,
-                "Link subscriber launched: pid=%d", pid);
-}
-
-static uint64_t link_sub_now_ms(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
-}
-
-static void *link_sub_monitor_main(void *arg)
-{
-    (void)arg;
-
-    uint32_t last_packets = link_audio.packets_intercepted;
-    uint64_t last_packet_ms = link_sub_now_ms();
-    uint64_t cooldown_until_ms = 0;
-    uint64_t kill_deadline_ms = 0;
-    uint64_t next_alive_check_ms = last_packet_ms + LINK_SUB_ALIVE_CHECK_MS;
-    int kill_pending = 0;
-
-    if (last_packets > link_sub_ever_received) {
-        link_sub_ever_received = last_packets;
-    }
-
-    while (link_sub_monitor_running) {
-        uint64_t now_ms = link_sub_now_ms();
-
-        if (!link_audio.enabled) {
-            usleep(LINK_SUB_MONITOR_POLL_US);
-            continue;
-        }
-
-        uint32_t packets_now = link_audio.packets_intercepted;
-        if (packets_now != last_packets) {
-            last_packets = packets_now;
-            last_packet_ms = now_ms;
-            if (packets_now > link_sub_ever_received) {
-                link_sub_ever_received = packets_now;
-            }
-        }
-
-        if (kill_pending) {
-            if (now_ms >= kill_deadline_ms) {
-                /* Wait period over: reap zombie, reset state, launch fresh */
-                link_sub_reap();
-                pid_t pid = link_sub_pid;
-                if (pid > 0) {
-                    kill(pid, SIGKILL);
-                    waitpid(pid, NULL, 0);
-                    link_sub_pid = -1;
-                    link_sub_started = 0;
-                }
-                kill_pending = 0;
-                link_sub_reset_state();
-                launch_link_subscriber();
-                link_sub_restart_count++;
-                cooldown_until_ms = now_ms + LINK_SUB_COOLDOWN_MS;
-                last_packets = link_audio.packets_intercepted;
-                last_packet_ms = now_ms;
-                next_alive_check_ms = now_ms + LINK_SUB_ALIVE_CHECK_MS;
-                unified_log("shim", LOG_LEVEL_INFO,
-                            "Link subscriber restarted after stale detection (restart #%d)",
-                            (int)link_sub_restart_count);
-            }
-            usleep(LINK_SUB_MONITOR_POLL_US);
-            continue;
-        }
-
-        if (link_sub_ever_received > 0 &&
-            now_ms > last_packet_ms + LINK_SUB_STALE_THRESHOLD_MS &&
-            now_ms >= cooldown_until_ms) {
-            /* Audio was flowing but stopped for ~5s — trigger recovery */
-            pid_t pid = link_sub_pid;
-            unified_log("shim", LOG_LEVEL_INFO,
-                        "Link audio stale detected: la_stale=%u la_ever=%u, killing subscriber pid=%d",
-                        la_stale_frames, link_sub_ever_received, (int)pid);
-            link_sub_kill();
-            kill_pending = 1;
-            kill_deadline_ms = now_ms + LINK_SUB_WAIT_MS;
-            usleep(LINK_SUB_MONITOR_POLL_US);
-            continue;
-        }
-
-        if (now_ms >= next_alive_check_ms) {
-            next_alive_check_ms = now_ms + LINK_SUB_ALIVE_CHECK_MS;
-            link_sub_reap();
-            pid_t pid = link_sub_pid;
-            if (link_sub_started && !link_sub_pid_alive(pid) &&
-                now_ms >= cooldown_until_ms) {
-                /* Subscriber crashed — restart */
-                unified_log("shim", LOG_LEVEL_INFO,
-                            "Link subscriber died (pid=%d), restarting",
-                            (int)pid);
-                link_sub_pid = -1;
-                link_sub_started = 0;
-                link_sub_reset_state();
-                launch_link_subscriber();
-                link_sub_restart_count++;
-                cooldown_until_ms = now_ms + LINK_SUB_COOLDOWN_MS;
-                last_packets = link_audio.packets_intercepted;
-                last_packet_ms = now_ms;
-            }
-        }
-
-        usleep(LINK_SUB_MONITOR_POLL_US);
-    }
-
-    return NULL;
-}
-
-static void start_link_sub_monitor(void)
-{
-    if (link_sub_monitor_started) return;
-
-    link_sub_monitor_running = 1;
-    int rc = pthread_create(&link_sub_monitor_thread, NULL, link_sub_monitor_main, NULL);
-    if (rc != 0) {
-        link_sub_monitor_running = 0;
-        unified_log("shim", LOG_LEVEL_WARN,
-                    "Link subscriber monitor start failed: %s",
-                    strerror(rc));
-        return;
-    }
-
-    pthread_detach(link_sub_monitor_thread);
-    link_sub_monitor_started = 1;
-    unified_log("shim", LOG_LEVEL_INFO, "Link subscriber monitor started");
-}
-
-static void link_sub_reset_state(void)
-{
-    /* Reset Link Audio state so fresh subscriber can rediscover everything */
-    link_audio.packets_intercepted = 0;
-    link_audio.session_parsed = 0;
-    link_audio.move_channel_count = 0;
-    link_sub_ever_received = 0;
-    la_prev_intercepted = 0;
-    la_stale_frames = 0;
-
-    /* Clear ring buffers */
-    for (int i = 0; i < LINK_AUDIO_MOVE_CHANNELS; i++) {
-        link_audio.channels[i].write_pos = 0;
-        link_audio.channels[i].read_pos = 0;
-        link_audio.channels[i].active = 0;
-        link_audio.channels[i].pkt_count = 0;
-        link_audio.channels[i].peak = 0;
-    }
-}
 
 int (*real_ioctl)(int, unsigned long, ...) = NULL;
 
@@ -6444,6 +2882,413 @@ void midi_monitor()
     }
 }
 
+/* ============================================================================
+ * MIDI FX REWRITE — Transform pad notes via shadow chain MIDI FX
+ * ============================================================================
+ * Post-ioctl: intercepts cable-0 pad notes in MIDI_IN, processes through
+ * the shadow chain's MIDI FX pipeline, and re-injects transformed notes
+ * as cable-2 (external MIDI format). Move's native synth processes cable-2
+ * notes without triggering ProcessEventsStepper ordering crashes.
+ * ============================================================================ */
+
+#define SHADOW_MIDI_FX_EXTRAS_MAX 4
+#define SHADOW_MIDI_FX_HELD_MAX 16
+
+typedef struct {
+    uint8_t active;
+    uint8_t pad_note;      /* Original pad note (68-99) for matching note-offs */
+    uint8_t musical_note;  /* Actual musical note from MIDI OUT (for chord generation) */
+    uint8_t channel;       /* MIDI channel (low nibble of status) */
+    uint8_t extras[SHADOW_MIDI_FX_EXTRAS_MAX];  /* Generated chord interval notes */
+    int extra_count;
+} shadow_midi_fx_held_t;
+
+static shadow_midi_fx_held_t shadow_midi_fx_held[SHADOW_MIDI_FX_HELD_MAX];
+
+static int shadow_move_transform_slot(void)
+{
+    int slot = shadow_selected_slot;
+    if (shadow_control && shadow_control->ui_slot >= 0 &&
+        shadow_control->ui_slot < SHADOW_CHAIN_INSTANCES) {
+        slot = shadow_control->ui_slot;
+    }
+    if (slot < 0 || slot >= SHADOW_CHAIN_INSTANCES) return -1;
+    return slot;
+}
+
+static int shadow_slot_get_param_string(int slot, const char *key, char *buf, int buf_len)
+{
+    if (!buf || buf_len < 2 || !key || !key[0]) return 0;
+    if (slot < 0 || slot >= SHADOW_CHAIN_INSTANCES) return 0;
+    if (!shadow_plugin_v2 || !shadow_plugin_v2->get_param) return 0;
+    if (!shadow_chain_slots[slot].instance) return 0;
+
+    int len = shadow_plugin_v2->get_param(shadow_chain_slots[slot].instance, key, buf, buf_len);
+    if (len <= 0) return 0;
+    if (len >= buf_len) len = buf_len - 1;
+    buf[len] = '\0';
+    return 1;
+}
+
+/* Check if a slot has any MIDI FX loaded */
+static int shadow_slot_has_midi_fx(int slot)
+{
+    char buf[8];
+    if (!shadow_slot_get_param_string(slot, "midi_fx_count", buf, sizeof(buf))) return 0;
+    return atoi(buf) > 0;
+}
+
+/* Process a MIDI message through a slot's MIDI FX chain.
+ * Returns number of output messages written to out_notes/out_vels. */
+#define SHADOW_MIDI_FX_OUT_MAX 16
+static int shadow_slot_process_midi_fx(int slot, uint8_t status, uint8_t note, uint8_t vel,
+                                       uint8_t *out_notes, uint8_t *out_vels, int max_out)
+{
+    if (max_out <= 0) return 0;
+
+    char key[48];
+    snprintf(key, sizeof(key), "midi_fx_process:%02X %02X %02X", status, note, vel);
+
+    char buf[256];
+    if (!shadow_slot_get_param_string(slot, key, buf, sizeof(buf))) return 0;
+    if (buf[0] == '\0') return 0;
+
+    int count = 0;
+    char *p = buf;
+    while (*p && count < max_out) {
+        unsigned int s, d1, d2;
+        if (sscanf(p, "%x %x %x", &s, &d1, &d2) != 3) break;
+        out_notes[count] = (uint8_t)d1;
+        out_vels[count] = (uint8_t)d2;
+        count++;
+        char *comma = strchr(p, ',');
+        if (!comma) break;
+        p = comma + 1;
+    }
+    return count;
+}
+
+static int shadow_midi_fx_log_enabled(void)
+{
+    static int enabled = -1;
+    static int check_counter = 0;
+    if (enabled < 0 || (check_counter++ % 200 == 0)) {
+        enabled = (access("/data/UserData/move-anything/shadow_midi_fx_log_on", F_OK) == 0);
+    }
+    return enabled;
+}
+
+/* Queue for cable-2 injection: multiple events per frame are OK on cable 2. */
+#define SHADOW_MIDI_FX_QUEUE_MAX 32
+typedef struct {
+    uint8_t note;
+    uint8_t vel;   /* 0 = note-off, >0 = note-on */
+    uint8_t ch;    /* channel (low nibble) */
+} shadow_midi_fx_queue_entry_t;
+
+static shadow_midi_fx_queue_entry_t shadow_midi_fx_queue[SHADOW_MIDI_FX_QUEUE_MAX];
+static int shadow_midi_fx_queue_head = 0;
+static int shadow_midi_fx_queue_tail = 0;
+
+static int shadow_midi_fx_queue_count(void)
+{
+    int c = shadow_midi_fx_queue_tail - shadow_midi_fx_queue_head;
+    if (c < 0) c += SHADOW_MIDI_FX_QUEUE_MAX;
+    return c;
+}
+
+static int shadow_midi_fx_queue_push(uint8_t note, uint8_t vel, uint8_t ch)
+{
+    int next = (shadow_midi_fx_queue_tail + 1) % SHADOW_MIDI_FX_QUEUE_MAX;
+    if (next == shadow_midi_fx_queue_head) return 0;
+    shadow_midi_fx_queue[shadow_midi_fx_queue_tail].note = note;
+    shadow_midi_fx_queue[shadow_midi_fx_queue_tail].vel = vel;
+    shadow_midi_fx_queue[shadow_midi_fx_queue_tail].ch = ch;
+    shadow_midi_fx_queue_tail = next;
+    return 1;
+}
+
+static int shadow_midi_fx_queue_pop(shadow_midi_fx_queue_entry_t *out)
+{
+    if (shadow_midi_fx_queue_head == shadow_midi_fx_queue_tail) return 0;
+    *out = shadow_midi_fx_queue[shadow_midi_fx_queue_head];
+    shadow_midi_fx_queue_head = (shadow_midi_fx_queue_head + 1) % SHADOW_MIDI_FX_QUEUE_MAX;
+    return 1;
+}
+
+/* Post-ioctl: monitor MIDI OUT for actual musical notes, process through
+ * chain's MIDI FX, and queue transformed notes for cable-2 injection.
+ *
+ * Instead of using pad IDs (68-99) from MIDI_IN, we read MIDI OUT cable 0
+ * to get the actual musical notes that Move's engine generated. This means
+ * chord/arp/strum intervals are based on real pitch, not pad position.
+ *
+ * sh_midi: pointer to shadow_mailbox + MIDI_IN_OFFSET (for pad event detection).
+ * sh_midi_out: pointer to shadow_mailbox + MIDI_OUT_OFFSET (for musical note reading). */
+static int shadow_midi_fx_rewrite(uint8_t *sh_midi)
+{
+    if (!sh_midi) return 0;
+
+    /* Only active when explicitly enabled via flag file */
+    static int midifx_enabled = 0;
+    static int midifx_enable_check = 0;
+    if (++midifx_enable_check >= 4410) {
+        midifx_enable_check = 0;
+        midifx_enabled = (access("/data/UserData/move-anything/midi_fx_rewrite_on", F_OK) == 0);
+    }
+    if (!midifx_enabled) return 0;
+
+    int transform_slot = shadow_move_transform_slot();
+    int has_midi_fx = (transform_slot >= 0) ? shadow_slot_has_midi_fx(transform_slot) : 0;
+
+    /* Force transform slot out of idle gate when MIDI FX needs tick(). */
+    if (has_midi_fx && transform_slot >= 0 && transform_slot < SHADOW_CHAIN_INSTANCES) {
+        shadow_slot_idle[transform_slot] = 0;
+        shadow_slot_silence_frames[transform_slot] = 0;
+    }
+
+    int log_on = shadow_midi_fx_log_enabled();
+    int modified = 0;
+
+    /* Periodic trace */
+    {
+        static int trace_counter = 0;
+        if (log_on && (trace_counter++ % 500 == 0)) {
+            char module_buf[64] = {0};
+            int has_instance = (transform_slot >= 0 && transform_slot < SHADOW_CHAIN_INSTANCES &&
+                                shadow_chain_slots[transform_slot].instance != NULL);
+            if (has_instance) {
+                shadow_slot_get_param_string(transform_slot, "midi_fx1_module", module_buf, sizeof(module_buf));
+            }
+            char dbg[256];
+            snprintf(dbg, sizeof(dbg),
+                     "move-midifx trace: slot=%d inst=%d midi_fx=%d module='%s' q=%d",
+                     transform_slot, has_instance, has_midi_fx, module_buf,
+                     shadow_midi_fx_queue_count());
+            shadow_log(dbg);
+        }
+    }
+
+    if (!has_midi_fx) {
+        /* No MIDI FX — queue note-offs for any held extras from previous session */
+        for (int i = 0; i < SHADOW_MIDI_FX_HELD_MAX; i++) {
+            if (!shadow_midi_fx_held[i].active) continue;
+            for (int e = 0; e < shadow_midi_fx_held[i].extra_count; e++) {
+                shadow_midi_fx_queue_push(shadow_midi_fx_held[i].extras[e], 0,
+                                        shadow_midi_fx_held[i].channel);
+            }
+            shadow_midi_fx_held[i].active = 0;
+        }
+        return modified;
+    }
+
+    /* Diagnostic: log all MIDI OUT note events by cable to determine
+     * if cable-2 injected notes echo back and on which cable. */
+    {
+        const uint8_t *diag_out = shadow_mailbox + MIDI_OUT_OFFSET;
+        for (int j = 0; j < MIDI_BUFFER_SIZE; j += 4) {
+            uint8_t d_hdr = diag_out[j];
+            uint8_t d_cin = d_hdr & 0x0F;
+            uint8_t d_cable = (d_hdr >> 4) & 0x0F;
+            uint8_t d_status = diag_out[j + 1];
+            uint8_t d_type = d_status & 0xF0;
+            uint8_t d_note = diag_out[j + 2];
+            uint8_t d_vel = diag_out[j + 3];
+            if (d_cin != 0x08 && d_cin != 0x09) continue;
+            if (d_type != 0x80 && d_type != 0x90) continue;
+            if (d_note < 10) continue;
+            if (log_on) {
+                char dbg[128];
+                snprintf(dbg, sizeof(dbg),
+                         "move-midifx MIDI_OUT cable=%d %s note=%d vel=%d ch=%d pos=%d",
+                         d_cable, (d_type == 0x90 && d_vel > 0) ? "ON" : "OFF",
+                         d_note, d_vel, d_status & 0x0F, j);
+                shadow_log(dbg);
+            }
+        }
+    }
+
+    /* Gate: only process MIDI OUT when a pad note (68-99) was recently
+     * detected in MIDI_IN. This filters out Move's init scans, step button
+     * output, and other non-musical traffic in MIDI OUT cable-0.
+     * The gate stays open for a few frames to catch the musical note that
+     * Move generates from the pad press (may arrive 1-2 frames later). */
+    {
+        static int pad_gate_frames = 0;
+        int has_pad_note = 0;
+        for (int j = 0; j < MIDI_BUFFER_SIZE; j += 4) {
+            uint8_t in_cable = (sh_midi[j] >> 4) & 0x0F;
+            uint8_t in_cin = sh_midi[j] & 0x0F;
+            uint8_t in_type = sh_midi[j + 1] & 0xF0;
+            uint8_t in_note = sh_midi[j + 2];
+            uint8_t in_vel = sh_midi[j + 3];
+            if (in_cable == 0 && (in_cin == 0x09 || in_cin == 0x08) &&
+                (in_type == 0x90 || in_type == 0x80) &&
+                in_note >= 68 && in_note <= 99) {
+                has_pad_note = 1;
+                break;
+            }
+        }
+        if (has_pad_note) {
+            pad_gate_frames = 5;  /* Keep gate open for 5 frames (~15ms) */
+        }
+        if (pad_gate_frames <= 0) {
+            return modified;  /* No recent pad activity, skip MIDI OUT processing */
+        }
+        pad_gate_frames--;
+    }
+
+    const uint8_t *midi_out = shadow_mailbox + MIDI_OUT_OFFSET;
+
+    /* Pre-scan: count cable-0 note-on events. If >6, this is a bulk init scan
+     * (Move plays all notes when switching sets/tracks). Skip the whole frame. */
+    {
+        int c0_note_on_count = 0;
+        for (int j = 0; j < MIDI_BUFFER_SIZE; j += 4) {
+            uint8_t c = (midi_out[j] >> 4) & 0x0F;
+            uint8_t ci = midi_out[j] & 0x0F;
+            uint8_t ty = midi_out[j + 1] & 0xF0;
+            uint8_t v = midi_out[j + 3];
+            if (c == 0 && ci == 0x09 && ty == 0x90 && v > 0) c0_note_on_count++;
+        }
+        if (c0_note_on_count > 6) {
+            if (log_on) {
+                char dbg[128];
+                snprintf(dbg, sizeof(dbg),
+                         "move-midifx SKIP bulk scan: %d note-ons in MIDI_OUT",
+                         c0_note_on_count);
+                shadow_log(dbg);
+            }
+            return modified;
+        }
+    }
+
+    for (int j = 0; j < MIDI_BUFFER_SIZE; j += 4) {
+        uint8_t hdr = midi_out[j];
+        uint8_t cin = hdr & 0x0F;
+        uint8_t cable = (hdr >> 4) & 0x0F;
+        uint8_t status = midi_out[j + 1];
+        uint8_t type = status & 0xF0;
+        uint8_t note = midi_out[j + 2];
+        uint8_t vel = midi_out[j + 3];
+
+        /* Only process cable-0 (Move's internal note output).
+         * Skip cable-2 — those are our own injected notes echoing back. */
+        if (cable != 0x00) continue;
+        if (cin != 0x08 && cin != 0x09) continue;
+        if (type != 0x80 && type != 0x90) continue;
+
+        /* Filter knob touches (0-9) and other non-musical notes */
+        if (note < 10) continue;
+
+        /* Filter low-velocity ghost/aftertouch artifacts (vel <= 10) */
+        if (type == 0x90 && vel > 0 && vel <= 10) continue;
+
+        int is_note_on = (type == 0x90 && vel > 0);
+        int is_note_off = (type == 0x80 || (type == 0x90 && vel == 0));
+        uint8_t ch = status & 0x0F;
+
+        if (is_note_on) {
+            /* Process the actual musical note through MIDI FX */
+            uint8_t out_notes[SHADOW_MIDI_FX_OUT_MAX];
+            uint8_t out_vels[SHADOW_MIDI_FX_OUT_MAX];
+            int out_count = shadow_slot_process_midi_fx(
+                transform_slot, status, note, vel,
+                out_notes, out_vels, SHADOW_MIDI_FX_OUT_MAX);
+
+            int hi = -1;
+            for (int i = 0; i < SHADOW_MIDI_FX_HELD_MAX; i++) {
+                if (!shadow_midi_fx_held[i].active) { hi = i; break; }
+            }
+            if (hi < 0) continue;  /* Table full */
+
+            shadow_midi_fx_held[hi].active = 1;
+            shadow_midi_fx_held[hi].pad_note = 0;
+            shadow_midi_fx_held[hi].musical_note = note;
+            shadow_midi_fx_held[hi].channel = ch;
+            shadow_midi_fx_held[hi].extra_count = 0;
+
+            /* Move already plays the root note natively (from cable-0 pad or sequence).
+             * Queue EXTRA chord notes only for cable-2 injection.
+             * These are based on the real musical note from MIDI OUT. */
+            if (out_count > 1) {
+                for (int i = 1; i < out_count; i++) {
+                    shadow_midi_fx_queue_push(out_notes[i], out_vels[i], ch);
+                    if (shadow_midi_fx_held[hi].extra_count < SHADOW_MIDI_FX_EXTRAS_MAX) {
+                        shadow_midi_fx_held[hi].extras[shadow_midi_fx_held[hi].extra_count++] = out_notes[i];
+                    }
+                }
+            }
+
+            modified++;
+            if (log_on) {
+                char dbg[256];
+                snprintf(dbg, sizeof(dbg),
+                         "move-midifx FX ON musical=%d ch=%d -> %d out q=%d",
+                         note, ch, out_count, shadow_midi_fx_queue_count());
+                shadow_log(dbg);
+            }
+        } else if (is_note_off) {
+            /* Match note-off by musical note */
+            for (int i = 0; i < SHADOW_MIDI_FX_HELD_MAX; i++) {
+                if (!shadow_midi_fx_held[i].active) continue;
+                if (shadow_midi_fx_held[i].musical_note != note) continue;
+                if (shadow_midi_fx_held[i].channel != ch) continue;
+
+                /* Queue cable-2 note-offs for EXTRA chord notes only. */
+                for (int e = 0; e < shadow_midi_fx_held[i].extra_count; e++) {
+                    shadow_midi_fx_queue_push(shadow_midi_fx_held[i].extras[e], 0, ch);
+                }
+
+                if (log_on) {
+                    char dbg[256];
+                    snprintf(dbg, sizeof(dbg),
+                             "move-midifx FX OFF musical=%d ch=%d extras=%d q=%d",
+                             note, ch, shadow_midi_fx_held[i].extra_count,
+                             shadow_midi_fx_queue_count());
+                    shadow_log(dbg);
+                }
+
+                shadow_midi_fx_held[i].active = 0;
+                modified++;
+                break;
+            }
+        }
+    }
+
+    /* Poll tick output from time-based MIDI FX (arp, strum) */
+    if (transform_slot >= 0) {
+        char tick_buf[256];
+        if (shadow_slot_get_param_string(transform_slot, "midi_fx_tick_output",
+                                          tick_buf, sizeof(tick_buf)) && tick_buf[0]) {
+            char *p = tick_buf;
+            while (*p) {
+                unsigned int s, d1, d2;
+                if (sscanf(p, "%x %x %x", &s, &d1, &d2) != 3) break;
+                uint8_t tick_type = (uint8_t)s & 0xF0;
+                uint8_t tick_ch = (uint8_t)s & 0x0F;
+                uint8_t tick_vel = (tick_type == 0x90 && d2 > 0) ? (uint8_t)d2 : 0;
+                shadow_midi_fx_queue_push((uint8_t)d1, tick_vel, tick_ch);
+                if (log_on) {
+                    char dbg[128];
+                    snprintf(dbg, sizeof(dbg),
+                             "move-midifx TICK %s note=%d ch=%d vel=%d",
+                             tick_vel > 0 ? "ON" : "OFF", d1, tick_ch, d2);
+                    shadow_log(dbg);
+                }
+                char *comma = strchr(p, ',');
+                if (!comma) break;
+                p = comma + 1;
+            }
+        }
+    }
+
+    /* Drain is handled by the caller (ioctl hook) with deferred cable-2 injection
+     * and a 3-frame cooldown to avoid cable-0 + cable-2 crash. */
+
+    return modified;
+}
+
 // unsigned long ioctlCounter = 0;
 int ioctl(int fd, unsigned long request, ...)
 {
@@ -6604,23 +3449,6 @@ int ioctl(int fd, unsigned long request, ...)
 
     /* NOTE: MIDI filtering moved to AFTER ioctl - see post-ioctl section below */
 
-    /* SPI ioctl trace is runtime-gated by spi_trace_on and useful for
-     * reverse-engineering note transport even in normal builds. */
-    spi_trace_ioctl(request, (char *)argp);
-
-    /* USB MIDI mailbox scan — runtime-gated by usb_midi_on flag file */
-    mailbox_usb_midi_scan();
-
-#if SHADOW_TRACE_DEBUG
-    /* Additional discovery/probe functions - development only */
-    shadow_capture_midi_probe();
-    shadow_scan_mailbox_raw();
-    mailbox_diff_probe();
-    mailbox_midi_scan_strict();
-    mailbox_midi_region_scan();
-    mailbox_midi_out_frame_log();
-#endif
-
     /* === SHADOW INSTRUMENT: PRE-IOCTL PROCESSING === */
 
     /* Forward MIDI BEFORE ioctl - hardware clears the buffer during transaction */
@@ -6649,8 +3477,6 @@ int ioctl(int fd, unsigned long request, ...)
     TIME_SECTION_START();
     shadow_inprocess_process_midi();
     TIME_SECTION_END(proc_midi_sum, proc_midi_max);
-
-    /* Chord rewrite is now done post-ioctl on MIDI_IN (subtractive approach) */
 
     /* Drain MIDI-to-DSP from shadow UI (overtake modules sending to chain slots) */
     shadow_drain_ui_midi_dsp();
@@ -7183,82 +4009,124 @@ do_ioctl:
             memcpy(sh_midi, hw_midi, MIDI_BUFFER_SIZE);
         }
 
-        /* MIDI FX rewrite: block pad notes, process through chain's MIDI FX,
-         * and inject transformed output as staggered cable-0 events. */
-        shadow_midi_fx_rewrite(sh_midi);
-
-        /* === MIDI INJECTION TEST ===
-         * One-shot test: touch midi_inject_test_N (N=0-9) to fire that combo.
-         * Sends note-on, waits ~0.5s, sends note-off, deletes flag file.
-         * Combos: 0-3 = cable0 ch1-4, 4-7 = cable2 ch1-4, 8-9 = cable1 ch1-2 */
+        /* === MIDI BUFFER DIAGNOSTIC ===
+         * Log cable-0 event presence every 500 frames to understand buffer contents. */
         {
-            static int inject_active_combo = -1;
-            static int inject_timer = 0;
-            static int inject_check = 0;
+            static int diag_counter = 0;
+            if (++diag_counter >= 500) {
+                diag_counter = 0;
+                int c0_notes = 0, c0_cc = 0, c0_other = 0, c2_any = 0, total = 0;
+                for (int j = 0; j < MIDI_BUFFER_SIZE; j += 4) {
+                    if (sh_midi[j] == 0 && sh_midi[j+1] == 0) continue;
+                    total++;
+                    uint8_t cable = (sh_midi[j] >> 4) & 0x0F;
+                    uint8_t cin = sh_midi[j] & 0x0F;
+                    if (cable == 0) {
+                        if (cin == 0x09 || cin == 0x08) c0_notes++;
+                        else if (cin == 0x0B) c0_cc++;
+                        else c0_other++;
+                    } else if (cable == 2) c2_any++;
+                }
+                if (total > 0) {
+                    /* Dump first few non-empty events */
+                    char detail[128] = {0};
+                    int dpos = 0;
+                    for (int j = 0; j < MIDI_BUFFER_SIZE && dpos < 100; j += 4) {
+                        if (sh_midi[j] == 0 && sh_midi[j+1] == 0) continue;
+                        dpos += snprintf(detail + dpos, sizeof(detail) - dpos,
+                            "[%d:%02X %02X %02X %02X] ", j,
+                            sh_midi[j], sh_midi[j+1], sh_midi[j+2], sh_midi[j+3]);
+                    }
+                    unified_log("diag", LOG_LEVEL_INFO,
+                        "MIDI_IN: total=%d c0n=%d c0c=%d c0o=%d c2=%d %s",
+                        total, c0_notes, c0_cc, c0_other, c2_any, detail);
+                }
+            }
+        }
 
-            struct { uint8_t cable; uint8_t channel; const char *desc; } combos[] = {
-                {0, 0, "cable0_ch1"},
-                {0, 1, "cable0_ch2"},
-                {0, 2, "cable0_ch3"},
-                {0, 3, "cable0_ch4"},
-                {2, 0, "cable2_ch1"},
-                {2, 1, "cable2_ch2"},
-                {2, 2, "cable2_ch3"},
-                {2, 3, "cable2_ch4"},
-                {1, 0, "cable1_ch1"},
-                {1, 1, "cable1_ch2"},
-            };
-            int num_combos = 10;
+        /* === MIDI FX REWRITE: Deferred cable-2 injection ===
+         * The MIDI FX pipeline queues transformed notes. We inject them
+         * as cable-2 events, but ONLY in frames where no cable-0 note events
+         * exist (mixing cables in the same frame crashes Move).
+         * A 2-frame cooldown after any cable-0 note ensures safety. */
+        {
+            static int c2_cooldown = 0;
 
-            /* Check for new trigger file every ~50ms */
-            if (inject_active_combo < 0 && (inject_check++ % 17 == 0)) {
-                for (int t = 0; t < num_combos; t++) {
-                    char path[128];
-                    snprintf(path, sizeof(path),
-                             "/data/UserData/move-anything/midi_inject_test_%d", t);
-                    if (access(path, F_OK) == 0) {
-                        unlink(path);
-                        inject_active_combo = t;
-                        inject_timer = 0;
+            /* Detect cable-0 note events in MIDI_IN or MIDI_OUT.
+             * Both indicate Move is actively processing notes this frame.
+             * Cable-2 injection must wait until Move is idle. */
+            int has_c0_notes = 0;
+            for (int j = 0; j < MIDI_BUFFER_SIZE; j += 4) {
+                uint8_t cable = (sh_midi[j] >> 4) & 0x0F;
+                uint8_t cin = sh_midi[j] & 0x0F;
+                if (cable == 0 && (cin == 0x09 || cin == 0x08)) {
+                    has_c0_notes = 1;
+                    break;
+                }
+            }
+            if (!has_c0_notes) {
+                const uint8_t *mo = shadow_mailbox + MIDI_OUT_OFFSET;
+                for (int j = 0; j < MIDI_BUFFER_SIZE; j += 4) {
+                    uint8_t cable = (mo[j] >> 4) & 0x0F;
+                    uint8_t cin = mo[j] & 0x0F;
+                    if (cable == 0 && (cin == 0x09 || cin == 0x08)) {
+                        has_c0_notes = 1;
                         break;
                     }
                 }
             }
 
-            if (inject_active_combo >= 0) {
-                int ci = inject_active_combo;
-                inject_timer++;
+            if (has_c0_notes) {
+                c2_cooldown = 3;  /* Wait 3 frames after last cable-0 note */
+            }
 
-                if (inject_timer == 1) {
-                    /* Note ON */
-                    for (int j = 0; j < MIDI_BUFFER_SIZE; j += 4) {
-                        if (sh_midi[j] || sh_midi[j+1] || sh_midi[j+2] || sh_midi[j+3]) continue;
-                        sh_midi[j] = (combos[ci].cable << 4) | 0x09;
-                        sh_midi[j+1] = 0x90 | combos[ci].channel;
-                        sh_midi[j+2] = 60;  /* C4 */
-                        sh_midi[j+3] = 100;
-                        char dbg[128];
-                        snprintf(dbg, sizeof(dbg),
-                                 "midi-inject-test: NOTE ON #%d %s [%02x %02x %02x %02x]",
-                                 ci, combos[ci].desc, sh_midi[j], sh_midi[j+1], sh_midi[j+2], sh_midi[j+3]);
-                        shadow_log(dbg);
+            /* Run MIDI FX pipeline (queues events, doesn't inject) */
+            shadow_midi_fx_rewrite(sh_midi);
+
+            /* Drain queue only when safe */
+            if (c2_cooldown > 0) {
+                c2_cooldown--;
+            } else if (shadow_midi_fx_queue_count() > 0) {
+                /* Clear XMOS heartbeat at position 248 before injecting cable-2.
+                 * This metadata byte mixed with cable-2 may trigger crash. */
+                sh_midi[248] = 0; sh_midi[249] = 0; sh_midi[250] = 0; sh_midi[251] = 0;
+
+                int inject_pos = 0;
+                int injected = 0;
+                const int MAX_INJECT_PER_FRAME = 4;  /* Rate limit like RTP-MIDI */
+                shadow_midi_fx_queue_entry_t ev;
+                while (injected < MAX_INJECT_PER_FRAME &&
+                       shadow_midi_fx_queue_pop(&ev) && inject_pos < MIDI_BUFFER_SIZE) {
+                    /* Skip non-empty slots */
+                    while (inject_pos < MIDI_BUFFER_SIZE &&
+                           (sh_midi[inject_pos] || sh_midi[inject_pos+1])) {
+                        inject_pos += 4;
+                    }
+                    if (inject_pos >= MIDI_BUFFER_SIZE) {
+                        shadow_midi_fx_queue_push(ev.note, ev.vel, ev.ch);
                         break;
                     }
-                } else if (inject_timer >= 172) {
-                    /* Note OFF after ~0.5s */
-                    for (int j = 0; j < MIDI_BUFFER_SIZE; j += 4) {
-                        if (sh_midi[j] || sh_midi[j+1] || sh_midi[j+2] || sh_midi[j+3]) continue;
-                        sh_midi[j] = (combos[ci].cable << 4) | 0x08;
-                        sh_midi[j+1] = 0x80 | combos[ci].channel;
-                        sh_midi[j+2] = 60;
-                        sh_midi[j+3] = 0;
-                        char dbg[128];
-                        snprintf(dbg, sizeof(dbg),
-                                 "midi-inject-test: NOTE OFF #%d %s", ci, combos[ci].desc);
-                        shadow_log(dbg);
-                        break;
+                    /* Use channel 2 for cable-2 injection.
+                     * Cable-2 on ch=0 may conflict with Move's internal routing. */
+                    uint8_t inject_ch = 2;
+                    if (ev.vel > 0) {
+                        sh_midi[inject_pos]     = 0x29;
+                        sh_midi[inject_pos + 1] = 0x90 | inject_ch;
+                        sh_midi[inject_pos + 2] = ev.note;
+                        sh_midi[inject_pos + 3] = ev.vel;
+                    } else {
+                        sh_midi[inject_pos]     = 0x28;
+                        sh_midi[inject_pos + 1] = 0x80 | inject_ch;
+                        sh_midi[inject_pos + 2] = ev.note;
+                        sh_midi[inject_pos + 3] = 0x40;
                     }
-                    inject_active_combo = -1;
+                    inject_pos += 4;
+                    injected++;
+                }
+                if (injected > 0) {
+                    unified_log("midifx", LOG_LEVEL_DEBUG,
+                        "INJECT %d cable-2 events, q_remaining=%d",
+                        injected, shadow_midi_fx_queue_count());
                 }
             }
         }
