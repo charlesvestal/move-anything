@@ -5591,6 +5591,15 @@ function formatParamForOverlay(val, meta) {
     if (meta && (meta.type === "enum" || meta.type === "bool")) {
         return String(val);
     }
+    /* Explicit display_format: ".4f" = 4 decimals, ".2%" = percentage with 2 decimals */
+    if (meta && meta.display_format) {
+        const m = meta.display_format.match(/^\.(\d+)(f|%)$/);
+        if (m) {
+            const decimals = parseInt(m[1]);
+            if (m[2] === '%') return (val * 100).toFixed(decimals) + "%";
+            return val.toFixed(decimals);
+        }
+    }
     /* Float: show as percentage if 0-1 or 0-2 range */
     const min = meta && typeof meta.min === "number" ? meta.min : 0;
     const max = meta && typeof meta.max === "number" ? meta.max : 1;
@@ -6124,6 +6133,16 @@ function formatHierDisplayValue(key, val) {
 
     const num = parseFloat(val);
     if (isNaN(num)) return val;
+
+    /* Explicit display_format: ".4f" = 4 decimals, ".2%" = percentage with 2 decimals */
+    if (meta && meta.display_format) {
+        const m = meta.display_format.match(/^\.(\d+)(f|%)$/);
+        if (m) {
+            const decimals = parseInt(m[1]);
+            if (m[2] === '%') return (num * 100).toFixed(decimals) + "%";
+            return num.toFixed(decimals);
+        }
+    }
 
     /* Show as percentage for 0-1 float values */
     if (meta && meta.type === "float") {
