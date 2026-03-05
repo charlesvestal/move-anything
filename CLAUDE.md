@@ -2,9 +2,21 @@
 
 Instructions for Claude Code when working with this repository.
 
+## Maintaining This File
+
+Keep CLAUDE.md up to date as the codebase evolves. When you add new JS host functions, module capabilities, component types, shared utilities, deployment paths, shortcuts, or other API surface, update the relevant sections here. Also update `docs/API.md`, `docs/MODULES.md`, and `MANUAL.md` as appropriate — see the Documentation section below for what each covers.
+
 ## Project Overview
 
 Move Anything is a framework for custom JavaScript and native DSP modules on Ableton Move hardware. It provides access to pads, encoders, buttons, display (128x64 1-bit), audio I/O, and MIDI via USB-A.
+
+## Code Style
+
+**C**: Snake_case for functions/variables. Prefix module manager functions with `mm_`, JS host bindings with `js_`. Log with descriptive prefixes (e.g., `mm:`, `host:`, `shim:`).
+
+**JavaScript**: `.mjs` for shared utilities (ES modules), `.js` for UI modules. Host-exposed functions use `snake_case` (e.g., `host_load_module`).
+
+**Naming**: Module IDs are lowercase hyphenated (`song-mode`). Parameter keys are lowercase underscored (`tail_bars`). LED color constants are PascalCase (`BrightRed`).
 
 ## Build Commands
 
@@ -18,6 +30,25 @@ Move Anything is a framework for custom JavaScript and native DSP modules on Abl
 ```
 
 Cross-compilation uses `${CROSS_PREFIX}gcc` for the Move's ARM architecture.
+
+**Deployment shortcut**: `./scripts/install.sh local --skip-modules --skip-confirmation` — never scp individual files; the install script handles setuid, symlinks, feature config, and service restart.
+
+## Testing
+
+No automated test suite. Testing is done manually on hardware. After deploying, enable the unified logger and check logs on device:
+
+```bash
+ssh ableton@move.local "touch /data/UserData/move-anything/debug_log_on"
+ssh ableton@move.local "tail -f /data/UserData/move-anything/debug.log"
+```
+
+See `docs/LOGGING.md` for the full unified logging guide. In JS use `console.log()` (auto-routed) or import from `shared/logger.mjs`. In C use `LOG_DEBUG("source", "msg")` etc. from `host/unified_log.h`.
+
+## Device Constraints
+
+**Never write to `/tmp` on the Move device.** The root filesystem (`/`) is tiny (~463MB) and nearly always 100% full. `/tmp` is on rootfs. Writing there **will** fill the disk and break things. Always use `/data/UserData/` which has ~49GB free.
+
+This applies to logs, recordings, temp files, test output — everything. Use paths under `/data/UserData/` (e.g., `/data/UserData/UserLibrary/Recordings/`). The unified logger already writes to `/data/UserData/move-anything/debug.log`.
 
 ## Architecture
 
@@ -58,6 +89,29 @@ Built-in modules (in main repo):
 - `chain` - Signal Chain for combining components
 - `controller` - MIDI Controller with 16 banks
 - `store` - Module Store for downloading external modules
+- `file-browser` - File/folder browser (tool)
+- `song-mode` - Song arranger for sequencing clips (tool)
+- `wav-player` - WAV file playback (tool, used by file browser)
+
+### JS Module Lifecycle
+
+Every UI module exports four functions via `globalThis`:
+
+```javascript
+globalThis.init = function() { }                        // Called once on load
+globalThis.tick = function() { }                        // Called ~44x/sec (128 frames @ 44.1kHz)
+globalThis.onMidiMessageInternal = function(data) { }   // Internal Move hardware MIDI
+globalThis.onMidiMessageExternal = function(data) { }   // External USB MIDI (overtake only)
+```
+
+`data` is a Uint8Array: `[status, cc/note, value]`. Always filter noise with `shouldFilterMessage(data)` from `input_filter.mjs`.
+
+Three module loading styles exist:
+- `host_load_module(id)` — Full load (DSP + UI), auto-calls `init()`
+- `host_load_ui_module(path)` — UI-only, caller captures globals and calls `init()` manually (used by Chain)
+- `shadow_load_ui_module(path)` — Overtake modules, deferred `init()` after LED clearing
+
+See `docs/API.md` for full display, LED, and MIDI API reference.
 
 ### Module Categorization
 
@@ -78,6 +132,7 @@ Valid component types:
 - `midi_fx` - MIDI processors
 - `utility` - Utility modules
 - `overtake` - Overtake modules (full UI control in shadow mode)
+- `tool` - Tool modules (accessed via Tools menu, e.g. File Browser, Song Mode)
 - `system` - System modules (Module Store), shown last
 
 The main menu automatically organizes modules by category, reading from each module's `component_type` field.
@@ -150,12 +205,26 @@ host_flush_display()          // Force immediate display update
 host_set_refresh_rate(hz)     // Set display refresh rate
 host_get_refresh_rate()       // Get current refresh rate
 
-// File system utilities (used by Module Store)
+// File system utilities
 host_file_exists(path)        // -> bool
 host_read_file(path)          // -> string or null
+host_write_file(path, content) // -> bool
 host_http_download(url, dest) // -> bool
 host_extract_tar(tarball, dir) // -> bool
+host_extract_tar_strip(tarball, dir, strip) // -> bool (with --strip-components)
+host_ensure_dir(path)         // -> bool (mkdir -p)
 host_remove_dir(path)         // -> bool
+
+// Tool module lifecycle
+host_exit_module()            // Exit tool module, return to tools menu
+
+// MIDI injection (simulate hardware input to Move firmware)
+move_midi_inject_to_move(packet) // [type, status, d1, d2]
+
+// Sampler (record audio to WAV)
+host_sampler_start(path)      // Start recording to WAV path
+host_sampler_stop()           // Stop recording
+host_sampler_is_recording()   // -> bool
 ```
 
 ### Host Volume Control
@@ -167,12 +236,19 @@ Modules can claim the volume knob for their own use by setting `"claims_master_k
 ### Shared JS Utilities
 
 Located in `src/shared/`:
-- `constants.mjs` - MIDI CC/note mappings
-- `input_filter.mjs` - Capacitive touch filtering
-- `midi_messages.mjs` - MIDI helpers
+- `constants.mjs` - MIDI CC/note mappings and LED colors
+- `input_filter.mjs` - Capacitive touch filtering, delta decoding, LED helpers
 - `move_display.mjs` - Display utilities
 - `menu_layout.mjs` - Title/list/footer menu layout helpers
+- `menu_render.mjs` - Menu rendering utilities
+- `menu_nav.mjs` - Menu navigation state
+- `menu_items.mjs` - Menu item types
+- `menu_stack.mjs` - Menu stack management
+- `screen_reader.mjs` - Screen reader announce/announceMenuItem/announceView helpers
 - `store_utils.mjs` - Module Store catalog fetching and install/remove functions
+- `filepath_browser.mjs` - File/folder browser component
+- `text_entry.mjs` - On-screen keyboard for text input
+- `sampler_overlay.mjs` - Quantized sampler UI overlay
 
 ## Move Hardware MIDI
 
@@ -210,7 +286,10 @@ On-device layout:
     sound_generators/<id>/          # External sound generators
     audio_fx/<id>/                  # External audio effects
     midi_fx/<id>/                   # External MIDI effects
+    tools/<id>/                     # Tool modules (File Browser, Song Mode)
 ```
+
+The device is accessed via SSH at `move.local` (e.g., `ssh ableton@move.local`).
 
 External modules are installed to category subdirectories based on their `component_type`.
 
@@ -359,7 +438,10 @@ Shadow Mode runs custom signal chains alongside stock Move. The shim intercepts 
 - **Shift+Vol+Track 1-4**: Open shadow mode / jump to slot settings (works from Move or Shadow UI)
 - **Shift+Vol+Menu**: Jump directly to Master FX settings
 - **Shift+Vol+Step2**: Open Global Settings
-- **Shift+Vol+Jog Click**: Exit overtake module (when in overtake mode)
+- **Shift+Vol+Step13**: Open Tools menu
+- **Shift+Vol+Jog Click**: Open Overtake menu (or exit overtake module)
+- **Shift+Sample**: Open Quantized Sampler
+- **Shift+Capture**: Skipback (save last 30 seconds)
 
 ### Quantized Sampler
 
@@ -367,13 +449,13 @@ Shadow Mode runs custom signal chains alongside stock Move. The shim intercepts 
 - Choose source: resample (including Move Everything synths), or Move Input (whatever is set in the regular sample flow)
 - Choose duration in bars (or until stopped). Uses MIDI clock to determine tempo, falling back to project tempo if not found.
 - Starts on a note event or pressing play
-- Recordings are saved to `Samples/Move Everything/`
+- Recordings are saved to `Samples/Move Everything/Resampler/YYYY-MM-DD/`
 
 Works for resampling your Move, including Move Everything synths, or a line-in source or microphone. You can use Move's built-in count-in for line-in recordings too.
 
 ### Skipback
 
-Shift+Capture writes the last 30 seconds of audio to disk. Uses the same source as the quantized sampler (resample or Move Input). Saved to `Samples/Move Everything/Skipback/`.
+Shift+Capture writes the last 30 seconds of audio to disk. Uses the same source as the quantized sampler (resample or Move Input). Saved to `Samples/Move Everything/Skipback/YYYY-MM-DD/`.
 
 ### Shadow Architecture
 
@@ -497,8 +579,10 @@ The Module Store (`store` module) downloads and installs external modules from G
       "author": "Your Name",
       "component_type": "sound_generator",
       "github_repo": "username/move-anything-mymodule",
+      "default_branch": "main",
       "asset_name": "mymodule-module.tar.gz",
-      "min_host_version": "0.1.0"
+      "min_host_version": "0.1.0",
+      "requires": "Optional: external assets needed (e.g. ROM files, .sf2 soundfonts)"
     }
   ]
 }
@@ -507,14 +591,42 @@ The Module Store (`store` module) downloads and installs external modules from G
 ### How the Store Works
 
 1. Fetches `module-catalog.json` and extracts `catalog.modules` array
-2. For each module, queries GitHub API for latest release
-3. Looks for asset matching `<module-id>-module.tar.gz`
-4. Compares release version to installed version
-5. Downloads and extracts tarball to category subdirectory (e.g., `modules/sound_generators/<id>/`)
+2. For each module, fetches `release.json` from the module's GitHub repo (on `default_branch`)
+3. Compares `release.json` version to installed version
+4. Downloads tarball from `release.json`'s `download_url`
+5. Extracts tarball to category subdirectory (e.g., `modules/sound_generators/<id>/`)
+
+### release.json
+
+Each module repo must have a `release.json` on its main branch. The Module Store reads this to determine the latest version and download URL. The release workflow should auto-update this file on each tagged release.
+
+```json
+{
+  "version": "0.2.0",
+  "download_url": "https://github.com/username/move-anything-mymodule/releases/download/v0.2.0/mymodule-module.tar.gz"
+}
+```
+
+Optional fields: `install_path`, `name`, `description`, `requires`, `post_install`, `repo_url`.
+
+### Catalog Entry Fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `id` | Yes | Module ID (lowercase hyphenated) |
+| `name` | Yes | Display name |
+| `description` | Yes | Short description |
+| `author` | Yes | Author name |
+| `component_type` | Yes | `sound_generator`, `audio_fx`, `midi_fx`, `overtake`, `utility`, `tool` |
+| `github_repo` | Yes | GitHub `owner/repo` |
+| `default_branch` | Yes | Branch to fetch `release.json` from (usually `main`) |
+| `asset_name` | Yes | Expected tarball filename |
+| `min_host_version` | Yes | Minimum compatible host version |
+| `requires` | No | User-facing note about required external assets (e.g. ROM files, samples) |
 
 ### Adding a Module to the Catalog
 
-Edit `module-catalog.json` and add an entry to the `modules` array (see format above).
+Edit `module-catalog.json` and add an entry to the `modules` array (see format above). Ensure the module repo has a valid `release.json` on its main branch.
 
 ## External Module Development
 
@@ -586,6 +698,28 @@ jobs:
 The Module Store will see the new version within minutes.
 
 See `BUILDING.md` for detailed documentation.
+
+## Documentation
+
+Detailed documentation is in the `docs/` directory:
+- `docs/API.md` - Full JS API reference (display, MIDI, host functions, LED colors)
+- `docs/MODULES.md` - Module development guide (module.json, capabilities, tool_config, DSP plugin API, Signal Chain integration)
+- `docs/LOGGING.md` - Unified logging guide (enable/disable, JS and C APIs, log format)
+- `MANUAL.md` - User-facing manual (shortcuts, slots, recording, tools, modules)
+- `BUILDING.md` - Build system and cross-compilation
+
+## Release Checklist
+
+Before tagging a new host release:
+
+1. **Build**: `./scripts/build.sh` succeeds
+2. **Deploy and test**: `./scripts/install.sh local --skip-modules --skip-confirmation`, verify on hardware
+3. **Version**: Update `src/host/version.txt` and `module-catalog.json` (host latest_version + download URL)
+4. **Documentation**: Update `CLAUDE.md`, `MANUAL.md`, `docs/API.md`, `docs/MODULES.md` for any new features, APIs, or changed behavior
+5. **Help files**: Update `help.json` in any modified tool modules
+6. **Module catalog**: Update `min_host_version` for any modules that depend on new host features
+7. **Commit, tag, push**: `git tag v0.X.0 && git push --tags`
+8. **Release notes**: Add notes to the GitHub release via `gh release edit`
 
 ## Dependencies
 

@@ -27,9 +27,16 @@
 #define SHM_SHADOW_PARAM      "/move-shadow-param"        /* Shadow param requests */
 #define SHM_SHADOW_MIDI_OUT   "/move-shadow-midi-out"   /* MIDI output from shadow UI */
 #define SHM_SHADOW_MIDI_DSP   "/move-shadow-midi-dsp"   /* MIDI from shadow UI to DSP slots */
+#define SHM_SHADOW_MIDI_INJECT "/move-shadow-midi-inject" /* MIDI inject into Move's MIDI_IN */
 #define SHM_SHADOW_SCREENREADER "/move-shadow-screenreader" /* Screen reader announcements */
 #define SHM_SHADOW_OVERLAY  "/move-shadow-overlay"  /* Overlay state (sampler/skipback) */
 #define SHM_DISPLAY_LIVE    "/move-display-live"    /* Live display for remote viewer */
+
+/* ============================================================================
+ * Audio Constants
+ * ============================================================================ */
+
+#define FRAMES_PER_BLOCK 128    /* Audio frames per ioctl block */
 
 /* ============================================================================
  * Buffer Sizes
@@ -42,6 +49,7 @@
 #define SHADOW_PARAM_BUFFER_SIZE  65664  /* Large buffer for complex ui_hierarchy */
 #define SHADOW_MIDI_OUT_BUFFER_SIZE 512  /* MIDI out buffer from shadow UI (128 packets) */
 #define SHADOW_MIDI_DSP_BUFFER_SIZE 512  /* MIDI to DSP buffer from shadow UI (128 packets) */
+#define SHADOW_MIDI_INJECT_BUFFER_SIZE 256    /* MIDI inject buffer (64 packets) */
 #define SHADOW_SCREENREADER_BUFFER_SIZE 8448  /* Screen reader message buffer */
 #define SHADOW_OVERLAY_BUFFER_SIZE 256        /* Overlay state buffer */
 
@@ -67,6 +75,7 @@
 #define SHADOW_UI_FLAG_JUMP_TO_SCREENREADER 0x10 /* Jump to screen reader settings */
 #define SHADOW_UI_FLAG_SET_CHANGED 0x20           /* Set changed - reload slot state */
 #define SHADOW_UI_FLAG_JUMP_TO_SETTINGS 0x40     /* Jump to Global Settings */
+#define SHADOW_UI_FLAG_JUMP_TO_TOOLS 0x80        /* Jump to Tools menu */
 
 /* ============================================================================
  * Special Values
@@ -103,7 +112,7 @@ typedef struct shadow_control_t {
     volatile uint8_t tts_volume;      /* TTS volume (0-100) */
     volatile uint16_t tts_pitch;      /* TTS pitch in Hz (80-180) */
     volatile float tts_speed;         /* TTS speed multiplier (0.5-6.0) */
-    volatile uint8_t overlay_knobs_mode; /* 0=shift, 1=jog_touch, 2=off */
+    volatile uint8_t overlay_knobs_mode; /* 0=shift, 1=jog_touch, 2=off, 3=native */
     volatile uint8_t display_mirror;     /* 0=off, 1=on (stream display to browser) */
     volatile uint8_t tts_engine;         /* 0=espeak-ng, 1=flite */
     volatile uint8_t pin_challenge_active; /* 0=none, 1=challenge detected, 2=submitted */
@@ -112,7 +121,17 @@ typedef struct shadow_control_t {
     volatile uint8_t overlay_rect_y;      /* Overlay rect top edge (pixels, 0-63) */
     volatile uint8_t overlay_rect_w;      /* Overlay rect width (pixels) */
     volatile uint8_t overlay_rect_h;      /* Overlay rect height (pixels) */
-    volatile uint8_t reserved[23];
+    volatile uint16_t tts_debounce_ms;   /* Screen reader debounce in ms (0-1000, default 300) */
+    volatile uint8_t set_pages_enabled;  /* 0=off, 1=on (Shift+Vol+Left/Right page switching) */
+    volatile uint8_t skip_led_clear;     /* 1=don't clear LEDs on overtake entry, restore snapshot instead */
+    volatile uint8_t move_ui_mode;       /* Move's UI mode: 0=unknown, 1=session, 2=note, 3=set_overview */
+    volatile uint8_t sampler_cmd;        /* 0=none, 1=start (path in file), 2=stop */
+    volatile uint8_t sampler_state_val;  /* Mirrors sampler_state_t: 0=idle,1=armed,2=recording,3=preroll */
+    volatile uint8_t mute_move_audio;   /* 1=zero Move's audio output (for silent clip switching) */
+    volatile uint8_t sampler_ext_stop;  /* 1=sampler ignores MIDI Stop, only explicit stop works */
+    volatile uint8_t wake_slots;       /* 1=clear all slot idle flags (auto-clears after read) */
+    volatile uint8_t skipback_require_volume; /* 0=Shift+Capture, 1=Shift+Vol+Capture */
+    volatile uint8_t reserved[11];
 } shadow_control_t;
 
 /*
@@ -124,7 +143,7 @@ typedef struct shadow_ui_state_t {
     uint8_t slot_count;
     uint8_t reserved[3];
     uint8_t slot_channels[SHADOW_UI_SLOTS];      /* 0=all, 1-16=specific channel */
-    uint8_t slot_volumes[SHADOW_UI_SLOTS];       /* 0-100 percentage */
+    uint16_t slot_volumes[SHADOW_UI_SLOTS];      /* 0-400 percentage */
     int8_t slot_forward_ch[SHADOW_UI_SLOTS];     /* -2=passthrough, -1=auto, 0-15=channel */
     char slot_names[SHADOW_UI_SLOTS][SHADOW_UI_NAME_LEN];
 } shadow_ui_state_t;
@@ -170,6 +189,19 @@ typedef struct shadow_midi_dsp_t {
 } shadow_midi_dsp_t;
 
 /*
+ * MIDI Inject buffer structure.
+ * Used by Shadow UI (or external tools) to inject USB-MIDI packets into
+ * Move's MIDI_IN buffer, making Move process them as real hardware events.
+ * Packets are 4-byte USB-MIDI format (CIN/cable, status, data1, data2).
+ */
+typedef struct shadow_midi_inject_t {
+    volatile uint8_t write_idx;      /* Writer increments after writing */
+    volatile uint8_t ready;          /* Toggle to signal new data */
+    volatile uint8_t reserved[2];
+    uint8_t buffer[SHADOW_MIDI_INJECT_BUFFER_SIZE];  /* USB-MIDI packets (4 bytes each) */
+} shadow_midi_inject_t;
+
+/*
  * Screen reader message structure.
  * Supports both D-Bus announcements and on-device TTS.
  * Shadow UI writes text and updates fields, shim reads and processes.
@@ -188,10 +220,12 @@ typedef struct shadow_screenreader_t {
 #define SHADOW_OVERLAY_SAMPLER    1
 #define SHADOW_OVERLAY_SKIPBACK   2
 #define SHADOW_OVERLAY_SHIFT_KNOB 3
+#define SHADOW_OVERLAY_SET_PAGE   4
 
 #define SHADOW_SAMPLER_IDLE       0
 #define SHADOW_SAMPLER_ARMED      1
 #define SHADOW_SAMPLER_RECORDING  2
+#define SHADOW_SAMPLER_PREROLL    3
 
 /*
  * Overlay state structure for communication from shim to shadow UI.
@@ -222,6 +256,7 @@ typedef struct shadow_overlay_state_t {
     volatile uint32_t sampler_fallback_blocks;
     volatile uint32_t sampler_fallback_target;
     volatile uint8_t  sampler_clock_received;
+    volatile uint8_t  transport_playing;       /* 1 = MIDI Start seen, 0 = MIDI Stop seen */
 
     /* Shift+knob overlay */
     volatile uint8_t  shift_knob_active;        /* 1 = showing shift+knob overlay */
@@ -230,7 +265,23 @@ typedef struct shadow_overlay_state_t {
     char shift_knob_param[64];                  /* Parameter name */
     char shift_knob_value[32];                  /* Parameter value */
 
-    volatile uint8_t  reserved[256 - 208];  /* Pad to SHADOW_OVERLAY_BUFFER_SIZE */
+    /* Set page overlay */
+    volatile uint8_t  set_page_active;            /* 1 = showing set page toast */
+    volatile uint8_t  set_page_current;           /* Current page (0-7) */
+    volatile uint8_t  set_page_total;             /* Total pages (8) */
+    volatile uint8_t  set_page_loading;           /* 1 = loading (pre-restart), 0 = loaded */
+    volatile uint16_t set_page_timeout;           /* Frames remaining for toast */
+
+    /* Preroll state */
+    volatile uint8_t  sampler_preroll_enabled;    /* 0=off, 1=on */
+    volatile uint8_t  sampler_preroll_active;     /* 1 = currently in preroll countdown */
+    volatile uint16_t sampler_preroll_bars_done;  /* Bars completed in preroll */
+
+    volatile float    sampler_bpm;                /* Project BPM from MIDI clock or fallback */
+
+    /* Pad LED colors (notes 68-99, written by shim from Move's MIDI_OUT cache).
+     * Index 0 = note 68 (track 4 pad A), index 31 = note 99 (track 1 pad H). */
+    volatile uint8_t  pad_led_colors[32];  /* velocity/color for each pad */
 } shadow_overlay_state_t;
 
 /* Compile-time size checks */

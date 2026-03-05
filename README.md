@@ -8,6 +8,12 @@ Move Everything adds a Shadow UI that runs alongside stock Move, enabling additi
 
 Move Everything is based on the original Move Anything project by Bobby Digitales.
 
+## License
+
+CC BY-NC-SA 4.0 - See [LICENSE](LICENSE) and [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES)
+
+Move Everything would not be possible without the work of the [Move Anything](https://github.com/bobbydigitales/move-anything) project from which it is forked. 
+
 ## Important Notice
 
 This project is in no way approved, endorsed or supported by Ableton.
@@ -39,7 +45,7 @@ curl -L https://raw.githubusercontent.com/charlesvestal/move-anything/main/scrip
 
 **Screen reader only (accessible install):**
 ```bash
-curl -sL https://raw.githubusercontent.com/charlesvestal/move-anything/main/scripts/install.sh | sh -s -- --enable-screen-reader --disable-shadow-ui --disable-standalone
+curl -sL https://raw.githubusercontent.com/charlesvestal/move-anything/main/scripts/install.sh | sh -s -- --enable-screen-reader --disable-shadow-ui
 ```
 _Note: Uses `-sL` (silent) for minimal output, suitable for screen readers._
 
@@ -55,7 +61,7 @@ The installer will:
 ./scripts/install.sh local --enable-screen-reader
 
 # Install only screen reader, without UI features
-./scripts/install.sh --enable-screen-reader --disable-shadow-ui --disable-standalone
+./scripts/install.sh --enable-screen-reader --disable-shadow-ui
 
 # Skip module installation prompt
 ./scripts/install.sh --skip-modules
@@ -71,15 +77,21 @@ For troubleshooting and manual setup, see [MANUAL.md](MANUAL.md).
 curl -L https://raw.githubusercontent.com/charlesvestal/move-anything/main/scripts/uninstall.sh | sh
 ```
 
+By default, uninstall exports inactive Set Pages backups to `/data/UserData/UserLibrary/Move Everything Backups/Set Pages/` before removing Move Everything.
+
+To permanently delete Move Anything data instead of exporting a backup:
+
+```bash
+curl -L https://raw.githubusercontent.com/charlesvestal/move-anything/main/scripts/uninstall.sh | sh -s -- --purge-data
+```
+
 ## Modes
 
 - **Shadow UI**: Runs custom signal chains alongside stock Move so you can layer additional synths and effects. Use Shift+Vol+Track (and +Menu) to access these signal chain slots.
 - **Overtake modules**: Full-screen modules that temporarily take over the Move UI (e.g., MIDI controller apps). Use Shift+Vol+Jog click to access overtake modules.
-- **Quantized Sampler**: Shift+Sample opens a sampler that records to `Samples/Move Everything/`. Choose resample (including Move Everything synths) or Move Input, set duration in bars, and recording starts on a note event or pressing play.
-- **Skipback**: Shift+Capture writes the last 30 seconds of audio to `Samples/Move Everything/Skipback/`.
+- **Quantized Sampler**: Shift+Sample opens a sampler that records to `Samples/Move Everything/Resampler/YYYY-MM-DD/`. Choose resample (including Move Everything synths) or Move Input, set duration in bars, and recording starts on a note event or pressing play.
+- **Skipback**: Shift+Capture writes the last 30 seconds of audio to `Samples/Move Everything/Skipback/YYYY-MM-DD/`.
 - **Screen Reader**: Optional TTS announcements for accessibility. Toggle via Shadow UI settings, or Shift+Menu when Shadow UI is disabled.
-- **Standalone**: Runs Move Everything without the stock app, including the Module Store. Use Shift+Vol+Knob 8 to access Standalone mode.
-
 In **Global Settings > Display > Overlay Knobs**, you can change the knob overlay trigger between `+Shift` (default), `+Jog Touch`, or `Off`. If `Shift+Knob` interferes with native Move actions (like fine control), use `+Jog Touch` or `Off`.
 
 Usage details, shortcuts, and workflows are documented in [MANUAL.md](MANUAL.md).
@@ -118,19 +130,18 @@ If monitoring is on (or source/routing is configured differently), audio feedbac
 **Sound Generators:**
 - [move-anything-airplay](https://github.com/charlesvestal/move-anything-airplay) - AirPlay audio receiver
 - [move-anything-braids](https://github.com/charlesvestal/move-anything-braids) - Mutable Instruments macro oscillator
-- [move-anything-bristol](https://github.com/charlesvestal/move-anything-bristol) - Bristol Minimoog-style synthesizer
 - [move-anything-chiptune](https://github.com/charlesvestal/move-anything-chiptune) - NES and Game Boy chiptune synthesizer
-- [move-anything-rings](https://github.com/charlesvestal/move-anything-rings) - Mutable Instruments resonator
 - [move-anything-clap](https://github.com/charlesvestal/move-anything-clap) - CLAP plugin host
 - [move-anything-dx7](https://github.com/charlesvestal/move-anything-dx7) - Yamaha DX7 FM synthesizer
 - [move-anything-hera](https://github.com/charlesvestal/move-anything-hera) - Juno-60 emulation
+- [move-anything-hush1](https://github.com/charlesvestal/move-anything-hush1) - HUSH ONE monophonic SH-101-style synthesizer
 - [move-anything-jv880](https://github.com/charlesvestal/move-anything-jv880) - Roland JV-880 emulator
 - [move-anything-moog](https://github.com/charlesvestal/move-anything-moog) - RaffoSynth (Moog ladder filter)
+- [move-anything-nusaw](https://github.com/charlesvestal/move-anything-nusaw) - NuSaw polyphonic detuned supersaw synthesizer
 - [move-anything-obxd](https://github.com/charlesvestal/move-anything-obxd) - Oberheim OB-X emulator
 - [move-anything-radiogarden](https://github.com/charlesvestal/move-anything-radiogarden) - Live radio streaming synthesizer
 - [move-anything-rex](https://github.com/charlesvestal/move-anything-rex) - ReCycle loop slice player (.rx2/.rex)
 - [move-anything-sf2](https://github.com/charlesvestal/move-anything-sf2) - SoundFont synthesizer
-- [move-anything-sh101](https://github.com/charlesvestal/move-anything-sh101) - SH-101 style monophonic synthesizer
 - [move-anything-surge](https://github.com/charlesvestal/move-anything-surge) - Surge XT hybrid synthesizer
 - [move-anything-virus](https://github.com/charlesvestal/move-anything-virus) - Access Virus emulator (Osirus/Gearmulator)
 - [move-anything-webstream](https://github.com/charlesvestal/move-anything-webstream) - Web audio search and streaming generator
@@ -147,7 +158,11 @@ If monitoring is on (or source/routing is configured differently), audio feedbac
 - [move-anything-tapescam](https://github.com/charlesvestal/move-anything-tapescam) - Tape saturation
 - [move-anything-vocoder](https://github.com/charlesvestal/move-anything-vocoder) - Channel vocoder (line-in/mic modulator)
 
+**MIDI FX:**
+- [move-anything-superarp](https://github.com/handcraftedcc/move-anything-superarp) - Super Arp advanced arpeggiator (community)
+
 **Overtake/Utilities:**
+- [move-anything-control](https://github.com/chaolue/move-anything-control) - Custom MIDI controller (community)
 - [move-anything-m8](https://github.com/charlesvestal/move-anything-m8) - Dirtywave M8 Launchpad Pro emulator
 - [move-anything-seqomd](https://github.com/charlesvestal/move-anything-seqomd) - 16-track MIDI step sequencer
 - [move-anything-sidcontrol](https://github.com/charlesvestal/move-anything-sidcontrol) - SIDaster III controller
@@ -157,9 +172,6 @@ If monitoring is on (or source/routing is configured differently), audio feedbac
 - Discord: [https://discord.gg/Zn33eRvTyK](https://discord.gg/Zn33eRvTyK)
 - Contributors: @talktogreg, @impbox, @deets, @bobbyd, @chaolue, @charlesvestal
 
-## License
-
-CC BY-NC-SA 4.0 - See [LICENSE](LICENSE) and [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES)
 
 ## AI Assistance Disclaimer
 

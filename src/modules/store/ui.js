@@ -98,9 +98,29 @@ const CC_DOWN = MoveDown;
 
 /* compareVersions, isNewerVersion, fetchReleaseJson imported from store_utils.mjs */
 
+const VERSION_CACHE_PATH = `${BASE_DIR}/tmp/version_cache.json`;
+
+/* Load cached version info from previous successful fetches */
+function loadVersionCache() {
+    try {
+        const jsonStr = std.loadFile(VERSION_CACHE_PATH);
+        if (jsonStr) return JSON.parse(jsonStr);
+    } catch (e) { /* ignore */ }
+    return {};
+}
+
+/* Save version cache after fetches */
+function saveVersionCache(cache) {
+    try {
+        host_write_file(VERSION_CACHE_PATH, JSON.stringify(cache));
+    } catch (e) { /* ignore */ }
+}
+
 /* Fetch release info for all modules in catalog */
 function fetchAllReleaseInfo() {
     if (!catalog) return;
+
+    const versionCache = loadVersionCache();
 
     /* Fetch host release info */
     if (catalog.host && catalog.host.github_repo) {
@@ -118,6 +138,18 @@ function fetchAllReleaseInfo() {
         }
     }
 
+    /* Set fallback download URLs and apply cached versions for all modules upfront */
+    if (catalog.modules) {
+        for (const mod of catalog.modules) {
+            if (mod.github_repo && mod.asset_name && !mod.download_url) {
+                mod.download_url = `https://github.com/${mod.github_repo}/releases/latest/download/${mod.asset_name}`;
+            }
+            if (!mod.latest_version && versionCache[mod.id]) {
+                mod.latest_version = versionCache[mod.id];
+            }
+        }
+    }
+
     /* Fetch module release info */
     if (catalog.modules) {
         for (let i = 0; i < catalog.modules.length; i++) {
@@ -128,20 +160,22 @@ function fetchAllReleaseInfo() {
                 draw();
                 host_flush_display();
 
-                const release = fetchReleaseJson(mod.github_repo);
+                const release = fetchReleaseJson(mod.github_repo, mod.id, mod.default_branch);
                 if (release) {
                     mod.latest_version = release.version;
                     mod.download_url = release.download_url;
                     mod.install_path = release.install_path;
+                    versionCache[mod.id] = release.version;
                     console.log(`${mod.id} latest: ${release.version}`);
                 } else {
-                    /* Fallback: module has no release.json yet */
-                    mod.latest_version = '0.0.0';
-                    mod.download_url = null;
+                    console.log(`${mod.id}: fetch failed, using ${mod.latest_version || '?'}`);
+                    if (!mod.latest_version) mod.latest_version = '?';
                 }
             }
         }
     }
+
+    saveVersionCache(versionCache);
 }
 
 /* Get current host version - wrapper that updates global state */
@@ -662,7 +696,7 @@ function drawCategories() {
         getValue: (item) => item.value
     });
 
-    drawMenuFooter('Back:exit  Jog:browse');
+    drawMenuFooter({left: "Back: exit", right: "Jog: browse"});
 }
 
 /* Draw host update confirmation screen */
@@ -681,7 +715,7 @@ function drawHostUpdate() {
     fill_rect(2, y - 1, 70, 12, 1);
     print(4, y, '[Update Now]', 0);
 
-    drawMenuFooter('Back:cancel');
+    drawMenuFooter('Back: cancel');
 }
 
 /* Draw update all screen - scrollable list of modules + Update All action */
@@ -716,7 +750,7 @@ function drawUpdateAll() {
         getValue: (item) => item.value
     });
 
-    drawMenuFooter('Back:cancel  Jog:select');
+    drawMenuFooter({left: "Back: cancel", right: "Jog: select"});
 }
 
 /* Draw module list screen */
@@ -728,7 +762,7 @@ function drawModuleList() {
 
     if (modules.length === 0) {
         print(2, 30, 'No modules available', 1);
-        drawMenuFooter('Back:categories');
+        drawMenuFooter('Back: categories');
         return;
     }
 
@@ -753,7 +787,7 @@ function drawModuleList() {
         getValue: (item) => item.statusIcon
     });
 
-    drawMenuFooter('Back:categories');
+    drawMenuFooter('Back: categories');
 }
 
 /* Build scrollable lines from release notes text */

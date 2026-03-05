@@ -71,7 +71,28 @@ for keys anywhere in `module.json`).
 | `raw_midi` | Skip host MIDI transforms (velocity curve, aftertouch filter); module may also bypass internal MIDI filters when set |
 | `raw_ui` | Module owns UI input handling; host won't intercept Back to return to menu (use `host_return_to_menu()` to exit) |
 | `chainable` | Marks a module as usable inside Signal Chain patches (metadata) |
-| `component_type` | Module category: `sound_generator`, `audio_fx`, `midi_fx`, `utility`, `system`, `featured`, or `overtake` |
+| `skip_led_clear` | Host skips clearing LEDs on module load/unload — preserves Move's native pad colors (useful for modules that overlay highlights on existing clip colors) |
+| `component_type` | Module category: `sound_generator`, `audio_fx`, `midi_fx`, `utility`, `system`, `featured`, `overtake`, or `tool` |
+
+### Tool Config
+
+Tool modules (`"component_type": "tool"`) appear in the Tools menu and support additional options via `tool_config`:
+
+```json
+{
+    "tool_config": {
+        "interactive": true,
+        "skip_file_browser": true
+    }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `interactive` | Tool takes over the UI (like an overtake module) rather than running headlessly |
+| `skip_file_browser` | Tool does not use the file browser on launch (goes straight to its own UI) |
+
+Interactive tools use `host_exit_module()` to return to the tools menu when the user presses Back.
 
 ### Defaults
 
@@ -646,6 +667,52 @@ int get_param(void *instance, const char *key, char *buf, int buf_len) {
 | `int` | `min`, `max`, `default`/`value` | Integer value |
 | `float` | `min`, `max`, `default`/`value` | Float value |
 | `enum` | `options`, `default`/`value` | List of string options |
+| `filepath` | `root`, `start_path`, `filter`, `default`/`value` | Opens Shadow UI file browser and stores selected path |
+
+#### `filepath` in module.json
+
+Use `type: "filepath"` in `capabilities.chain_params` to let Shadow UI open a reusable file browser.
+
+```json
+{
+  "capabilities": {
+    "chain_params": [
+      {
+        "key": "sample_file",
+        "name": "Sample File",
+        "type": "filepath",
+        "root": "/data/UserData",
+        "start_path": "/data/UserData/UserLibrary/Samples",
+        "filter": ".wav",
+        "default": ""
+      }
+    ]
+  }
+}
+```
+
+`filepath` fields:
+
+- `key` (required): Parameter key passed to `set_param`.
+- `name` (required): Label shown in Shadow UI.
+- `type` (required): Must be `"filepath"`.
+- `root` (optional, recommended): Absolute folder where browsing starts and is constrained.
+- `start_path` (optional): Absolute folder or file path used as the initial location when current value is empty.
+- `filter` (optional): File extension filter as a string or array, for example `".wav"` or `[".wav", ".aif"]`.
+- `live_preview` (optional): When true, moving the file-browser cursor over files temporarily sets the parameter to that file until the user confirms or cancels.
+- `browser_hooks` (optional): Event hooks to run additional parameter writes at browser lifecycle points. Supported keys: `on_open`, `on_preview`, `on_cancel`, `on_commit`.
+- `default` or `value` (optional): Initial absolute path. If the path exists and is inside `root`, the browser opens to the parent folder and highlights the file.
+
+Behavior notes:
+
+- Selected files are stored as absolute paths.
+- Initial browser location priority is: current/default value, then `start_path`, then `root`.
+- If the chosen start location is missing, invalid, or outside `root`, the browser falls back to `root`.
+- With `live_preview: true`, preview changes are temporary: Back cancels and restores the original value, Click commits the highlighted file.
+- `browser_hooks` action format is `{ "key": "<param>", "value": "<string>", "restore": true|false }`. Non-prefixed keys are resolved against the active component prefix.
+- `browser_hooks` supports value placeholders: `$path`/`$selected_path` and `$filename`/`$selected_filename`.
+- For pad samplers, you can suspend auto-pad switching while browsing by adding `{"key":"ui_auto_select_pad","value":"off","restore":true}` to `browser_hooks.on_open`.
+- Example user sample file path: `/data/UserData/UserLibrary/Samples/Drums/Kick01.wav`.
 
 These map to knobs 1-8 in the Shadow UI for quick access.
 
@@ -664,6 +731,7 @@ Import path from modules: `../../shared/<file>.mjs`
 | `menu_layout.mjs` | Title/list/footer menu layout helpers |
 | `text_scroll.mjs` | Marquee scrolling for long text |
 | `move_display.mjs` | Display utilities |
+| `filepath_browser.mjs` | Reusable filesystem browser helpers for `chain_params` type `filepath` |
 
 ### Common Imports
 
@@ -703,6 +771,117 @@ For native code, shared headers are in `src/host/`:
 | `shadow_constants.h` | Shadow mode shared memory names, buffer sizes, control structures |
 | `plugin_api_v1.h` | DSP plugin interface |
 | `audio_fx_api_v2.h` | Audio effects plugin interface |
+
+## Help Content (help.json)
+
+Modules can provide on-device help accessible from the Shadow UI's Help viewer (Shift+Vol+Menu → Help). Add a `help.json` file to your module's source directory.
+
+### File Location
+
+```
+src/modules/your-module/
+  module.json
+  ui.js
+  help.json          # Help content for the Help viewer
+```
+
+The host scans all installed module directories for `help.json` at runtime. Module help topics appear alphabetically in the "Modules" section of the Help viewer.
+
+### Format
+
+Help content is a tree of sections and leaf topics:
+
+```json
+{
+  "title": "Your Module",
+  "children": [
+    {
+      "title": "Overview",
+      "lines": [
+        "Brief description",
+        "of your module.",
+        "",
+        "Second paragraph",
+        "with more detail."
+      ]
+    },
+    {
+      "title": "Controls",
+      "children": [
+        {
+          "title": "Knob Mapping",
+          "lines": [
+            "Knob 1: Cutoff",
+            "Knob 2: Resonance",
+            "Knob 3: Attack",
+            "Knob 4: Release"
+          ]
+        },
+        {
+          "title": "Other Settings",
+          "lines": [
+            "Detail about other",
+            "settings here."
+          ]
+        }
+      ]
+    },
+    {
+      "title": "MIDI",
+      "lines": [
+        "MIDI behavior",
+        "description."
+      ]
+    }
+  ]
+}
+```
+
+### Node Types
+
+| Type | Fields | Description |
+|------|--------|-------------|
+| Branch | `title`, `children` | Navigable folder (shows as a list) |
+| Leaf | `title`, `lines` | Scrollable text content |
+
+- **Branch nodes** have a `children` array of other branch or leaf nodes. Nesting depth is unlimited.
+- **Leaf nodes** have a `lines` array of strings displayed as scrollable text.
+
+### Text Formatting Rules
+
+The display is 128x64 pixels with a ~20 character line width. Pre-wrap your text accordingly:
+
+- Keep lines to **20 characters or fewer**
+- Use empty strings (`""`) for blank lines between paragraphs
+- Indent continuation lines with a leading space for readability:
+  ```json
+  "lines": [
+    "Knob 3: Contour",
+    " (filter env depth)"
+  ]
+  ```
+
+### Packaging
+
+Include `help.json` in your build script so it ends up in the distributed tarball:
+
+```bash
+# In scripts/build.sh, after copying other files to dist/<id>/
+[ -f src/help.json ] && cp src/help.json dist/<id>/help.json
+```
+
+The host discovers `help.json` automatically — no changes to `module.json` are needed.
+
+### Recommended Sections
+
+A typical module help file includes:
+
+| Section | Content |
+|---------|---------|
+| Overview | What the module does, key features |
+| Controls / Knob Mapping | Which knobs control which parameters |
+| MIDI | MIDI behavior, supported CCs, channel info |
+| Presets | List of factory presets (if applicable) |
 
 ## Example Modules
 
@@ -848,12 +1027,9 @@ Shadow Mode runs custom signal chains alongside stock Ableton Move. Your modules
 
 ### How It Works
 
-Shadow mode loads the same chain module and patches that Move Anything uses standalone. When you install a module via Module Store (or manually copy it to the modules directory), it becomes available to:
+Shadow mode loads the chain module and patches. When you install a module via Module Store (or manually copy it to the modules directory), it becomes available in Shadow Mode.
 
-1. **Standalone Move Anything** - when launched via the hotkey combo
-2. **Shadow Mode** - when toggled while stock Move is running
-
-Both modes read from the same directories:
+Modules and patches are read from:
 - Modules: `/data/UserData/move-anything/modules/`
 - Patches: `/data/UserData/move-anything/patches/`
 
@@ -1065,24 +1241,55 @@ function clearLedBatch() {
 ```
 
 **In your module (initialization):**
+
+Use the shared `setLED()` and `setButtonLED()` from `input_filter.mjs` — they provide caching (skip duplicate sends) and correct MIDI packet formatting:
+
 ```javascript
+import {
+    MoveBack, MoveCapture, MoveUndo, MoveLoop, MoveCopy, MoveMute, MoveDelete,
+    MovePads, White, DarkGrey,
+    WhiteLedDim, WhiteLedMedium, WhiteLedBright
+} from '/data/UserData/move-anything/shared/constants.mjs';
+
+import { setLED, setButtonLED } from '/data/UserData/move-anything/shared/input_filter.mjs';
+
 let ledInitPending = false;
 let ledInitIndex = 0;
 const LEDS_PER_FRAME = 8;
 
 globalThis.init = function() {
-    // Start progressive LED setup
     ledInitPending = true;
     ledInitIndex = 0;
 };
 
+function setupLedBatch() {
+    const leds = [];
+    // Button LEDs (CC-based) — use setButtonLED
+    leds.push({ type: 'cc', id: MoveBack, color: WhiteLedDim });
+    leds.push({ type: 'cc', id: MoveCapture, color: WhiteLedDim });
+    // Pad LEDs (note-based) — use setLED
+    for (const pad of MovePads) {
+        leds.push({ type: 'note', id: pad, color: DarkGrey });
+    }
+
+    const end = Math.min(ledInitIndex + LEDS_PER_FRAME, leds.length);
+    for (let i = ledInitIndex; i < end; i++) {
+        if (leds[i].type === 'cc') setButtonLED(leds[i].id, leds[i].color);
+        else setLED(leds[i].id, leds[i].color);
+    }
+    ledInitIndex = end;
+    if (ledInitIndex >= leds.length) ledInitPending = false;
+}
+
 globalThis.tick = function() {
     if (ledInitPending) {
-        setupLedBatch();  // Set 8 LEDs per frame
+        setupLedBatch();
     }
     drawUI();
 };
 ```
+
+**Important:** Always use the shared `setLED()` and `setButtonLED()` from `input_filter.mjs` rather than calling `move_midi_internal_send()` directly. The shared helpers handle LED caching and correct USB-MIDI cable byte formatting. Use absolute import paths (`/data/UserData/move-anything/shared/...`) for module location independence.
 
 ### LED Addresses
 
@@ -1176,8 +1383,10 @@ External modules can be distributed via the built-in Module Store. Users can bro
      "author": "Your Name",
      "component_type": "sound_generator",
      "github_repo": "username/move-anything-yourmodule",
+     "default_branch": "main",
      "asset_name": "your-module-module.tar.gz",
-     "min_host_version": "0.3.0"
+     "min_host_version": "0.3.0",
+     "requires": "Optional: external assets needed (e.g. sample files, ROMs)"
    }
    ```
 
@@ -1225,6 +1434,25 @@ jobs:
           files: ${{ github.event.repository.name }}-module.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update release.json
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          git fetch origin main
+          git checkout -f main
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          cat > release.json << EOF
+          {
+            "version": "${VERSION}",
+            "download_url": "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ github.event.repository.name }}-module.tar.gz"
+          }
+          EOF
+
+          git add release.json
+          git commit -m "chore: update release.json for ${{ github.ref_name }}" || echo "No changes to commit"
+          git push origin main
 ```
 
 ### Catalog Entry Schema (v2)
@@ -1237,14 +1465,50 @@ Each module in `module-catalog.json`:
   "name": "Display Name",
   "description": "Short description",
   "author": "Author Name",
-  "component_type": "sound_generator|audio_fx|overtake|utility",
+  "component_type": "sound_generator|audio_fx|midi_fx|overtake|utility|tool",
   "github_repo": "username/repo-name",
+  "default_branch": "main",
   "asset_name": "module-id-module.tar.gz",
-  "min_host_version": "0.3.0"
+  "min_host_version": "0.3.0",
+  "requires": "Optional: external assets needed (e.g. ROM files, .sf2 soundfonts)"
 }
 ```
 
-The Module Store fetches the latest release from the GitHub repo and looks for an asset matching `asset_name`.
+| Field | Required | Description |
+|-------|----------|-------------|
+| `id` | Yes | Module ID (lowercase hyphenated) |
+| `name` | Yes | Display name |
+| `description` | Yes | Short description |
+| `author` | Yes | Author name |
+| `component_type` | Yes | `sound_generator`, `audio_fx`, `midi_fx`, `overtake`, `utility`, `tool` |
+| `github_repo` | Yes | GitHub `owner/repo` |
+| `default_branch` | Yes | Branch to fetch `release.json` from (usually `main`) |
+| `asset_name` | Yes | Expected tarball filename |
+| `min_host_version` | Yes | Minimum compatible host version |
+| `requires` | No | User-facing note about required external assets |
+
+### release.json
+
+Each module repo must have a `release.json` on its main branch. The Module Store fetches this file (not the GitHub releases API) to determine the latest version and download URL.
+
+```json
+{
+  "version": "0.2.0",
+  "download_url": "https://github.com/username/move-anything-mymodule/releases/download/v0.2.0/mymodule-module.tar.gz"
+}
+```
+
+Optional fields: `install_path`, `name`, `description`, `requires`, `post_install`, `repo_url`. Fields like `name`, `description`, and `requires` in `release.json` override their catalog equivalents.
+
+The release workflow should auto-update `release.json` on each tagged release (see the workflow template above for an example).
+
+### How the Module Store Works
+
+1. Fetches `module-catalog.json` from the main branch
+2. For each module, fetches `release.json` from the module's GitHub repo (on `default_branch`)
+3. Compares `release.json` version to installed version
+4. Downloads tarball from `release.json`'s `download_url`
+5. Extracts tarball to category subdirectory (e.g., `modules/sound_generators/<id>/`)
 
 ### Component Types
 
@@ -1297,13 +1561,14 @@ The Move Anything host can also be updated via the Module Store. When an update 
    git push
    ```
 
-### How Updates Work
+### How Host Updates Work
 
 1. Module Store fetches `module-catalog.json` from the main branch
-2. Compares `host.latest_version` to installed version in `/data/UserData/move-anything/host/version.txt`
-3. If different, shows "Update Host" option with version numbers
-4. Update downloads the tarball and extracts over the existing installation
-5. User must restart Move Anything for changes to take effect
+2. Fetches `release.json` from the host repo for the latest version and download URL
+3. Compares to installed version in `/data/UserData/move-anything/host/version.txt`
+4. If different, shows "Update Host" option with version numbers
+5. Update downloads the tarball and extracts over the existing installation
+6. User must restart Move Anything for changes to take effect
 
 ### Catalog Location
 

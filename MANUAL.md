@@ -41,18 +41,36 @@ After installation, Move will restart automatically.
 
 ---
 
+## Uninstall
+
+Run:
+```
+curl -L https://raw.githubusercontent.com/charlesvestal/move-anything/main/scripts/uninstall.sh | sh
+```
+
+By default, uninstall exports inactive Set Pages backups to `/data/UserData/UserLibrary/Move Everything Backups/Set Pages/` before removing Move Everything.
+
+To skip that export and permanently delete Move Anything data:
+```
+curl -L https://raw.githubusercontent.com/charlesvestal/move-anything/main/scripts/uninstall.sh | sh -s -- --purge-data
+```
+
+---
+
 ## Shortcuts
 
 All shortcuts use **Shift + touch Volume knob** as a modifier:
 
 | Shortcut | Action |
 |----------|--------|
-| **Shift+Vol + Track 1-4** | Open that slot's editor |
-| **Shift+Vol + Menu** | Open Master FX |
+| **Shift+Vol + Track 1-4**| Open that slot's editor |
+| **Shift+Vol + Note/Session** | Open Master FX |
 | **Shift+Vol + Step 2** | Open Global Settings |
+| **Shift+Vol + Step 13** | Open Tools Menu |
 | **Shift+Vol + Jog Click** | Open Overtake menu (or exit Overtake mode) |
 | **Shift+Sample** | Open Quantized Sampler |
 | **Shift+Capture** | Skipback (save last 30 seconds) |
+| **Shift+Vol + Left/Right** | Switch set page (when enabled) |
 
 **Tip:** You can access slots directly from normal Move mode - you don't need to be in shadow mode first.
 
@@ -137,6 +155,38 @@ Each Move Set maintains its own independent slot configurations. When you switch
 
 ---
 
+## Set Pages
+
+Set Pages let you organize your sets into 8 switchable pages. Each page holds its own collection of sets, so you can group sets by project, genre, or live performance.
+
+### Usage
+
+- **Shift+Vol+Left**: Switch to the previous page
+- **Shift+Vol+Right**: Switch to the next page
+
+A toast overlay shows "Loading Page X/8..." during the switch. Move restarts automatically to load the new page's sets.
+
+### How It Works
+
+When you switch pages, Move Everything:
+1. Saves the current set (if dirty)
+2. Moves all sets from `Sets/` into a stash directory for the current page
+3. Moves the target page's sets from its stash into `Sets/`
+4. Restarts Move to load the new sets
+
+Each page's sets are completely independent. Per-set slot state (synths, effects, settings) is preserved per-set as usual.
+
+### Settings
+
+Set Pages is **enabled by default**. To disable:
+1. Open **Global Settings** (**Shift+Vol + Step 2**)
+2. Navigate to **Set Pages**
+3. Toggle **Set Pages** to **Off**
+
+The setting takes effect immediately (no restart needed) and persists across reboots.
+
+---
+
 ## Connecting to Move Tracks
 
 1. Set a Move track's **MIDI Out** to a channel (1-4)
@@ -147,13 +197,15 @@ Each Move Set maintains its own independent slot configurations. When you switch
 
 Move Everything also forwards pitch bend, mod wheel, sustain, and other CCs from external MIDI controllers.
 
+**Tip:** Some synths and FX (i.e. Arp) utilize Midi Cloc for tempo sync. Make sure your Move is set to "Midi Clock: Out" for these to pick up sync correctly. 
+
 ---
 
 ## Master FX
 
-Access via **Shift+Vol + Menu**. Contains four audio effect slots that process the mixed output of all instrument slots.
+Access via **Shift+Vol + Note/Session**. Contains four audio effect slots that process the mixed output of all instrument slots.
 
-Global settings (Link Audio, Resample Src, Mirror Display, Screen Reader, Help, Updates) are accessed via **Shift+Vol + Step 2**.
+Global settings (Link Audio, Sample Src, Mirror Display, Screen Reader, Set Pages, Help, Updates) are accessed via **Shift+Vol + Step 2**.
 
 ---
 
@@ -221,15 +273,15 @@ ME Slot 2 (synth → FX) ────────────────│
 
 Move Everything audio can be fed into Move's native sampler for resampling.
 
-In **Global Settings > Audio**, `Resample Src` controls this:
+In **Global Settings > Audio**, `Sample Src` controls this:
 
 | Option | Behavior |
 |--------|----------|
-| **Off** | Disabled (default) |
-| **Replace** | Replaces native sampler input with Move Everything master output |
+| **Native** | Disabled — sampler uses Move's normal input (default) |
+| **ME Mix** | Replaces native sampler input with Move Everything master output |
 
 Recommended setup to avoid feedback:
-1. Set `Resample Src` to **Replace**
+1. Set `Sample Src` to **ME Mix**
 2. In native Move Sampler, set source to **Line In**
 3. Set monitoring to **Off**
 
@@ -253,7 +305,7 @@ Access via **Shift+Sample**. Records Move's audio output (including Move Everyth
 3. Recording starts on a note event or pressing Play
 4. Press **Shift+Sample** again to stop (or it stops automatically at the set duration)
 
-Recordings are saved to `Samples/Move Everything/`.
+Recordings are saved to `Samples/Move Everything/Resampler/YYYY-MM-DD/`.
 
 Uses MIDI clock for accurate bar timing, falling back to project tempo if no clock is available. You can also use Move's built-in count-in for line-in recordings.
 
@@ -263,7 +315,7 @@ Press **Shift+Capture** to save the last 30 seconds of audio to disk.
 
 Move Everything continuously maintains a 30-second rolling buffer of audio. When triggered, it dumps this buffer to a WAV file instantly without interrupting playback.
 
-Files are saved to `Samples/Move Everything/Skipback/`. Uses the same source setting as the Quantized Sampler (Resample or Move Input).
+Files are saved to `Samples/Move Everything/Skipback/YYYY-MM-DD/`. Uses the same source setting as the Quantized Sampler (Resample or Move Input).
 
 ---
 
@@ -273,9 +325,13 @@ Files are saved to `Samples/Move Everything/Skipback/`. Uses the same source set
 
 These modules are included with Move Everything:
 
+**Sound Generators:**
+- **Line In** - Line input with conditioning for Line, Guitar, and Phono sources
+
 **MIDI FX:**
 - **Chords** - Chord generator with shapes, inversions, voicing, and strum
 - **Arpeggiator** - Pattern-based arpeggiator (up, down, up/down, random)
+- **Velocity Scale** - Scales MIDI velocity to a configurable min/max range
 
 **Audio FX:**
 - **Freeverb** - Simple, effective reverb
@@ -285,34 +341,47 @@ These modules are included with Move Everything:
 
 ### Module Store
 
-When selecting a module, "[Get more...]" opens the Module Store to download additional modules. To update Move Everything itself, access Module Store via Settings (**Shift+Vol + Knob 2**), then select Updates -> Module Store.
+When selecting a module, "[Get more...]" opens the Module Store to download additional modules. To update Move Everything itself, access Module Store via **Global Settings > Updates** (**Shift+Vol + Step 2**).
 
 **Sound Generators:**
+- **AirPlay** - AirPlay audio receiver (stream from iPhone, iPad, or Mac)
 - **Braids** - Mutable Instruments macro oscillator (47 algorithms)
+- **Chiptune** - NES 2A03 & Game Boy DMG chiptune synthesizer
 - **Dexed** - 6-operator FM synthesizer (DX7 compatible)
-- **SF2** - SoundFont player (requires .sf2 files)
+- **Hera** - Juno-60 emulation with BBD chorus
+- **HUSH ONE** - Monophonic SH-101-style subtractive synthesizer
 - **Mini-JV** - Roland JV-880 emulation (requires ROM files)
 - **OB-Xd** - Oberheim-style virtual analog
-- **Hera** - Juno-60 emulation with BBD chorus
-- **Surge XT** - Hybrid synthesizer (wavetable, FM, subtractive, physical modeling)
+- **Osirus** - Access Virus DSP56300 emulator (requires ROM file)
+- **Radio Garden** - Browse and stream live radio from 200 cities worldwide
 - **RaffoSynth** - Monophonic synth with Moog ladder filter
+- **REX Player** - Propellerhead ReCycle (.rx2/.rex) slice player
+- **SF2** - SoundFont player (requires .sf2 files)
+- **Surge XT** - Hybrid synthesizer (wavetable, FM, subtractive, physical modeling)
 - **Webstream** - Web audio search and streaming
 
 **Audio Effects:**
+- **CLAP FX** - Host for CLAP audio effect plugins (requires .clap files)
 - **CloudSeed** - Algorithmic reverb
+- **Ducker** - MIDI-triggered sidechain ducker
+- **Gate** - Noise gate and downward expander
+- **Junologue Chorus** - Juno-60 chorus emulation (I, I+II, II modes)
+- **Key Detect** - Detects the musical key of audio passing through
+- **NAM** - Neural Amp Modeler (requires .nam model files)
 - **PSXVerb** - PlayStation-style reverb
 - **TapeDelay** - RE-201 Space Echo style delay
 - **TAPESCAM** - Tape saturation/degradation
-- **Junologue Chorus** - Juno-60 chorus emulation (I, I+II, II modes)
-- **NAM** - Neural Amp Modeler (requires .nam model files)
-- **Ducker** - MIDI-triggered sidechain ducker
+- **Vocoder** - Channel vocoder (mic/line-in as modulator)
+
+**MIDI FX:**
+- **Super Arp** - Advanced arpeggiator with progression patterns and rhythm presets
 
 **Overtake/Utility:**
-- **Four Track** - Four-track recorder
+- **Custom MIDI Control** - Custom MIDI controller with 16 banks (community)
 - **M8 LPP** - Launchpad Pro emulator for Dirtywave M8
 - **SID Control** - Controller for SIDaster III
 
-**Note:** Some modules require additional files (ROMs, SoundFonts, .nam models). Check each module's documentation.
+**Note:** Some modules require additional files (ROMs, SoundFonts, .nam models, .clap plugins). Check each module's documentation.
 
 ---
 
@@ -326,11 +395,77 @@ To exit an overtake module: **Shift+Vol + Jog Click** (works anytime)
 
 ---
 
+## Tools Menu
+
+Access via **Shift+Vol + Step 13**. Tools are standalone utilities that run outside the normal slot system.
+
+### File Browser
+
+Browse files and folders on your Move. Two starting roots:
+- **User Library**: Your samples, presets, and recordings
+- **System Files**: The Move Everything directory (shows a warning before entry)
+
+**Navigation:**
+- **Jog wheel**: Scroll through files and folders
+- **Jog click**: Open a folder, or show file actions for a file
+- **Shift+Jog click**: Show actions for any item (files or folders)
+- **Back**: Go up one directory or exit
+
+**File actions:** Play (WAV files), Duplicate, Rename, Delete, Copy to..., Move to..., New Folder (on directories).
+
+**Play:** Selecting Play on a .wav file starts audio preview through Move's speakers. A progress bar and time display are shown. Push jog or press back to stop.
+
+### Song Mode
+
+Sequence clips across time to build full songs from your set's clip layout.
+
+**How it works:** Song Mode reads your set's clips and tempo, then lets you arrange pad assignments into an ordered list of steps. Each step triggers all 4 tracks simultaneously, advancing automatically based on bar timing.
+
+**Building a song:**
+1. Select a step with the jog wheel or step buttons
+2. Tap pads to assign clips for each track
+3. The first pad press on an empty step copies the previous step, so you only change what differs
+4. Steps display track assignments as column letters (A-H)
+
+**Playback:**
+- **Play**: Start from current step
+- **Shift+Play**: Start from beginning
+- **Play again**: Stop (returns to where playback started)
+
+**Recording:**
+- **Rec**: Record audio from current step
+- **Shift+Rec**: Record from beginning
+- **Rec again**: Stop recording
+- Auto-stops after a configurable tail period (default 2 bars) to capture reverb/delay tails
+- **Tail setting**: Last menu item — jog click cycles through 0, 1, 2, 4, 8 bars
+- Files saved to `Recordings/Song Mode/` with set name in filename
+
+**Loop mode:** Press **Loop** to toggle. When on, playback wraps back to the first step after the last step ends. Shows `[L]` in the header. Disabled during recording.
+
+**Editing:**
+- **Hold step** or **Jog click** on a step: Edit repeat count (1, 2, 4, 8, 16, 32, 64 bars)
+- **Copy**: Duplicate selected step
+- **Delete**: Remove selected step
+- **Shift+Delete**: Clear entire song
+- **Shift+Up/Down**: Reorder steps
+- **Undo**: Restore previous state (up to 20 levels)
+
+**Navigation:**
+- **Jog wheel**: Scroll through steps
+- **Step buttons**: Select steps directly
+- **Left/Right**: Page through steps (16 per page)
+
+Step LEDs: green = has content, red = now playing, white = selected. Pad LEDs highlight the current step's assigned clips in red.
+
+**Persistence:** Song arrangements save automatically per set. Re-entering Song Mode for the same set restores your song.
+
+---
+
 ## Screen Reader
 
 Move Everything includes an optional screen reader for accessibility, using text-to-speech to announce UI elements.
 
-Toggle via **Global Settings > Screen Reader** (**Shift+Vol + Step 2**), or **Shift+Menu** when Shadow UI is disabled.
+Toggle via **Global Settings > Screen Reader** (**Shift+Vol + Step 2**), or **Shift+Note/Session** when Shadow UI is disabled.
 
 Settings:
 - **Speed**: 0.5x to 2.0x
@@ -371,7 +506,21 @@ If the screen reader is enabled, help pages are read aloud automatically when op
 
 ---
 
+## Mute and Solo
+
+You can mute and solo individual slots using the Mute button (next to the track buttons):
+
+| Shortcut | Action |
+|----------|--------|
+| **Mute + Track 1-4** | Toggle mute on that slot |
+| **Shift + Mute + Track 1-4** | Toggle solo on that slot |
+
+Muted slots are silenced but continue processing MIDI. Solo isolates a single slot.
+
+---
+
 ## Tips
 
 - Each Move Set has its own slot configurations — switch Sets to switch between different instrument setups
+- Use Set Pages to organize sets by project or performance — Shift+Vol+Left/Right to switch
 - If something goes wrong, use Move's DFU restore mode to reset

@@ -87,18 +87,94 @@ import {
 } from '/data/UserData/move-anything/shared/screen_reader.mjs';
 
 import {
+    fetchAndParseManual,
+    refreshManualBackground,
+    processDownloadedHtml
+} from '/data/UserData/move-anything/shared/parse_move_manual.mjs';
+
+import {
     OVERLAY_NONE,
     OVERLAY_SAMPLER,
     OVERLAY_SKIPBACK,
     OVERLAY_SHIFT_KNOB,
+    OVERLAY_SET_PAGE,
     drawSamplerOverlay,
     drawSkipbackToast,
     drawShiftKnobOverlay,
+    drawSetPageToast,
     SHIFT_KNOB_BOX_X,
     SHIFT_KNOB_BOX_Y,
     SHIFT_KNOB_BOX_W,
-    SHIFT_KNOB_BOX_H
+    SHIFT_KNOB_BOX_H,
+    SET_PAGE_BOX_X,
+    SET_PAGE_BOX_Y,
+    SET_PAGE_BOX_W,
+    SET_PAGE_BOX_H
 } from '/data/UserData/move-anything/shared/sampler_overlay.mjs';
+
+import {
+    buildFilepathBrowserState,
+    refreshFilepathBrowser,
+    moveFilepathBrowserSelection,
+    activateFilepathBrowserItem
+} from '/data/UserData/move-anything/shared/filepath_browser.mjs';
+
+/* Shared context for view modules */
+import { ctx as _ctx } from './shadow_ui_ctx.mjs';
+
+/* Extracted view modules */
+import {
+    SLOT_SETTINGS,
+    getSlotSettingValue,
+    drawSlots as _drawSlots,
+    drawSlotSettings as _drawSlotSettings,
+    enterSlotSettings as _enterSlotSettings,
+    handleSlotsJog, handleSlotSettingsJog,
+    handleSlotsSelect, handleSlotSettingsSelect,
+    handleSlotsBack, handleSlotSettingsBack
+} from './shadow_ui_slots.mjs';
+import {
+    PATCH_INDEX_NONE,
+    loadPatchList, findPatchIndexByName, findPatchByName,
+    applyPatchSelection as _applyPatchSelection,
+    drawPatches as _drawPatches,
+    drawPatchDetail as _drawPatchDetail,
+    drawComponentParams as _drawComponentParams,
+    enterPatchBrowser as _enterPatchBrowser,
+    enterPatchDetail as _enterPatchDetail,
+    enterComponentParams as _enterComponentParams,
+    handlePatchesJog, handlePatchDetailJog, handleComponentParamsJog,
+    handlePatchesSelect, handlePatchDetailSelect, handleComponentParamsSelect,
+    handlePatchesBack, handlePatchDetailBack, handleComponentParamsBack
+} from './shadow_ui_patches.mjs';
+import {
+    drawMasterFx as _drawMasterFx,
+    getMasterFxDisplayName as _getMasterFxDisplayName,
+    enterMasterFxSettings as _enterMasterFxSettings
+} from './shadow_ui_master_fx.mjs';
+import {
+    scanForToolModules as _scanForToolModules,
+    enterToolsMenu as _enterToolsMenu,
+    drawToolsMenu as _drawToolsMenu,
+    drawToolFileBrowser as _drawToolFileBrowser,
+    drawToolEngineSelect as _drawToolEngineSelect,
+    drawToolConfirm as _drawToolConfirm,
+    drawToolProcessing as _drawToolProcessing,
+    drawToolResult as _drawToolResult,
+    drawToolStemReview as _drawToolStemReview,
+    drawToolSetPicker as _drawToolSetPicker
+} from './shadow_ui_tools.mjs';
+import {
+    drawStorePickerCategories as _drawStorePickerCategories,
+    drawStorePickerList as _drawStorePickerList,
+    drawStorePickerLoading as _drawStorePickerLoading,
+    drawStorePickerResult as _drawStorePickerResult,
+    drawStorePickerDetail as _drawStorePickerDetail
+} from './shadow_ui_store.mjs';
+import {
+    drawChainSettings as _drawChainSettings,
+    drawGlobalSettings as _drawGlobalSettings
+} from './shadow_ui_settings.mjs';
 
 /* Track buttons - derive from imported constants */
 const TRACK_CC_START = MoveRow4;  // CC 40
@@ -113,11 +189,18 @@ const SHADOW_UI_FLAG_SAVE_STATE = 0x08;
 const SHADOW_UI_FLAG_JUMP_TO_SCREENREADER = 0x10;
 const SHADOW_UI_FLAG_SET_CHANGED = 0x20;
 const SHADOW_UI_FLAG_JUMP_TO_SETTINGS = 0x40;
+const SHADOW_UI_FLAG_JUMP_TO_TOOLS = 0x80;
 
 /* Knob CC range for parameter control */
 const KNOB_CC_START = MoveKnob1;  // CC 71
 const KNOB_CC_END = MoveKnob8;    // CC 78
 const NUM_KNOBS = 8;
+
+/* Overtake encoder accumulation — batch knob/jog deltas and flush once per tick.
+ * Without this, every encoder tick generates a separate IPC round-trip to the
+ * module, causing sluggish response when turning fast. */
+let overtakeKnobDelta = [0, 0, 0, 0, 0, 0, 0, 0];  // Accumulated delta per knob (CC 71-78)
+let overtakeJogDelta = 0;                             // Accumulated delta for jog wheel (CC 14)
 
 const CONFIG_PATH = "/data/UserData/move-anything/shadow_chain_config.json";
 const PATCH_DIR = "/data/UserData/move-anything/patches";
@@ -144,6 +227,7 @@ const VIEWS = {
     COMPONENT_EDIT: "compedit",  // Edit component (presets, params) via Shift+Click
     MASTER_FX: "masterfx",    // Master FX selection
     HIERARCHY_EDITOR: "hierarch", // Hierarchy-based parameter editor
+    FILEPATH_BROWSER: "filepathbrowser", // Generic filepath picker for filepath params
     KNOB_EDITOR: "knobedit",  // Edit knob assignments for a slot
     KNOB_PARAM_PICKER: "knobpick", // Pick parameter for a knob assignment
     STORE_PICKER_CATEGORIES: "storepickercats", // Store: browse categories
@@ -157,7 +241,15 @@ const VIEWS = {
     UPDATE_PROMPT: "updateprompt",    // Startup update prompt (updates available)
     UPDATE_DETAIL: "updatedetail",    // Detail view for a single update
     UPDATE_RESTART: "updaterestart",   // Restart prompt after core update
-    GLOBAL_SETTINGS: "globalsettings"  // Global settings menu (display, audio, etc.)
+    GLOBAL_SETTINGS: "globalsettings",  // Global settings menu (display, audio, etc.)
+    TOOLS: "tools",                     // Tools menu (Stem Separation, Timestretch)
+    TOOL_FILE_BROWSER: "toolfilebrowser",   // Browse directories/files for tool input
+    TOOL_CONFIRM: "toolconfirm",            // Confirm file selection before processing
+    TOOL_PROCESSING: "toolprocessing",      // Progress/status while tool runs
+    TOOL_RESULT: "toolresult",               // Success/failure result
+    TOOL_ENGINE_SELECT: "toolengineselect",  // Pick engine (e.g. 3-stem vs 4-stem)
+    TOOL_STEM_REVIEW: "toolstemreview",       // Review produced stems before saving
+    TOOL_SET_PICKER: "toolsetpicker"          // Browse sets for render tool
 };
 
 /* Special action key for swap module option */
@@ -196,9 +288,8 @@ let slots = [];
 let patches = [];
 let selectedSlot = 0;
 let selectedPatch = 0;
-let selectedDetailItem = 0;    // For patch detail view (0=synth, 1=fx1, 2=fx2, 3=load)
-let selectedSetting = 0;       // For slot settings view
-let editingSettingValue = false;
+/* selectedDetailItem moved to shadow_ui_patches.mjs */
+/* selectedSetting, editingSettingValue moved to shadow_ui_slots.mjs */
 let view = VIEWS.SLOTS;
 let needsRedraw = true;
 let refreshCounter = 0;
@@ -226,6 +317,7 @@ const VIEW_NAMES = {
     [VIEWS.COMPONENT_EDIT]: "Preset Picker",
     [VIEWS.MASTER_FX]: "Master FX",
     [VIEWS.HIERARCHY_EDITOR]: "Hierarchy Editor",
+    [VIEWS.FILEPATH_BROWSER]: "File Browser",
     [VIEWS.KNOB_EDITOR]: "Knob Editor",
     [VIEWS.KNOB_PARAM_PICKER]: "Parameter Picker",
     [VIEWS.STORE_PICKER_CATEGORIES]: "Module Store",
@@ -236,7 +328,14 @@ const VIEW_NAMES = {
     [VIEWS.STORE_PICKER_POST_INSTALL]: "Installation Complete",
     [VIEWS.OVERTAKE_MENU]: "Overtake Menu",
     [VIEWS.OVERTAKE_MODULE]: "Overtake Module",
-    [VIEWS.GLOBAL_SETTINGS]: "Settings"
+    [VIEWS.GLOBAL_SETTINGS]: "Settings",
+    [VIEWS.TOOL_FILE_BROWSER]: "File Browser",
+    [VIEWS.TOOL_CONFIRM]: "Confirm",
+    [VIEWS.TOOL_PROCESSING]: "Processing",
+    [VIEWS.TOOL_RESULT]: "Result",
+    [VIEWS.TOOL_ENGINE_SELECT]: "Engine Selection",
+    [VIEWS.TOOL_STEM_REVIEW]: "Stem Review",
+    [VIEWS.TOOL_SET_PICKER]: "Choose Set"
 };
 
 /* Helper to change view and announce it */
@@ -578,15 +677,18 @@ const GLOBAL_SETTINGS_SECTIONS = [
         items: [
             { key: "display_mirror", label: "Mirror Display", type: "bool" },
             { key: "overlay_knobs", label: "Overlay Knobs", type: "enum",
-              options: ["+Shift", "+Jog Touch", "Off"], values: [0, 1, 2] }
+              options: ["+Shift", "+Jog Touch", "Off", "Native"], values: [0, 1, 2, 3] }
         ]
     },
     {
         id: "audio", label: "Audio",
         items: [
-            { key: "link_audio_routing", label: "Link Audio", type: "bool" },
-            { key: "resample_bridge", label: "Resample Src", type: "enum",
-              options: ["Off", "Replace"], values: [0, 2] }
+            { key: "link_audio_routing", label: "Route thru ME", type: "bool" },
+            { key: "link_audio_publish", label: "ME->Link Audio", type: "bool" },
+            { key: "resample_bridge", label: "Sample Src", type: "enum",
+              options: ["Native", "ME Mix"], values: [0, 2] },
+            { key: "skipback_shortcut", label: "Skipback", type: "enum",
+              options: ["Sh+Cap", "Sh+Vol+Cap"], values: [0, 1] }
         ]
     },
     {
@@ -597,7 +699,14 @@ const GLOBAL_SETTINGS_SECTIONS = [
               options: ["eSpeak-NG", "Flite"], values: ["espeak", "flite"] },
             { key: "screen_reader_speed", label: "Voice Speed", type: "float", min: 0.5, max: 6.0, step: 0.1 },
             { key: "screen_reader_pitch", label: "Voice Pitch", type: "float", min: 80, max: 180, step: 5 },
-            { key: "screen_reader_volume", label: "Voice Vol", type: "int", min: 0, max: 100, step: 5 }
+            { key: "screen_reader_volume", label: "Voice Vol", type: "int", min: 0, max: 100, step: 5 },
+            { key: "screen_reader_debounce", label: "Debounce", type: "int", min: 0, max: 1000, step: 50 }
+        ]
+    },
+    {
+        id: "set_pages", label: "Set Pages",
+        items: [
+            { key: "set_pages_enabled", label: "Set Pages", type: "bool" }
         ]
     },
     {
@@ -617,8 +726,116 @@ let globalSettingsInSection = false;
 let globalSettingsItemIndex = 0;
 let globalSettingsEditing = false;
 
-const RESAMPLE_BRIDGE_LABEL_BY_MODE = { 0: "Off", 2: "Replace" };
+/* Tools menu state */
+let toolsMenuIndex = 0;
+let toolModules = [];           // Populated by scanForToolModules()
+
+/* Tool file browser state (shared filepath_browser) */
+let toolBrowserState = null;
+let toolSelectedFile = "";
+let toolActiveTool = null;      // Currently active tool module descriptor
+let toolProcessPid = -1;        // PID of background tool process
+let toolOutputDir = "";          // Output directory for current tool run
+let toolResultMessage = "";      // Result message to display
+let toolResultSuccess = false;   // Whether the tool succeeded
+let toolProcessingDots = 0;      // Animation counter for processing view
+let toolProcessStartTime = 0;    // Date.now() when process started
+let toolFileDurationSec = 0;     // Duration of input file in seconds
+let toolStemsFound = 0;          // Number of stem WAV files found in output dir
+let toolExpectedStems = 4;       // Expected number of stems
+let toolOvertakeActive = false;  // True if an interactive tool is running as overtake
+let toolNonOvertake = false;     // True if the active tool runs without overtake (pads still work)
+let toolSelectedEngine = null;   // Selected engine from engines array
+let toolEngineIndex = 0;         // Jog position in engine list
+let toolAvailableEngines = [];   // Engines filtered by installed commands
+let toolStemFiles = [];          // Array of stem .wav filenames in output dir
+let toolStemReviewIndex = 0;     // Selected index (0 = "Save All", 1+ = individual stems)
+let toolStemKept = [];           // Parallel bool array — true if stem is marked to keep
+let toolSetList = [];            // Array of {uuid, name} for set picker
+let toolSetPickerIndex = 0;      // Selected index in set picker
+let toolSelectedSetUuid = "";    // Chosen set UUID
+let toolSelectedSetName = "";    // Chosen set display name
+
+/* WAV Player preview state */
+let wavPlayerLoaded = false;
+let wavPlayerPendingFile = "";  /* deferred file_path after DSP load */
+let wavPlayerLoadWait = 0;      /* ticks to wait after loading DSP */
+const WAV_PLAYER_DSP = "/data/UserData/move-anything/modules/tools/wav-player/dsp.so";
+
+function loadWavPlayerDsp() {
+    if (wavPlayerLoaded) return;
+    if (typeof shadow_set_param !== "function") return;
+    shadow_set_param(0, "overtake_dsp:load", WAV_PLAYER_DSP);
+    wavPlayerLoaded = true;
+    wavPlayerLoadWait = 2; /* wait 2 ticks for C-side to process load */
+}
+
+function unloadWavPlayerDsp() {
+    if (!wavPlayerLoaded) return;
+    if (typeof shadow_set_param !== "function") return;
+    shadow_set_param(0, "overtake_dsp:unload", "1");
+    wavPlayerLoaded = false;
+    wavPlayerPendingFile = "";
+    wavPlayerLoadWait = 0;
+}
+
+function wavPlayerPlay(filePath) {
+    loadWavPlayerDsp();
+    if (wavPlayerLoadWait > 0) {
+        /* DSP just loaded — defer file_path to next tick */
+        wavPlayerPendingFile = filePath;
+        return;
+    }
+    if (typeof shadow_set_param !== "function") return;
+    shadow_set_param(0, "overtake_dsp:file_path", filePath);
+}
+
+/* Call from tick() to flush deferred file_path after DSP load */
+function wavPlayerTick() {
+    if (wavPlayerLoadWait > 0) {
+        wavPlayerLoadWait--;
+        if (wavPlayerLoadWait === 0 && wavPlayerPendingFile) {
+            if (typeof shadow_set_param === "function") {
+                shadow_set_param(0, "overtake_dsp:file_path", wavPlayerPendingFile);
+            }
+            wavPlayerPendingFile = "";
+        }
+    }
+}
+
+function wavPlayerStop() {
+    if (!wavPlayerLoaded) return;
+    if (typeof shadow_set_param !== "function") return;
+    wavPlayerPendingFile = "";
+    shadow_set_param(0, "overtake_dsp:playing", "0");
+}
+
+const RESAMPLE_BRIDGE_LABEL_BY_MODE = { 0: "Native", 2: "ME Mix" };
 const RESAMPLE_BRIDGE_VALUES = [0, 2];
+
+/* Check Move's system Link setting via shim param (reads Settings.json) */
+function checkSystemLinkEnabled() {
+    try {
+        const val = shadow_get_param(0, "master_fx:system_link_enabled");
+        systemLinkEnabled = (val === "1");
+    } catch (e) { /* keep previous value */ }
+}
+
+/* Show warning overlay if a Link Audio setting is on but system Link is off.
+ * Optional settingName focuses the message on what was just toggled. */
+function warnIfLinkDisabled(settingName) {
+    checkSystemLinkEnabled();
+    if (systemLinkEnabled === false) {
+        const routingOn = shadow_get_param(0, "master_fx:link_audio_routing") === "1";
+        const publishOn = shadow_get_param(0, "master_fx:link_audio_publish") === "1";
+        if (routingOn || publishOn) {
+            const name = settingName || (routingOn ? "Route thru ME" : "ME->Link Audio");
+            warningTitle = name;
+            warningLines = wrapText("requires Link enabled in Move System Settings", 18);
+            warningActive = true;
+        }
+    }
+}
 
 function parseResampleBridgeMode(raw) {
     if (raw === null || raw === undefined) return 0;
@@ -656,31 +873,10 @@ let helpDetailScrollState = null;
 let storeReturnView = null;   /* View to return to from store/update flows */
 let helpReturnView = null;    /* View to return to from help viewer */
 
-/* Slot settings definitions */
-const SLOT_SETTINGS = [
-    { key: "patch", label: "Patch", type: "action" },  // Opens patch browser
-    { key: "chain", label: "Edit Chain", type: "action" },  // Opens chain editor
-    { key: "slot:volume", label: "Volume", type: "float", min: 0, max: 1, step: 0.05 },
-    { key: "slot:receive_channel", label: "Recv Ch", type: "int", min: 0, max: 16, step: 1 },
-    { key: "slot:forward_channel", label: "Fwd Ch", type: "int", min: -2, max: 15, step: 1 },  // -2 = passthrough, -1 = auto, 0-15 = ch 1-16
-];
+/* SLOT_SETTINGS imported from shadow_ui_slots.mjs */
 
-/* Cached patch detail info */
-let patchDetail = {
-    synthName: "",
-    synthPreset: "",
-    fx1Name: "",
-    fx1Wet: "",
-    fx2Name: "",
-    fx2Wet: ""
-};
-
-/* Component parameter editing state */
-let editingComponent = "";     // "synth", "fx1", "fx2"
-let componentParams = [];      // List of {key, label, value, type, min, max}
-let selectedParam = 0;
-let editingValue = false;      // True when adjusting value
-let editValue = "";            // Current value being edited
+/* patchDetail, editingComponent, componentParams, selectedParam,
+ * editingValue moved to shadow_ui_patches.mjs */
 
 /* Chain editing state */
 let chainConfigs = [];         // In-memory chain configs per slot
@@ -970,7 +1166,9 @@ function processAllUpdates() {
 /* Chain settings (shown when Settings component is selected) */
 const CHAIN_SETTINGS_ITEMS = [
     { key: "knobs", label: "Knobs", type: "action" },  // Opens knob assignment editor
-    { key: "slot:volume", label: "Volume", type: "float", min: 0, max: 1, step: 0.05 },
+    { key: "slot:volume", label: "Volume", type: "float", min: 0, max: 4, step: 0.05 },
+    { key: "slot:muted", label: "Muted", type: "int", min: 0, max: 1, step: 1 },
+    { key: "slot:soloed", label: "Soloed", type: "int", min: 0, max: 1, step: 1 },
     { key: "slot:receive_channel", label: "Recv Ch", type: "int", min: 0, max: 16, step: 1 },
     { key: "slot:forward_channel", label: "Fwd Ch", type: "int", min: -2, max: 15, step: 1 },  // -2 = passthrough, -1 = auto, 0-15 = ch 1-16
     { key: "save", label: "[Save]", type: "action" },  // Save slot preset (overwrite for existing)
@@ -1001,6 +1199,8 @@ let inMasterPresetPicker = false;    // True when showing preset picker
  * loadMasterFxChainFromConfig() has restored the correct values. */
 let cachedResampleBridgeMode = 0;
 let cachedLinkAudioRouting = false;
+let cachedLinkAudioPublish = false;
+let systemLinkEnabled = null; /* null = not checked yet */
 
 /* Master preset CRUD state (reuse pattern from slot presets) */
 let masterPendingSaveName = "";
@@ -1057,6 +1257,106 @@ let hierEditorIsDynamicItems = false; // true when current level uses items_para
 let hierEditorSelectParam = "";       // param to set when item selected
 let hierEditorNavigateTo = "";        // level to navigate to after item selection (optional)
 
+/* Filepath browser state (for chain_params type: filepath) */
+let filepathBrowserState = null;
+let filepathBrowserParamKey = "";
+const FILEPATH_BROWSER_FS = {
+    readdir(path) {
+        const entries = os.readdir(path) || [];
+        if (Array.isArray(entries[0])) return entries[0];
+        return Array.isArray(entries) ? entries : [];
+    },
+    stat(path) {
+        return os.stat(path);
+    }
+};
+
+function parseMetaBool(value) {
+    if (value === true || value === 1) return true;
+    if (value === false || value === 0 || value === null || value === undefined) return false;
+    const v = String(value).trim().toLowerCase();
+    return v === "1" || v === "true" || v === "on" || v === "yes";
+}
+
+function normalizeFilepathHookActions(rawActions, prefix) {
+    if (!Array.isArray(rawActions)) return [];
+    const out = [];
+    for (const action of rawActions) {
+        if (!action || typeof action !== "object") continue;
+        const rawKey = typeof action.key === "string" ? action.key.trim() : "";
+        if (!rawKey) continue;
+        const fullKey = rawKey.includes(":") ? rawKey : (prefix ? `${prefix}:${rawKey}` : rawKey);
+        const value = action.value === undefined || action.value === null ? "" : String(action.value);
+        out.push({
+            key: fullKey,
+            value,
+            restore: parseMetaBool(action.restore)
+        });
+    }
+    return out;
+}
+
+function buildFilepathBrowserHooks(meta, prefix) {
+    const hooksRaw = (meta && meta.browser_hooks && typeof meta.browser_hooks === "object")
+        ? meta.browser_hooks
+        : {};
+    return {
+        onOpen: normalizeFilepathHookActions(hooksRaw.on_open, prefix),
+        onPreview: normalizeFilepathHookActions(hooksRaw.on_preview, prefix),
+        onCancel: normalizeFilepathHookActions(hooksRaw.on_cancel, prefix),
+        onCommit: normalizeFilepathHookActions(hooksRaw.on_commit, prefix)
+    };
+}
+
+function resolveFilepathHookValue(rawValue, context) {
+    const value = rawValue === undefined || rawValue === null ? "" : String(rawValue);
+    if (value === "$path" || value === "$selected_path") {
+        return context && context.path ? String(context.path) : "";
+    }
+    if (value === "$filename" || value === "$selected_filename") {
+        if (context && context.path) {
+            const path = String(context.path);
+            const idx = path.lastIndexOf("/");
+            return idx >= 0 ? path.slice(idx + 1) : path;
+        }
+        return "";
+    }
+    return value;
+}
+
+function applyFilepathHookActions(state, actions, context) {
+    if (!state || !Array.isArray(actions) || actions.length === 0) return;
+    for (const action of actions) {
+        if (!action || !action.key) continue;
+
+        if (action.restore && state.hookRestoreValues && !Object.prototype.hasOwnProperty.call(state.hookRestoreValues, action.key)) {
+            const prev = getSlotParam(hierEditorSlot, action.key);
+            if (prev !== null && prev !== undefined) {
+                state.hookRestoreValues[action.key] = String(prev);
+            }
+        }
+
+        const nextVal = resolveFilepathHookValue(action.value, context);
+        setSlotParam(hierEditorSlot, action.key, nextVal);
+    }
+}
+
+function restoreFilepathHookActions(state) {
+    if (!state || !state.hookRestoreValues) return;
+    for (const [key, prevValue] of Object.entries(state.hookRestoreValues)) {
+        setSlotParam(hierEditorSlot, key, prevValue);
+    }
+}
+
+function applyLivePreview(state, selected) {
+    if (!state || !state.livePreviewEnabled || !selected || selected.kind !== "file" || !selected.path) return;
+    if (selected.path === state.previewCurrentValue || !state.previewParamFullKey) return;
+    if (setSlotParam(hierEditorSlot, state.previewParamFullKey, selected.path)) {
+        state.previewCurrentValue = selected.path;
+        applyFilepathHookActions(state, state.hooksOnPreview, { path: selected.path });
+    }
+}
+
 /* Loaded module UI state */
 let loadedModuleUi = null;       // The chain_ui object from loaded module
 let loadedModuleSlot = -1;       // Which slot the module UI is for
@@ -1064,11 +1364,12 @@ let loadedModuleComponent = "";  // "synth", "fx1", "fx2"
 let moduleUiLoadError = false;   // True if load failed
 
 /* Asset warning overlay state */
-let assetWarningActive = false;  // True when showing asset warning overlay
-let assetWarningTitle = "";      // e.g., "Dexed Warning"
-let assetWarningLines = [];      // Wrapped error message lines
-let assetWarningShownForSlots = new Set();  // Track which chain slots have shown warnings
-let assetWarningShownForMasterFx = new Set();  // Track which Master FX slots have shown warnings
+let warningActive = false;  // True when showing warning overlay
+let warningTitle = "";      // Warning overlay title
+let warningLines = [];      // Wrapped warning message lines
+let warningShownForSlots = new Set();  // Track which chain slots have shown warnings
+let warningShownForMidiFxSlots = new Set();  // Track which slots have shown MIDI FX warnings
+let warningShownForMasterFx = new Set();  // Track which Master FX slots have shown warnings
 
 const MODULES_ROOT = "/data/UserData/move-anything/modules";
 
@@ -1159,6 +1460,7 @@ function setupModuleParamShims(slot, componentKey) {
 function clearModuleParamShims() {
     delete globalThis.host_module_get_param;
     delete globalThis.host_module_set_param;
+    delete globalThis.host_exit_module;
 }
 
 /* Load a module's UI for editing */
@@ -1250,11 +1552,26 @@ function checkAndShowSynthError(slotIndex) {
     const synthError = getSlotParam(slotIndex, "synth_error");
     if (synthError && synthError.length > 0) {
         const synthName = getSlotParam(slotIndex, "synth:name") || "Synth";
-        assetWarningTitle = `${synthName} Warning`;
-        assetWarningLines = wrapText(synthError, 18);
-        assetWarningActive = true;
+        warningTitle = `${synthName} Warning`;
+        warningLines = wrapText(synthError, 18);
+        warningActive = true;
         /* Announce the error */
-        announce(`${assetWarningTitle}: ${synthError}`);
+        announce(`${warningTitle}: ${synthError}`);
+        needsRedraw = true;
+        return true;
+    }
+    return false;
+}
+
+/* Check for MIDI FX warning in a slot and show warning if found */
+function checkAndShowMidiFxError(slotIndex) {
+    const midiFxError = getSlotParam(slotIndex, "midi_fx1:error");
+    if (midiFxError && midiFxError.length > 0) {
+        const midiFxName = getSlotParam(slotIndex, "midi_fx1:name") || "MIDI FX";
+        warningTitle = `${midiFxName} Warning`;
+        warningLines = wrapText(midiFxError, 18);
+        warningActive = true;
+        announce(`${warningTitle}: ${midiFxError}`);
         needsRedraw = true;
         return true;
     }
@@ -1268,11 +1585,11 @@ function checkAndShowMasterFxError(fxSlot) {
     const fxError = getMasterFxParam(fxSlot, "error");
     if (fxError && fxError.length > 0) {
         const fxName = getMasterFxParam(fxSlot, "name") || `FX ${fxNum}`;
-        assetWarningTitle = `${fxName} Warning`;
-        assetWarningLines = wrapText(fxError, 18);
-        assetWarningActive = true;
+        warningTitle = `${fxName} Warning`;
+        warningLines = wrapText(fxError, 18);
+        warningActive = true;
         /* Announce the error */
-        announce(`${assetWarningTitle}: ${fxError}`);
+        announce(`${warningTitle}: ${fxError}`);
         needsRedraw = true;
         return true;
     }
@@ -1280,10 +1597,10 @@ function checkAndShowMasterFxError(fxSlot) {
 }
 
 /* Dismiss asset warning overlay */
-function dismissAssetWarning() {
-    assetWarningActive = false;
-    assetWarningTitle = "";
-    assetWarningLines = [];
+function dismissWarning() {
+    warningActive = false;
+    warningTitle = "";
+    warningLines = [];
     needsRedraw = true;
 }
 
@@ -1376,7 +1693,21 @@ function getSlotParam(slot, key) {
 function setSlotParam(slot, key, value) {
     if (typeof shadow_set_param !== "function") return false;
     try {
-        return shadow_set_param(slot, key, String(value));
+        const ok = shadow_set_param(slot, key, String(value));
+        if (!ok) return false;
+
+        /* Re-check MIDI FX warnings immediately after sync/module changes. */
+        if (key === "midi_fx1:module") {
+            warningShownForMidiFxSlots.delete(slot);
+        }
+        if (key === "midi_fx1:sync") {
+            warningShownForMidiFxSlots.delete(slot);
+            if (String(value) === "clock") {
+                checkAndShowMidiFxError(slot);
+            }
+        }
+
+        return true;
     } catch (e) {
         return false;
     }
@@ -1496,7 +1827,8 @@ function scanForOvertakeModules() {
                     path: dirPath,
                     uiPath: `${dirPath}/${json.ui || 'ui.js'}`,
                     dsp: json.dsp || null,
-                    basePath: dirPath
+                    basePath: dirPath,
+                    capabilities: json.capabilities || null
                 });
             }
         } catch (e) {
@@ -1542,6 +1874,7 @@ function scanForOvertakeModules() {
         /* Failed to read modules directory */
     }
 
+    result.sort((a, b) => a.name.localeCompare(b.name));
     debugLog("returning " + result.length + " modules");
     return result;
 }
@@ -1596,10 +1929,63 @@ function exitOvertakeMode() {
     overtakeModulePath = "";
     overtakeModuleCallbacks = null;
 
-    /* Start progressive LED clearing before exiting */
+    /* Reset encoder accumulation */
+    for (let k = 0; k < NUM_KNOBS; k++) overtakeKnobDelta[k] = 0;
+    overtakeJogDelta = 0;
+
+    /* NOTE: skip_led_clear is cleared in completeOvertakeExit() AFTER
+     * overtake_mode drops to 0, so the C-side transition sees it and
+     * skips its snapshot restore (which may have stale/polluted state). */
+
+    /* Signal exit — C-side LED cache will restore Move's LEDs
+     * when overtake_mode transitions back to 0 */
     overtakeExitPending = true;
-    ledClearIndex = 0;
     needsRedraw = true;
+}
+
+/* Direct exit for interactive tools - skip LED clearing ceremony */
+function exitToolOvertake() {
+    debugLog("exitToolOvertake: direct tool exit, nonOvertake=" + toolNonOvertake);
+
+    /* Deactivate LED queue (no-op if never activated for non-overtake tools) */
+    deactivateLedQueue();
+
+    /* Unload overtake DSP */
+    if (typeof shadow_set_param === "function") {
+        shadow_set_param(0, "overtake_dsp:unload", "1");
+    }
+
+    /* Clean up shims */
+    delete globalThis.host_module_set_param;
+    delete globalThis.host_module_get_param;
+    delete globalThis.host_exit_module;
+
+    /* Reset overtake state */
+    overtakeModuleLoaded = false;
+    overtakeModulePath = "";
+    overtakeModuleCallbacks = null;
+    overtakeExitPending = false;
+    overtakeInitPending = false;
+
+    /* Reset encoder accumulation */
+    for (let k = 0; k < NUM_KNOBS; k++) overtakeKnobDelta[k] = 0;
+    overtakeJogDelta = 0;
+
+    /* Disable overtake mode first, THEN clear skip_led_clear.
+     * The C-side checks skip_led_clear during the overtake→0 transition
+     * to decide whether to restore its LED snapshot. skip_led_clear must
+     * still be set at that moment so the restore is skipped. */
+    if (!toolNonOvertake && typeof shadow_set_overtake_mode === "function") {
+        shadow_set_overtake_mode(0);
+    }
+    if (typeof shadow_set_skip_led_clear === "function") {
+        shadow_set_skip_led_clear(0);
+    }
+
+    /* Return to tools menu */
+    toolOvertakeActive = false;
+    toolNonOvertake = false;
+    enterToolsMenu();
 }
 
 /* Complete the exit after LEDs are cleared */
@@ -1609,6 +1995,22 @@ function completeOvertakeExit() {
     /* Disable overtake mode to allow MIDI to reach Move again */
     if (typeof shadow_set_overtake_mode === "function") {
         shadow_set_overtake_mode(0);
+    }
+
+    /* Clear skip_led_clear AFTER overtake_mode drops to 0.
+     * The C-side overtake transition checks skip_led_clear to decide
+     * whether to restore its snapshot. With skip_led_clear still set,
+     * it skips the restore (good — the snapshot may be polluted from
+     * Move's MIDI_OUT during the session). Move reasserts its own LEDs. */
+    if (typeof shadow_set_skip_led_clear === "function") {
+        shadow_set_skip_led_clear(0);
+    }
+
+    /* If exiting an interactive tool, return to tools menu instead of Move */
+    if (toolOvertakeActive) {
+        toolOvertakeActive = false;
+        enterToolsMenu();
+        return;
     }
 
     /* Return to slots view */
@@ -1621,16 +2023,24 @@ function completeOvertakeExit() {
 }
 
 /* Load and run an overtake module */
-function loadOvertakeModule(moduleInfo) {
-    debugLog("loadOvertakeModule called with: " + JSON.stringify(moduleInfo));
+function loadOvertakeModule(moduleInfo, skipOvertake) {
+    debugLog("loadOvertakeModule called with: " + JSON.stringify(moduleInfo) + " skipOvertake=" + !!skipOvertake);
     if (!moduleInfo || !moduleInfo.uiPath) {
         debugLog("loadOvertakeModule: no moduleInfo or uiPath");
         return false;
     }
 
     try {
-        /* Step 1: Enable overtake mode 2 (module) - all MIDI forwarded including external */
-        if (typeof shadow_set_overtake_mode === "function") {
+        /* Step 1: Set overtake mode.
+         * Non-overtake tools stay at mode 0 — jog/click/back already forwarded to shadow,
+         * and everything else (pads, steps, knobs) passes through to Move normally.
+         * If skip_led_clear, tell C-side to preserve LED state on overtake entry. */
+        if (!skipOvertake && typeof shadow_set_overtake_mode === "function") {
+            const wantSkipLed = moduleInfo.capabilities && moduleInfo.capabilities.skip_led_clear;
+            if (wantSkipLed && typeof shadow_set_skip_led_clear === "function") {
+                shadow_set_skip_led_clear(1);
+                debugLog("loadOvertakeModule: skip_led_clear set");
+            }
             shadow_set_overtake_mode(2);  /* 2 = module mode (all events) */
             debugLog("loadOvertakeModule: overtake_mode=2 (module)");
         }
@@ -1641,8 +2051,11 @@ function loadOvertakeModule(moduleInfo) {
         debugLog("loadOvertakeModule: escape state reset");
 
         /* Activate LED queue before loading module - intercepts move_midi_internal_send
-         * to prevent SHM buffer flooding from modules that send many LEDs per tick */
-        activateLedQueue();
+         * to prevent SHM buffer flooding from modules that send many LEDs per tick.
+         * Non-overtake tools don't own LEDs, so skip this.
+         * skip_led_clear modules also don't own LEDs — Move's LEDs pass through. */
+        const wantLedQueue = !skipOvertake && !(moduleInfo.capabilities && moduleInfo.capabilities.skip_led_clear);
+        if (wantLedQueue) activateLedQueue();
 
         /* Save current globals before loading - module may overwrite them */
         const savedInit = globalThis.init;
@@ -1675,6 +2088,30 @@ function loadOvertakeModule(moduleInfo) {
             }
             return null;
         };
+        globalThis.host_exit_module = function() {
+            debugLog("host_exit_module called by overtake module");
+            if (toolOvertakeActive) {
+                exitToolOvertake();
+            } else {
+                exitOvertakeMode();
+            }
+        };
+        /* Expose file I/O to overtake modules */
+        if (typeof host_write_file === "function") {
+            globalThis.host_write_file = host_write_file;
+        }
+        if (typeof host_ensure_dir === "function") {
+            globalThis.host_ensure_dir = host_ensure_dir;
+        }
+        if (typeof host_file_exists === "function") {
+            globalThis.host_file_exists = host_file_exists;
+        }
+        if (typeof host_read_file === "function") {
+            globalThis.host_read_file = host_read_file;
+        }
+        if (typeof host_system_cmd === "function") {
+            globalThis.host_system_cmd = host_system_cmd;
+        }
         debugLog("loadOvertakeModule: param shims installed");
 
         /* Step 4: Load the module's UI script (after DSP + shims so module can use them) */
@@ -1722,11 +2159,23 @@ function loadOvertakeModule(moduleInfo) {
 
         overtakeModuleLoaded = true;
 
-        /* Step 6: Defer init() call - LEDs will be cleared progressively during loading screen */
-        overtakeInitPending = true;
-        overtakeInitTicks = 0;
-        ledClearIndex = 0;  /* Start LED clearing from beginning */
-        debugLog("loadOvertakeModule: init deferred, LEDs will clear progressively");
+        /* Step 6: Defer init() call - LEDs will be cleared progressively during loading screen.
+         * Non-overtake tools don't own LEDs, so call init() immediately.
+         * Modules with skip_led_clear capability skip LED clearing and init immediately
+         * (e.g. song-mode wants Move's pad colors to stay visible). */
+        const skipLedClear = moduleInfo.capabilities && moduleInfo.capabilities.skip_led_clear;
+        if (skipOvertake || skipLedClear) {
+            overtakeInitPending = false;
+            debugLog("loadOvertakeModule: " + (skipOvertake ? "non-overtake" : "skip_led_clear") + ", calling init() immediately");
+            if (overtakeModuleCallbacks && overtakeModuleCallbacks.init) {
+                overtakeModuleCallbacks.init();
+            }
+        } else {
+            overtakeInitPending = true;
+            overtakeInitTicks = 0;
+            ledClearIndex = 0;  /* Start LED clearing from beginning */
+            debugLog("loadOvertakeModule: init deferred, LEDs will clear progressively");
+        }
 
         return true;
     } catch (e) {
@@ -1740,6 +2189,7 @@ function loadOvertakeModule(moduleInfo) {
         }
         delete globalThis.host_module_set_param;
         delete globalThis.host_module_get_param;
+        delete globalThis.host_exit_module;
         if (typeof shadow_set_overtake_mode === "function") {
             shadow_set_overtake_mode(0);
         }
@@ -1774,7 +2224,7 @@ function drawOvertakeMenu() {
         });
     }
 
-    drawFooter("Jog:Select  Back:Exit");
+    drawFooter({left: "Back: Exit", right: "Jog: Select"});
 }
 
 /* Handle input in overtake menu */
@@ -1837,7 +2287,8 @@ function setMasterFxModule(moduleId) {
 
 function loadPatchByIndex(slot, index) {
     /* Clear warning tracking for this slot so new warnings can show */
-    assetWarningShownForSlots.delete(slot);
+    warningShownForSlots.delete(slot);
+    warningShownForMidiFxSlots.delete(slot);
     return setSlotParam(slot, "load_patch", index);
 }
 
@@ -1935,15 +2386,7 @@ function getMasterFxHierarchy(fxSlot) {
     }
 }
 
-/* Fetch patch detail info from chain DSP */
-function fetchPatchDetail(slot) {
-    patchDetail.synthName = getSlotParam(slot, "synth:name") || "Unknown";
-    patchDetail.synthPreset = getSlotParam(slot, "synth:preset_name") || getSlotParam(slot, "synth:preset") || "-";
-    patchDetail.fx1Name = getSlotParam(slot, "fx1:name") || "None";
-    patchDetail.fx1Wet = getSlotParam(slot, "fx1:wet") || "-";
-    patchDetail.fx2Name = getSlotParam(slot, "fx2:name") || "None";
-    patchDetail.fx2Wet = getSlotParam(slot, "fx2:wet") || "-";
-}
+/* fetchPatchDetail -> shadow_ui_patches.mjs */
 
 /* Fetch knob mappings for the selected slot */
 function fetchKnobMappings(slot) {
@@ -1956,104 +2399,12 @@ function fetchKnobMappings(slot) {
     lastKnobSlot = slot;
 }
 
-/* Get items for patch detail view */
-function getDetailItems() {
-    return [
-        { label: "Synth", value: patchDetail.synthName, subvalue: patchDetail.synthPreset, editable: true, component: "synth" },
-        { label: "FX1", value: patchDetail.fx1Name, subvalue: patchDetail.fx1Wet, editable: true, component: "fx1" },
-        { label: "FX2", value: patchDetail.fx2Name, subvalue: patchDetail.fx2Wet, editable: true, component: "fx2" },
-        { label: "Load Patch", value: "", subvalue: "", editable: false, component: "" }
-    ];
-}
+/* getDetailItems -> shadow_ui_patches.mjs */
 
-/* Known synth parameters that can be edited */
-const SYNTH_PARAMS = [
-    { key: "preset", label: "Preset", type: "int", min: 0, max: 127 },
-    { key: "volume", label: "Volume", type: "float", min: 0, max: 1 },
-];
+/* SYNTH_PARAMS, FX_PARAMS -> shadow_ui_patches.mjs */
 
-/* Known FX parameters that can be edited */
-const FX_PARAMS = [
-    { key: "wet", label: "Wet", type: "float", min: 0, max: 1 },
-    { key: "dry", label: "Dry", type: "float", min: 0, max: 1 },
-    { key: "room_size", label: "Size", type: "float", min: 0, max: 1 },
-    { key: "damping", label: "Damp", type: "float", min: 0, max: 1 },
-];
-
-/* Fetch current parameter values for a component */
-function fetchComponentParams(slot, component) {
-    const prefix = component + ":";
-    const params = component === "synth" ? SYNTH_PARAMS : FX_PARAMS;
-    const result = [];
-
-    for (const param of params) {
-        const fullKey = prefix + param.key;
-        const value = getSlotParam(slot, fullKey);
-        if (value !== null) {
-            result.push({
-                key: fullKey,
-                label: param.label,
-                value: value,
-                type: param.type,
-                min: param.min,
-                max: param.max
-            });
-        }
-    }
-
-    return result;
-}
-
-/* Enter component parameter editing view */
-function enterComponentParams(slot, component) {
-    editingComponent = component;
-    componentParams = fetchComponentParams(slot, component);
-    selectedParam = 0;
-    editingValue = false;
-    setView(VIEWS.COMPONENT_PARAMS);
-    needsRedraw = true;
-
-    /* Announce menu title + initial selection */
-    if (componentParams.length > 0) {
-        const param = componentParams[0];
-        const label = param.label || param.key;
-        const value = formatParamValue(param);
-        announce(`Component Parameters, ${label}: ${value}`);
-    } else {
-        announce("Component Parameters, No parameters");
-    }
-}
-
-/* Format a parameter value for display */
-function formatParamValue(param) {
-    if (param.type === "float") {
-        const num = parseFloat(param.value);
-        if (isNaN(num)) return param.value;
-        return num.toFixed(2);
-    }
-    return param.value;
-}
-
-/* Adjust parameter value by delta */
-function adjustParamValue(param, delta) {
-    let val;
-    if (param.type === "float") {
-        val = parseFloat(param.value) || 0;
-        const step = (param.step > 0) ? param.step : KNOB_BASE_STEP_FLOAT;
-        val += delta * step;
-    } else {
-        val = parseInt(param.value) || 0;
-        val += delta;
-    }
-
-    /* Clamp to range */
-    val = Math.max(param.min, Math.min(param.max, val));
-
-    if (param.type === "float") {
-        return val.toFixed(4);
-    }
-    return String(Math.round(val));
-}
+/* fetchComponentParams, enterComponentParams, formatParamValue,
+ * adjustParamValue -> shadow_ui_patches.mjs */
 
 function safeLoadJson(path) {
     try {
@@ -2090,35 +2441,36 @@ function loadMasterFxFromConfig() {
 }
 
 function saveSlotsToConfig(nextSlots) {
-    const payload = {
-        patches: nextSlots.map((slot, idx) => ({
-            name: slot.name,
-            channel: slot.channel,
-            forward_channel: parseInt(getSlotParam(idx, "slot:forward_channel") || "-1")
-        })),
-        master_fx: currentMasterFxId || ""
-    };
+    /* Read existing config to preserve fields written by C-side shadow_save_state()
+     * (slot_volumes, slot_muted, slot_soloed, slot_forward_channels, etc.) */
+    const existing = safeLoadJson(CONFIG_PATH) || {};
+    existing.patches = nextSlots.map((slot, idx) => ({
+        name: slot.name,
+        channel: slot.channel,
+        forward_channel: parseInt(getSlotParam(idx, "slot:forward_channel") || "-1")
+    }));
+    existing.master_fx = currentMasterFxId || "";
     try {
-        host_write_file(CONFIG_PATH, JSON.stringify(payload, null, 2) + "\n");
+        host_write_file(CONFIG_PATH, JSON.stringify(existing, null, 2) + "\n");
     } catch (e) {
         /* ignore */
     }
 }
 
 function saveConfigMasterFx() {
-    /* Save just the master FX setting to config */
-    const data = safeLoadJson(CONFIG_PATH);
-    const payload = {
-        patches: data && Array.isArray(data.patches) ? data.patches : slots.map((slot, idx) => ({
+    /* Save just the master FX setting to config, preserving all other fields */
+    const existing = safeLoadJson(CONFIG_PATH) || {};
+    if (!Array.isArray(existing.patches)) {
+        existing.patches = slots.map((slot, idx) => ({
             name: slot.name,
             channel: slot.channel,
             forward_channel: parseInt(getSlotParam(idx, "slot:forward_channel") || "-1")
-        })),
-        master_fx: currentMasterFxId || "",
-        master_fx_path: currentMasterFxPath || ""
-    };
+        }));
+    }
+    existing.master_fx = currentMasterFxId || "";
+    existing.master_fx_path = currentMasterFxPath || "";
     try {
-        host_write_file(CONFIG_PATH, JSON.stringify(payload, null, 2) + "\n");
+        host_write_file(CONFIG_PATH, JSON.stringify(existing, null, 2) + "\n");
     } catch (e) {
         /* ignore */
     }
@@ -2150,127 +2502,9 @@ function refreshSlots() {
     needsRedraw = true;
 }
 
-function parsePatchName(path) {
-    try {
-        const raw = std.loadFile(path);
-        if (!raw) return null;
-        const match = raw.match(/"name"\s*:\s*"([^"]+)"/);
-        if (match && match[1]) {
-            return match[1];
-        }
-    } catch (e) {
-        return null;
-    }
-    return null;
-}
-
-function loadPatchList() {
-    const entries = [];
-    let dir = [];
-    try {
-        dir = os.readdir(PATCH_DIR) || [];
-    } catch (e) {
-        dir = [];
-    }
-    const names = dir[0];
-    if (!Array.isArray(names)) {
-        patches = entries;
-        return;
-    }
-    for (const name of names) {
-        if (name === "." || name === "..") continue;
-        if (!name.endsWith(".json")) continue;
-        const path = `${PATCH_DIR}/${name}`;
-        const patchName = parsePatchName(path);
-        if (patchName) {
-            entries.push({ name: patchName, file: name });
-        }
-    }
-    entries.sort((a, b) => {
-        const al = a.name.toLowerCase();
-        const bl = b.name.toLowerCase();
-        if (al < bl) return -1;
-        if (al > bl) return 1;
-        return 0;
-    });
-    /* Add "New Slot Preset" as first option to clear a slot */
-    patches = [{ name: "[New Slot Preset]", file: null }, ...entries];
-}
-
-function findPatchIndexByName(name) {
-    if (!name) return 0;
-    const match = patches.findIndex((patch) => patch.name === name);
-    return match >= 0 ? match : 0;
-}
-
-function enterPatchBrowser(slotIndex) {
-    loadPatchList();
-    selectedSlot = slotIndex;
-    updateFocusedSlot(slotIndex);
-    if (patches.length === 0) {
-        /* No patches found - still enter view to show message */
-        selectedPatch = 0;
-    } else {
-        selectedPatch = findPatchIndexByName(slots[slotIndex]?.name);
-    }
-    setView(VIEWS.PATCHES);
-    needsRedraw = true;
-
-    /* Announce menu title + initial selection */
-    if (patches.length === 0) {
-        announce("Patch Browser, No patches found");
-    } else {
-        const patchName = patches[selectedPatch]?.name || "Unknown";
-        announce(`Patch Browser, ${patchName}`);
-    }
-}
-
-function enterPatchDetail(slotIndex, patchIndex) {
-    selectedSlot = slotIndex;
-    updateFocusedSlot(slotIndex);
-    selectedPatch = patchIndex;
-    selectedDetailItem = 0;
-    fetchPatchDetail(slotIndex);
-    setView(VIEWS.PATCH_DETAIL);
-    needsRedraw = true;
-
-    /* Announce menu title + initial selection */
-    const patchName = patches[patchIndex]?.name || "Unknown";
-    const items = getDetailItems();
-    if (items.length > 0) {
-        const item = items[0];
-        const value = item.value || "Empty";
-        announce(`${patchName}, ${item.label}: ${value}`);
-    }
-}
-
-/* Special patch index value meaning clear the slot - must match shim */
-const PATCH_INDEX_NONE = 65535;
-
-function applyPatchSelection() {
-    const patch = patches[selectedPatch];
-    const slot = slots[selectedSlot];
-    if (!patch || !slot) return;
-    const isNewSlot = patch.name === "[New Slot Preset]";
-    slot.name = isNewSlot ? "Untitled" : patch.name;
-    saveSlotsToConfig(slots);
-    if (typeof shadow_request_patch === "function") {
-        try {
-            /* "[New Slot Preset]" is at index 0 in patches array, use special value 65535
-             * Real patches start at index 1, so subtract 1 for shim's index */
-            const patchIndex = isNewSlot ? PATCH_INDEX_NONE : selectedPatch - 1;
-            shadow_request_patch(selectedSlot, patchIndex);
-        } catch (e) {
-            /* ignore */
-        }
-    }
-    /* Refresh detail info and knob mappings after loading/clearing patch */
-    fetchPatchDetail(selectedSlot);
-    fetchKnobMappings(selectedSlot);
-    invalidateKnobContextCache();  /* Clear stale knob contexts after patch change */
-    setView(VIEWS.SLOTS);
-    needsRedraw = true;
-}
+/* parsePatchName, loadPatchList, findPatchIndexByName,
+ * enterPatchBrowser, enterPatchDetail, PATCH_INDEX_NONE,
+ * applyPatchSelection -> shadow_ui_patches.mjs */
 
 /* ========== Slot Preset Save/Delete Functions ========== */
 
@@ -2292,16 +2526,7 @@ function getChainSettingsItems(slotIndex) {
     });
 }
 
-/* Find patch index by name (for conflict detection) */
-function findPatchByName(name) {
-    loadPatchList();
-    for (let i = 1; i < patches.length; i++) {
-        if (patches[i].name === name) {
-            return i - 1;
-        }
-    }
-    return -1;
-}
+/* findPatchByName -> shadow_ui_patches.mjs (imported) */
 
 /* Generate default name from chain components */
 function generateSlotPresetName(slotIndex) {
@@ -2346,7 +2571,7 @@ function generateUniquePresetName(baseName) {
  * Note: save_patch expects raw chain content (synth, audio_fx at root)
  * with "custom_name" for the name. It wraps it with name/version/chain.
  */
-function buildSlotPatchJson(slotIndex, name) {
+function buildSlotPatchJson(slotIndex, name, forAutosave) {
     const cfg = chainConfigs[slotIndex];
     if (!cfg) return null;
 
@@ -2368,6 +2593,10 @@ function buildSlotPatchJson(slotIndex, name) {
             } catch (e) {
                 /* Keep original params if state parse fails */
             }
+        } else if (forAutosave) {
+            /* State query timed out - skip autosave to avoid clobbering
+             * a good file with empty config (synth reverts to defaults) */
+            return null;
         }
         patch.synth = {
             module: cfg.synth.module,
@@ -2386,6 +2615,8 @@ function buildSlotPatchJson(slotIndex, name) {
             } catch (e) {
                 /* Keep original params if state parse fails */
             }
+        } else if (forAutosave) {
+            return null;
         }
         patch.midi_fx = [{
             type: cfg.midiFx.module,
@@ -2404,6 +2635,8 @@ function buildSlotPatchJson(slotIndex, name) {
             } catch (e) {
                 /* Keep original params if state parse fails */
             }
+        } else if (forAutosave) {
+            return null;
         }
         patch.audio_fx.push({
             type: cfg.fx1.module,
@@ -2421,6 +2654,8 @@ function buildSlotPatchJson(slotIndex, name) {
             } catch (e) {
                 /* Keep original params if state parse fails */
             }
+        } else if (forAutosave) {
+            return null;
         }
         patch.audio_fx.push({
             type: cfg.fx2.module,
@@ -2474,7 +2709,7 @@ function autosaveAllSlots() {
         const dirty = getSlotParam(i, "dirty");
         slotDirtyCache[i] = (dirty === "1");
 
-        const patchJson = buildSlotPatchJson(i, slots[i].name || "Untitled");
+        const patchJson = buildSlotPatchJson(i, slots[i].name || "Untitled", true);
         if (!patchJson) continue;
 
         /* Wrap with name, version, modified flag */
@@ -2516,6 +2751,7 @@ function doSavePreset(slotIndex, name) {
     overwriteTargetIndex = -1;
 
     loadPatchList();
+    announce("Chain Settings");
     /* Save complete */
     needsRedraw = true;
 }
@@ -2542,8 +2778,7 @@ function doDeletePreset(slotIndex) {
         }
     }
 
-    /* Refresh detail info and knob mappings */
-    fetchPatchDetail(slotIndex);
+    /* Refresh knob mappings (patch detail refreshed on re-entry) */
     fetchKnobMappings(slotIndex);
     invalidateKnobContextCache();  /* Clear stale knob contexts after slot clear */
 
@@ -2554,20 +2789,21 @@ function doDeletePreset(slotIndex) {
     needsRedraw = true;
 }
 
-/* Enter slot settings view */
-function enterSlotSettings(slotIndex) {
-    selectedSlot = slotIndex;
-    updateFocusedSlot(slotIndex);
-    selectedSetting = 0;
-    editingSettingValue = false;
-    setView(VIEWS.SLOT_SETTINGS);
-    needsRedraw = true;
-
-    /* Announce menu title + initial selection */
-    const setting = SLOT_SETTINGS[0];
-    const val = getSlotSettingValue(slotIndex, setting);
-    announceMenuItem(`Slot Settings, ${setting.label}`, val);
+function getSavePreviewText(name) {
+    if (!name || name === "") return "Untitled";
+    return name;
 }
+
+function announceSavePreview(name, selectedIndex, full = true) {
+    const selected = selectedIndex === 0 ? "Edit" : "OK";
+    if (!full) {
+        announce(selected);
+        return;
+    }
+    announce(`Save As, current text: ${getSavePreviewText(name)}. ${selected} selected`);
+}
+
+/* enterSlotSettings() -> shadow_ui_slots.mjs */
 
 /* ========== Master Preset Picker Functions ========== */
 
@@ -2604,27 +2840,7 @@ function exitMasterPresetPicker() {
     needsRedraw = true;
 }
 
-function drawMasterPresetPicker() {
-    drawHeader("Master Presets");
-
-    /* Build items: [New] + presets */
-    const items = [{ name: "[New]", index: -1 }];
-    for (let i = 0; i < masterPresets.length; i++) {
-        items.push(masterPresets[i]);
-    }
-
-    drawMenuList({
-        items: items,
-        selectedIndex: selectedMasterPresetIndex,
-        getLabel: (item) => {
-            const isCurrent = item.index >= 0 && masterPresets[item.index]?.name === currentMasterPresetName;
-            return isCurrent ? `* ${item.name}` : item.name;
-        },
-        listArea: { topY: LIST_TOP_Y, bottomY: FOOTER_RULE_Y }
-    });
-
-    drawFooter("Back: cancel");
-}
+/* drawMasterPresetPicker -> shadow_ui_master_fx.mjs */
 
 function findMasterPresetByName(name) {
     for (let i = 0; i < masterPresets.length; i++) {
@@ -2800,44 +3016,121 @@ function handleMasterFxSettingsAction(key) {
                 debugLog("Failed to load help content: " + e);
             }
         }
-        /* Try to load parsed Move Manual (from cache, if not already loaded) */
+        /* Try to load Move Manual (from bundled or cache — never HTTP) */
         if (helpContent && !helpContent._manualLoaded) {
             try {
-                const manualRaw = host_read_file("/data/UserData/move-anything/cache/move_manual.json");
-                if (manualRaw) {
-                    const manualData = JSON.parse(manualRaw);
-                    if (manualData && manualData.sections && manualData.sections.length > 0) {
-                        /* Find the Move Manual section and replace its children */
-                        for (let i = 0; i < helpContent.sections.length; i++) {
-                            if (helpContent.sections[i].title === "Move Manual") {
-                                helpContent.sections[i].children = manualData.sections;
-                                break;
-                            }
+                /* Pick up any completed background download first */
+                processDownloadedHtml();
+                const sections = fetchAndParseManual();
+                if (sections && sections.length > 0) {
+                    /* Find the Move Manual section and replace its children */
+                    for (let i = 0; i < helpContent.sections.length; i++) {
+                        if (helpContent.sections[i].title === "Move Manual") {
+                            helpContent.sections[i].children = sections;
+                            break;
                         }
-                        helpContent._manualLoaded = true;
-                        debugLog("Loaded Move Manual: " + manualData.sections.length + " chapters");
                     }
+                    helpContent._manualLoaded = true;
+                    debugLog("Loaded Move Manual: " + sections.length + " chapters");
                 }
             } catch (e) {
-                debugLog("Move Manual cache not available: " + e);
+                debugLog("Move Manual not available: " + e);
             }
         }
-        if (helpContent && helpContent.sections && helpContent.sections.length > 0) {
-            /* If only Move Everything section has real content, skip straight to it */
-            const meSection = helpContent.sections.find(s => s.title === "Move Everything");
-            const hasManual = helpContent._manualLoaded;
-            if (meSection && meSection.children && !hasManual) {
-                /* Skip section list, go directly to ME topics */
-                helpNavStack = [
-                    { items: meSection.children, selectedIndex: 0, title: meSection.title }
-                ];
-                needsRedraw = true;
-                announce(meSection.title + ", " + meSection.children[0].title);
-            } else {
-                helpNavStack = [{ items: helpContent.sections, selectedIndex: 0, title: "Help" }];
-                needsRedraw = true;
-                announce("Help, " + helpContent.sections[0].title);
+        /* Scan installed modules for help.json files (rescan each time to pick up new installs) */
+        if (helpContent && helpContent.sections) {
+            try {
+                /* Remove previous Modules section if present */
+                const oldIdx = helpContent.sections.findIndex(s => s.title === "Modules");
+                if (oldIdx >= 0) helpContent.sections.splice(oldIdx, 1);
+
+                const MODULES_DIR = "/data/UserData/move-anything/modules";
+                const moduleHelpChildren = [];
+                const entries = os.readdir(MODULES_DIR) || [];
+                const dirList = entries[0];
+                if (Array.isArray(dirList)) {
+                    for (const entry of dirList) {
+                        if (entry === "." || entry === "..") continue;
+                        const entryPath = `${MODULES_DIR}/${entry}`;
+                        /* Check top-level module dirs and category subdirs */
+                        const checkHelp = function(dirPath) {
+                            try {
+                                const helpRaw = std.loadFile(`${dirPath}/help.json`);
+                                if (!helpRaw) return;
+                                const helpData = JSON.parse(helpRaw);
+                                if (helpData.title && helpData.children) {
+                                    moduleHelpChildren.push(helpData);
+                                }
+                            } catch (e) { /* skip */ }
+                        };
+                        checkHelp(entryPath);
+                        /* Scan subdirectories (sound_generators/, audio_fx/, etc.) */
+                        try {
+                            const subEntries = os.readdir(entryPath) || [];
+                            const subDirList = subEntries[0];
+                            if (Array.isArray(subDirList)) {
+                                for (const subEntry of subDirList) {
+                                    if (subEntry === "." || subEntry === "..") continue;
+                                    checkHelp(`${entryPath}/${subEntry}`);
+                                }
+                            }
+                        } catch (e) { /* not a directory */ }
+                    }
+                }
+                if (moduleHelpChildren.length > 0) {
+                    moduleHelpChildren.sort((a, b) => a.title.localeCompare(b.title));
+                    const modulesSection = { title: "Modules", children: moduleHelpChildren };
+                    /* Insert after "Move Everything" (index 0) */
+                    const meIdx = helpContent.sections.findIndex(s => s.title === "Move Everything");
+                    helpContent.sections.splice(meIdx >= 0 ? meIdx + 1 : 1, 0, modulesSection);
+                    debugLog("Loaded module help: " + moduleHelpChildren.length + " modules");
+                }
+            } catch (e) {
+                debugLog("Module help scan failed: " + e);
             }
+        }
+        /* Ensure Notice section is always present */
+        if (helpContent && helpContent.sections &&
+            !helpContent.sections.find(s => s.title === "Notice")) {
+            helpContent.sections.push({
+                title: "Notice",
+                children: [{
+                    title: "Copyright",
+                    lines: [
+                        "Ableton Move Manual",
+                        "",
+                        "Copyright 2024",
+                        "Ableton AG.",
+                        "All rights reserved.",
+                        "Made in Germany.",
+                        "",
+                        "Manual content",
+                        "displayed with",
+                        "permission from",
+                        "Ableton AG."
+                    ]
+                }, {
+                    title: "Trademark Notice",
+                    lines: [
+                        "Ableton and Move are",
+                        "trademarks of",
+                        "Ableton AG.",
+                        "",
+                        "Move Everything is",
+                        "an independent",
+                        "product and has not",
+                        "been authorized,",
+                        "sponsored, or",
+                        "otherwise approved",
+                        "by Ableton AG."
+                    ]
+                }]
+            });
+        }
+        if (helpContent && helpContent.sections && helpContent.sections.length > 0) {
+            helpNavStack = [{ items: helpContent.sections, selectedIndex: 0, title: "Help" }];
+            needsRedraw = true;
+            announce("Help, " + helpContent.sections[0].title);
         }
         return;
     }
@@ -2856,7 +3149,7 @@ function handleMasterFxSettingsAction(key) {
             masterShowingNamePreview = true;
             masterNamePreviewIndex = 1;  /* Default to OK */
             masterOverwriteFromKeyboard = true;
-            announce(`Confirm save as: ${masterPendingSaveName}`);
+            announceSavePreview(masterPendingSaveName, masterNamePreviewIndex);
             needsRedraw = true;
         }
     } else if (key === "save_as") {
@@ -2866,7 +3159,7 @@ function handleMasterFxSettingsAction(key) {
         masterNamePreviewIndex = 1;
         masterOverwriteFromKeyboard = true;
         masterOverwriteTargetIndex = -1;  /* Force create new */
-        announce(`Confirm save as: ${masterPendingSaveName}`);
+        announceSavePreview(masterPendingSaveName, masterNamePreviewIndex);
         needsRedraw = true;
     } else if (key === "check_updates") {
         /* Check for updates now */
@@ -2908,6 +3201,529 @@ function doDeleteMasterPreset() {
 }
 
 /* ========== End Master Preset Picker Functions ========== */
+
+/* ========== Tools Menu Functions ========== */
+
+/* scanForToolModules(), enterToolsMenu() -> shadow_ui_tools.mjs */
+
+/* drawToolsMenu() -> shadow_ui_tools.mjs */
+
+/* ========== Tool File Browser Functions (shared filepath_browser) ========== */
+
+function enterToolFileBrowser(toolModule) {
+    debugLog("enterToolFileBrowser: " + toolModule.id);
+    toolActiveTool = toolModule;
+    const exts = (toolModule.tool_config && toolModule.tool_config.input_extensions) || [".wav"];
+    const filter = Array.isArray(exts) ? exts : [exts];
+    toolBrowserState = buildFilepathBrowserState(
+        { root: "/data/UserData/UserLibrary", filter: filter, name: toolModule.name },
+        ""
+    );
+    refreshFilepathBrowser(toolBrowserState, FILEPATH_BROWSER_FS);
+    setView(VIEWS.TOOL_FILE_BROWSER);
+    needsRedraw = true;
+    const firstEntry = toolBrowserState.items.length > 0 ? toolBrowserState.items[0].label : "empty";
+    announce(toolModule.name + " - Browse files, " + firstEntry);
+    debugLog("enterToolFileBrowser: view now=" + view + " items=" + toolBrowserState.items.length);
+}
+
+function toolBrowserNavigate(delta) {
+    if (!toolBrowserState || toolBrowserState.items.length === 0) return;
+    moveFilepathBrowserSelection(toolBrowserState, delta);
+    const item = toolBrowserState.items[toolBrowserState.selectedIndex];
+    announce(item.label + (item.kind === "dir" ? " folder" : ""));
+}
+
+function toolBrowserSelect() {
+    if (!toolBrowserState || toolBrowserState.items.length === 0) return;
+    const result = activateFilepathBrowserItem(toolBrowserState);
+    if (result.action === "open") {
+        refreshFilepathBrowser(toolBrowserState, FILEPATH_BROWSER_FS);
+        needsRedraw = true;
+        if (toolBrowserState.items.length > 0) {
+            announce(toolBrowserState.items[0].label);
+        } else {
+            announce("empty");
+        }
+    } else if (result.action === "select") {
+        toolSelectedFile = result.value;
+        if (toolActiveTool && toolActiveTool.tool_config && toolActiveTool.tool_config.interactive) {
+            startInteractiveTool(toolActiveTool, result.value);
+        } else if (toolActiveTool && toolActiveTool.tool_config &&
+                   toolActiveTool.tool_config.engines) {
+            enterToolEngineSelect();
+        } else {
+            toolSelectedEngine = null;
+            enterToolConfirm();
+        }
+    }
+}
+
+function toolBrowserBack() {
+    if (!toolBrowserState) { enterToolsMenu(); return; }
+    const root = toolBrowserState.root;
+    if (toolBrowserState.currentDir === root) {
+        enterToolsMenu();
+        return;
+    }
+    /* Navigate up by setting currentDir to parent */
+    const lastSlash = toolBrowserState.currentDir.lastIndexOf("/");
+    if (lastSlash > 0) {
+        toolBrowserState.currentDir = toolBrowserState.currentDir.substring(0, lastSlash);
+        if (toolBrowserState.currentDir.length < root.length) {
+            toolBrowserState.currentDir = root;
+        }
+    } else {
+        toolBrowserState.currentDir = root;
+    }
+    toolBrowserState.selectedIndex = 0;
+    toolBrowserState.selectedPath = "";
+    refreshFilepathBrowser(toolBrowserState, FILEPATH_BROWSER_FS);
+    needsRedraw = true;
+    const dirName = toolBrowserState.currentDir.substring(toolBrowserState.currentDir.lastIndexOf("/") + 1);
+    announce(dirName);
+}
+
+/* drawToolFileBrowser() -> shadow_ui_tools.mjs */
+
+/* ========== Tool Set Picker Functions ========== */
+
+function scanSetsForPicker() {
+    const SETS_DIR = "/data/UserData/UserLibrary/Sets";
+    const result = [];
+    try {
+        const entries = os.readdir(SETS_DIR) || [];
+        const dirList = entries[0];
+        if (!Array.isArray(dirList)) return result;
+        for (const uuid of dirList) {
+            if (uuid.startsWith(".")) continue;
+            const subEntries = os.readdir(SETS_DIR + "/" + uuid) || [];
+            const subList = subEntries[0];
+            if (!Array.isArray(subList)) continue;
+            for (const name of subList) {
+                if (name.startsWith(".")) continue;
+                result.push({ uuid, name });
+                break; /* only one subdirectory per UUID */
+            }
+        }
+    } catch (e) {
+        debugLog("scanSetsForPicker error: " + e);
+    }
+    result.sort((a, b) => a.name.localeCompare(b.name));
+    return result;
+}
+
+function enterToolSetPicker(toolModule) {
+    debugLog("enterToolSetPicker: " + toolModule.id);
+    toolActiveTool = toolModule;
+    toolSetList = scanSetsForPicker();
+    toolSetPickerIndex = 0;
+    setView(VIEWS.TOOL_SET_PICKER);
+    needsRedraw = true;
+    if (toolSetList.length > 0) {
+        announce(toolModule.name + " - Choose set, " + toolSetList[0].name);
+    } else {
+        announce(toolModule.name + " - No sets found");
+    }
+}
+
+function toolSetPickerNavigate(delta) {
+    if (toolSetList.length === 0) return;
+    toolSetPickerIndex = Math.max(0, Math.min(toolSetList.length - 1, toolSetPickerIndex + delta));
+    announce(toolSetList[toolSetPickerIndex].name);
+}
+
+function toolSetPickerSelect() {
+    if (toolSetList.length === 0) return;
+    const chosen = toolSetList[toolSetPickerIndex];
+    toolSelectedSetUuid = chosen.uuid;
+    toolSelectedSetName = chosen.name;
+    /* Use the set name as the "selected file" for display in confirm/processing */
+    toolSelectedFile = chosen.name;
+    toolSelectedEngine = null;
+    enterToolConfirmForSet();
+}
+
+function enterToolConfirmForSet() {
+    toolFileDurationSec = 0;  /* Unknown duration for sets */
+    setView(VIEWS.TOOL_CONFIRM);
+    needsRedraw = true;
+    announce("Render " + toolSelectedSetName + "? Jog to confirm, Back to cancel");
+}
+
+/* drawToolSetPicker() -> shadow_ui_tools.mjs */
+
+/* ========== Tool Engine Selection View ========== */
+
+/* Filter engines to only those whose command script exists on disk */
+function getAvailableEngines() {
+    const engines = toolActiveTool.tool_config.engines;
+    if (!engines) return [];
+    return engines.filter(e => {
+        const cmdPath = toolActiveTool.path + "/" + e.command;
+        try {
+            const st = os.stat(cmdPath);
+            return st && st[1] === 0;
+        } catch (err) { return false; }
+    });
+}
+
+function enterToolEngineSelect() {
+    toolEngineIndex = 0;
+    toolSelectedEngine = null;
+    toolAvailableEngines = getAvailableEngines();
+    if (toolAvailableEngines.length === 0) {
+        announce("No engines installed");
+        return;
+    }
+    if (toolAvailableEngines.length === 1) {
+        /* Only one engine available — skip selection */
+        toolSelectedEngine = toolAvailableEngines[0];
+        enterToolConfirm();
+        return;
+    }
+    setView(VIEWS.TOOL_ENGINE_SELECT);
+    needsRedraw = true;
+    announce("Choose engine, " + toolAvailableEngines[0].name);
+}
+
+function toolEngineNavigate(delta) {
+    if (toolAvailableEngines.length === 0) return;
+    toolEngineIndex = Math.max(0, Math.min(toolAvailableEngines.length - 1, toolEngineIndex + delta));
+    announce(toolAvailableEngines[toolEngineIndex].name);
+}
+
+function toolEngineConfirm() {
+    toolSelectedEngine = toolAvailableEngines[toolEngineIndex];
+    enterToolConfirm();
+}
+
+/* drawToolEngineSelect() -> shadow_ui_tools.mjs */
+
+/* ========== Tool Confirm View ========== */
+
+/* Read WAV file duration in seconds from header.
+ * WAV format: bytes 24-27 = sample rate (uint32 LE),
+ *             bytes 28-31 = byte rate (uint32 LE),
+ *             bytes 32-33 = block align (uint16 LE).
+ * File size minus header (~44 bytes) divided by byte rate = duration. */
+function getWavDurationSec(filePath) {
+    try {
+        const st = os.stat(filePath);
+        if (!st || st[1] !== 0) return 0;
+        const fileSize = st[0].size;
+
+        const fd = os.open(filePath, os.O_RDONLY);
+        if (fd < 0) return 0;
+        const buf = new ArrayBuffer(44);
+        os.read(fd, buf, 0, 44);
+        os.close(fd);
+
+        const view = new DataView(buf);
+        const byteRate = view.getUint32(28, true);  /* little-endian */
+        if (byteRate <= 0) return 0;
+        return (fileSize - 44) / byteRate;
+    } catch (e) {
+        debugLog("getWavDurationSec error: " + e);
+        return 0;
+    }
+}
+
+/* Estimate processing time based on selected engine.
+ * SpleeterRT (3-stem): ~0.5x realtime on Move's Cortex-A72.
+ * Spleeter TFLite (4-stem): ~3.0x realtime. */
+function getToolProcessingRatio() {
+    if (toolSelectedEngine && toolSelectedEngine.processing_ratio) {
+        return toolSelectedEngine.processing_ratio;
+    }
+    return 0.5;  /* default for legacy/unknown engines */
+}
+
+function formatTime(seconds) {
+    seconds = Math.round(seconds);
+    if (seconds < 60) return seconds + "s";
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    return m + "m " + (s < 10 ? "0" : "") + s + "s";
+}
+
+function enterToolConfirm() {
+    /* Read file duration for time estimate */
+    toolFileDurationSec = getWavDurationSec(toolSelectedFile);
+    /* Auto-preview the selected file */
+    if (toolSelectedFile.toLowerCase().endsWith(".wav")) {
+        wavPlayerPlay(toolSelectedFile);
+    }
+    setView(VIEWS.TOOL_CONFIRM);
+    needsRedraw = true;
+    const fileName = toolSelectedFile.substring(toolSelectedFile.lastIndexOf("/") + 1);
+    const estSec = Math.round(toolFileDurationSec * getToolProcessingRatio());
+    const estStr = estSec > 0 ? (", about " + formatTime(estSec)) : "";
+    announce("Separate " + fileName + "? Jog to confirm, Back to cancel" + estStr);
+}
+
+/* drawToolConfirm() -> shadow_ui_tools.mjs */
+
+/* ========== Tool Processing View ========== */
+
+function startToolProcess() {
+    if (!toolActiveTool || !toolSelectedFile) return;
+
+    const isSetPicker = toolActiveTool.tool_config && toolActiveTool.tool_config.set_picker;
+
+    /* Compute output directory */
+    if (isSetPicker) {
+        toolOutputDir = "/data/UserData/UserLibrary/Recordings/Renders";
+    } else {
+        const fileName = toolSelectedFile.substring(toolSelectedFile.lastIndexOf("/") + 1);
+        const baseName = fileName.replace(/\.[^.]+$/, "");  /* Remove extension */
+        toolOutputDir = "/data/UserData/UserLibrary/Samples/Move Everything/Stems/" + baseName;
+    }
+
+    /* Create output directory hierarchy */
+    if (isSetPicker) {
+        try { os.mkdir("/data/UserData/UserLibrary/Recordings", 0o755); } catch (e) {}
+        try { os.mkdir("/data/UserData/UserLibrary/Recordings/Renders", 0o755); } catch (e) {}
+    } else {
+        try { os.mkdir("/data/UserData/UserLibrary/Samples/Move Everything", 0o755); } catch (e) {}
+        try { os.mkdir("/data/UserData/UserLibrary/Samples/Move Everything/Stems", 0o755); } catch (e) {}
+        try { os.mkdir(toolOutputDir, 0o755); } catch (e) {}
+    }
+
+    /* Remove stale marker files from previous runs */
+    try { os.remove(toolOutputDir + "/.done"); } catch (e) {}
+    try { os.remove(toolOutputDir + "/.error"); } catch (e) {}
+
+    /* Spawn the tool process — use selected engine's command if available */
+    const engineCmd = toolSelectedEngine ? toolSelectedEngine.command
+        : (toolActiveTool.tool_config.command || "separate");
+    const command = toolActiveTool.path + "/" + engineCmd;
+
+    let execArgs;
+    if (isSetPicker) {
+        execArgs = [command, toolSelectedSetUuid, toolSelectedSetName, toolOutputDir];
+        debugLog("startToolProcess (set): " + command + " " + toolSelectedSetUuid + " " + toolSelectedSetName);
+    } else {
+        execArgs = [command, toolSelectedFile, toolOutputDir];
+        debugLog("startToolProcess: " + command + " " + toolSelectedFile + " " + toolOutputDir);
+    }
+
+    try {
+        toolProcessPid = os.exec(execArgs, { block: false });
+        debugLog("startToolProcess: pid=" + toolProcessPid);
+    } catch (e) {
+        debugLog("startToolProcess error: " + e);
+        toolProcessPid = -1;
+        toolResultSuccess = false;
+        toolResultMessage = "Failed to start: " + e;
+        setView(VIEWS.TOOL_RESULT);
+        needsRedraw = true;
+        announce("Error: " + toolResultMessage);
+        return;
+    }
+
+    toolProcessingDots = 0;
+    toolProcessStartTime = Date.now();
+    toolStemsFound = 0;
+    toolExpectedStems = (toolSelectedEngine && toolSelectedEngine.stems)
+        ? toolSelectedEngine.stems.length
+        : (toolActiveTool.tool_config && toolActiveTool.tool_config.stems)
+            ? toolActiveTool.tool_config.stems.length : 4;
+    setView(VIEWS.TOOL_PROCESSING);
+    needsRedraw = true;
+    const estSec = Math.round(toolFileDurationSec * getToolProcessingRatio());
+    const estStr = estSec > 0 ? (", about " + formatTime(estSec) + " remaining") : "";
+    announce("Processing" + estStr);
+}
+
+function startInteractiveTool(toolModule, filePath) {
+    toolActiveTool = toolModule;
+    toolSelectedFile = filePath;
+    toolOvertakeActive = true;
+
+    /* Non-overtake tools keep pads/buttons working for Move */
+    const skipOvertake = (toolModule.tool_config && toolModule.tool_config.overtake === false);
+    toolNonOvertake = skipOvertake;
+
+    /* Build a moduleInfo descriptor compatible with loadOvertakeModule */
+    const uiPath = toolModule.path + "/ui.js";
+    const uiStat = os.stat(uiPath);
+    if (!uiStat || uiStat[0] === -1) {
+        announce("Tool UI not found");
+        setView(VIEWS.TOOL_RESULT);
+        toolResultSuccess = false;
+        toolResultMessage = "Missing ui.js";
+        toolOvertakeActive = false;
+        toolNonOvertake = false;
+        needsRedraw = true;
+        return;
+    }
+
+    /* Check for DSP plugin */
+    const dspPath = toolModule.path + "/dsp.so";
+    const dspStat = os.stat(dspPath);
+    const hasDsp = (dspStat && dspStat[0] !== -1) ? "dsp.so" : null;
+
+    /* Construct moduleInfo in the same format as scanForOvertakeModules */
+    const moduleInfo = {
+        id: toolModule.id,
+        name: toolModule.name,
+        path: toolModule.path,
+        uiPath: uiPath,
+        dsp: hasDsp,
+        basePath: toolModule.path,
+        capabilities: toolModule.capabilities || null
+    };
+
+    /* Reuse the existing overtake module loading infrastructure */
+    announce("Loading " + toolModule.name);
+    const success = loadOvertakeModule(moduleInfo, skipOvertake);
+    if (success) {
+        /* DSP is now loaded — pass the selected file path */
+        globalThis.host_tool_file_path = filePath || "";
+        if (typeof shadow_set_param === "function") {
+            shadow_set_param(0, "overtake_dsp:file_path", filePath);
+            /* Pass project BPM for tempo-aware tools */
+            if (overlayState && overlayState.samplerBpm > 0) {
+                shadow_set_param(0, "overtake_dsp:project_bpm", String(overlayState.samplerBpm));
+            }
+        }
+    } else {
+        toolOvertakeActive = false;
+        setView(VIEWS.TOOL_RESULT);
+        toolResultSuccess = false;
+        toolResultMessage = "Failed to load tool";
+        needsRedraw = true;
+        announce("Error: Failed to load tool");
+    }
+}
+
+function countStemFiles() {
+    /* Count .wav files in the output directory */
+    try {
+        const entries = os.readdir(toolOutputDir) || [];
+        const dirList = entries[0];
+        if (!Array.isArray(dirList)) return 0;
+        let count = 0;
+        for (const name of dirList) {
+            if (name.toLowerCase().endsWith(".wav")) count++;
+        }
+        return count;
+    } catch (e) { return 0; }
+}
+
+function getStemFileNames() {
+    try {
+        const entries = os.readdir(toolOutputDir) || [];
+        const dirList = entries[0];
+        if (!Array.isArray(dirList)) return [];
+        const wavFiles = [];
+        for (const name of dirList) {
+            if (name.toLowerCase().endsWith(".wav")) wavFiles.push(name);
+        }
+        wavFiles.sort();
+        return wavFiles;
+    } catch (e) { return []; }
+}
+
+function pollToolProcess() {
+    /* Count completed stem files for progress */
+    toolStemsFound = countStemFiles();
+
+    /* Check for .done or .error marker files */
+    try {
+        const doneStat = os.stat(toolOutputDir + "/.done");
+        if (doneStat && doneStat[1] === 0) {
+            /* Success! */
+            toolProcessPid = -1;
+            toolResultSuccess = true;
+            const isSetPicker = toolActiveTool && toolActiveTool.tool_config && toolActiveTool.tool_config.set_picker;
+            if (isSetPicker) {
+                /* Set picker tools (e.g. render): skip stem review, show simple result */
+                toolResultMessage = "Saved to\nrecordings/";
+                setView(VIEWS.TOOL_RESULT);
+                needsRedraw = true;
+                announce("Complete! Saved to recordings");
+            } else {
+                toolStemFiles = getStemFileNames();
+                if (toolStemFiles.length > 0) {
+                    toolStemReviewIndex = 0;
+                    toolStemKept = new Array(toolStemFiles.length).fill(true);
+                    setView(VIEWS.TOOL_STEM_REVIEW);
+                    needsRedraw = true;
+                    announce("Complete! " + toolStemFiles.length + " stems. Push to save all, or jog to choose.");
+                } else {
+                    /* Fallback if no WAVs found */
+                    const baseName = toolOutputDir.substring(toolOutputDir.lastIndexOf("/") + 1);
+                    toolResultMessage = "Stems saved to\nStems/" + baseName + "/";
+                    setView(VIEWS.TOOL_RESULT);
+                    needsRedraw = true;
+                    announce("Complete! Stems saved to Stems " + baseName);
+                }
+            }
+            return;
+        }
+    } catch (e) { /* .done not found yet */ }
+
+    try {
+        const errStat = os.stat(toolOutputDir + "/.error");
+        if (errStat && errStat[1] === 0) {
+            /* Error */
+            toolProcessPid = -1;
+            toolResultSuccess = false;
+            try {
+                const errContent = std.loadFile(toolOutputDir + "/.error");
+                toolResultMessage = "Error: " + (errContent || "unknown").trim();
+            } catch (e2) {
+                toolResultMessage = "Error: separation failed";
+            }
+            setView(VIEWS.TOOL_RESULT);
+            needsRedraw = true;
+            announce(toolResultMessage);
+            return;
+        }
+    } catch (e) { /* .error not found yet */ }
+
+    /* Also check if process exited via waitpid (non-blocking) */
+    if (toolProcessPid > 0) {
+        try {
+            const wp = os.waitpid(toolProcessPid, os.WNOHANG);
+            if (wp && wp[0] === toolProcessPid) {
+                /* Process exited but no marker file — check exit status */
+                const status = wp[1];
+                const exitCode = (status >> 8) & 0xff;
+                if (exitCode !== 0) {
+                    toolProcessPid = -1;
+                    toolResultSuccess = false;
+                    toolResultMessage = "Process exited with code " + exitCode;
+                    setView(VIEWS.TOOL_RESULT);
+                    needsRedraw = true;
+                    announce(toolResultMessage);
+                }
+                /* If exit code 0 but no .done yet, keep polling briefly */
+            }
+        } catch (e) { /* waitpid not available or error, keep polling */ }
+    }
+}
+
+function cancelToolProcess() {
+    if (toolProcessPid > 0) {
+        try {
+            os.kill(toolProcessPid, os.SIGTERM);
+            debugLog("cancelToolProcess: killed pid " + toolProcessPid);
+        } catch (e) {
+            debugLog("cancelToolProcess error: " + e);
+        }
+        toolProcessPid = -1;
+    }
+    toolResultSuccess = false;
+    toolResultMessage = "Cancelled";
+    setView(VIEWS.TOOL_RESULT);
+    needsRedraw = true;
+    announce("Cancelled");
+}
+
+/* drawToolProcessing(), drawToolResult(), drawToolStemReview() -> shadow_ui_tools.mjs */
 
 /* ========== Global Settings Functions ========== */
 
@@ -2966,21 +3782,7 @@ function handleGlobalSettingsAction(key) {
 
 /* ========== End Global Settings Functions ========== */
 
-function enterMasterFxSettings() {
-    /* Scan for available audio_fx modules */
-    MASTER_FX_OPTIONS = scanForAudioFxModules();
-    /* Load current master FX chain configuration from DSP */
-    loadMasterFxChainConfig();
-    selectedMasterFxComponent = 0;  // Start at FX 1
-    selectingMasterFxModule = false;
-    setView(VIEWS.MASTER_FX);
-    needsRedraw = true;
-
-    /* Announce menu title + initial selection */
-    const comp = MASTER_FX_CHAIN_COMPONENTS[0];
-    const moduleName = getMasterFxSlotModule(0) || "Empty";
-    announce(`Master FX, ${comp.label} ${moduleName}`);
-}
+/* enterMasterFxSettings() -> shadow_ui_master_fx.mjs */
 
 /* Load master FX chain configuration from DSP */
 function loadMasterFxChainConfig() {
@@ -3024,7 +3826,7 @@ function getMasterFxSlotModule(slotIndex) {
 function setMasterFxSlotModule(slotIndex, dspPath) {
     if (typeof shadow_set_param !== "function") return false;
     /* Clear warning tracking for this slot so warning can show again for new module */
-    assetWarningShownForMasterFx.delete(slotIndex);
+    warningShownForMasterFx.delete(slotIndex);
     try {
         return shadow_set_param(0, `master_fx:fx${slotIndex + 1}:module`, dspPath || "");
     } catch (e) {
@@ -3169,11 +3971,16 @@ function saveMasterFxChainConfig() {
         if (typeof overlay_knobs_get_mode === "function") {
             config.overlay_knobs_mode = overlay_knobs_get_mode();
         }
+        /* Save TTS debounce */
+        if (typeof tts_get_debounce === "function") {
+            config.tts_debounce_ms = tts_get_debounce();
+        }
         /* Use JS-cached values instead of reading from shim to avoid
          * race condition where periodic autosave reads shim defaults
          * before loadMasterFxChainFromConfig() has restored them. */
         config.resample_bridge_mode = cachedResampleBridgeMode;
         config.link_audio_routing = cachedLinkAudioRouting;
+        config.link_audio_publish = cachedLinkAudioPublish;
 
         host_write_file(configPath, JSON.stringify(config, null, 2));
     } catch (e) {
@@ -3228,6 +4035,10 @@ function loadMasterFxChainFromConfig() {
         if (typeof config.overlay_knobs_mode === "number" && typeof overlay_knobs_set_mode === "function") {
             overlay_knobs_set_mode(config.overlay_knobs_mode);
         }
+        /* Restore TTS debounce */
+        if (typeof config.tts_debounce_ms === "number" && typeof tts_set_debounce === "function") {
+            tts_set_debounce(config.tts_debounce_ms);
+        }
         if (config.resample_bridge_mode !== undefined && typeof shadow_set_param === "function") {
             const mode = parseResampleBridgeMode(config.resample_bridge_mode);
             shadow_set_param(0, "master_fx:resample_bridge", String(mode));
@@ -3236,6 +4047,10 @@ function loadMasterFxChainFromConfig() {
         if (config.link_audio_routing !== undefined && typeof shadow_set_param === "function") {
             shadow_set_param(0, "master_fx:link_audio_routing", config.link_audio_routing ? "1" : "0");
             cachedLinkAudioRouting = !!config.link_audio_routing;
+        }
+        if (config.link_audio_publish !== undefined && typeof shadow_set_param === "function") {
+            shadow_set_param(0, "master_fx:link_audio_publish", config.link_audio_publish ? "1" : "0");
+            cachedLinkAudioPublish = !!config.link_audio_publish;
         }
 
         if (!config.master_fx_chain) return;
@@ -3992,7 +4807,13 @@ function getChainSettingValue(slot, setting) {
 
     if (setting.key === "slot:volume") {
         const pct = Math.round(parseFloat(val) * 100);
-        return pct === 0 ? "Muted" : `${pct}%`;
+        return `${pct}%`;
+    }
+    if (setting.key === "slot:muted") {
+        return parseInt(val) ? "Yes" : "No";
+    }
+    if (setting.key === "slot:soloed") {
+        return parseInt(val) ? "Yes" : "No";
     }
     if (setting.key === "slot:forward_channel") {
         const ch = parseInt(val);
@@ -4061,6 +4882,12 @@ function getKnobTargets(slot) {
     const targets = [{ id: "", name: "(None)" }];
     const cfg = chainConfigs[slot];
     if (!cfg) return targets;
+
+    /* MIDI FX */
+    if (cfg.midiFx && cfg.midiFx.module) {
+        const name = getSlotParam(slot, "midi_fx1:name") || cfg.midiFx.module;
+        targets.push({ id: "midi_fx1", name: `MIDI FX: ${name}` });
+    }
 
     /* Synth */
     if (cfg.synth && cfg.synth.module) {
@@ -4384,6 +5211,8 @@ function enterHierarchyEditor(slotIndex, componentKey) {
     hierEditorEditMode = false;
     hierEditorIsMasterFx = false;
     hierEditorMasterFxSlot = -1;
+    filepathBrowserState = null;
+    filepathBrowserParamKey = "";
 
     /* Fetch chain_params metadata for this component */
     hierEditorChainParams = getComponentChainParams(slotIndex, componentKey);
@@ -4529,7 +5358,7 @@ function loadHierarchyLevel() {
         hierEditorKnobs = levelDef.knobs || [];
 
         /* Fetch preset count and current preset */
-        const prefix = hierEditorComponent;
+        const prefix = getComponentParamPrefix(hierEditorComponent);
         const countStr = getSlotParam(hierEditorSlot, `${prefix}:${levelDef.count_param}`);
         hierEditorPresetCount = countStr ? parseInt(countStr) : 0;
 
@@ -4554,7 +5383,7 @@ function loadHierarchyLevel() {
         hierEditorKnobs = levelDef.knobs || [];
 
         /* Fetch items list from plugin */
-        const prefix = hierEditorComponent;
+        const prefix = getComponentParamPrefix(hierEditorComponent);
         const itemsJson = getSlotParam(hierEditorSlot, `${prefix}:${levelDef.items_param}`);
         let items = [];
         if (itemsJson) {
@@ -4597,7 +5426,7 @@ function changeHierPreset(delta) {
     if (newPreset >= hierEditorPresetCount) newPreset = 0;
 
     /* Apply the preset change */
-    const prefix = hierEditorComponent;
+    const prefix = getComponentParamPrefix(hierEditorComponent);
     setSlotParam(hierEditorSlot, `${prefix}:${levelDef.list_param}`, String(newPreset));
 
     /* Update local state */
@@ -4642,9 +5471,101 @@ function exitHierarchyEditor() {
     hierEditorPresetEditMode = false;
     hierEditorIsMasterFx = false;
     hierEditorMasterFxSlot = -1;
+    filepathBrowserState = null;
+    filepathBrowserParamKey = "";
 
     view = returnToMasterFx ? VIEWS.MASTER_FX : VIEWS.CHAIN_EDIT;
     needsRedraw = true;
+}
+
+/* Refresh chain_params metadata for dynamic filepath fields (e.g. start_path). */
+function refreshHierarchyChainParams() {
+    if (hierEditorIsMasterFx) {
+        if (hierEditorMasterFxSlot >= 0) {
+            hierEditorChainParams = getMasterFxChainParams(hierEditorMasterFxSlot);
+        }
+        return;
+    }
+
+    if (hierEditorSlot >= 0 && hierEditorComponent) {
+        hierEditorChainParams = getComponentChainParams(hierEditorSlot, hierEditorComponent);
+    }
+}
+
+/* Open generic file browser for a filepath parameter */
+function openHierarchyFilepathBrowser(key, meta) {
+    refreshHierarchyChainParams();
+    const effectiveMeta = getParamMetadata(key) || meta;
+    if (!effectiveMeta || effectiveMeta.type !== "filepath") return false;
+
+    const fullKey = buildHierarchyParamKey(key);
+    const currentVal = getSlotParam(hierEditorSlot, fullKey) || "";
+    const prefix = getComponentParamPrefix(hierEditorComponent);
+
+    filepathBrowserParamKey = key;
+    filepathBrowserState = buildFilepathBrowserState(effectiveMeta, currentVal);
+    filepathBrowserState.livePreviewEnabled = parseMetaBool(effectiveMeta.live_preview);
+    filepathBrowserState.previewOriginalValue = currentVal;
+    filepathBrowserState.previewCurrentValue = currentVal;
+    filepathBrowserState.previewCommitted = false;
+    filepathBrowserState.previewParamFullKey = fullKey;
+    filepathBrowserState.previewPendingPath = "";
+    filepathBrowserState.previewPendingTime = 0;
+    filepathBrowserState.previewSelectedPath = "";
+    const hooks = buildFilepathBrowserHooks(effectiveMeta, prefix);
+    filepathBrowserState.hooksOnOpen = hooks.onOpen;
+    filepathBrowserState.hooksOnPreview = hooks.onPreview;
+    filepathBrowserState.hooksOnCancel = hooks.onCancel;
+    filepathBrowserState.hooksOnCommit = hooks.onCommit;
+    filepathBrowserState.hookRestoreValues = {};
+    applyFilepathHookActions(filepathBrowserState, filepathBrowserState.hooksOnOpen, { path: currentVal });
+
+    refreshFilepathBrowser(filepathBrowserState, FILEPATH_BROWSER_FS);
+
+    if (filepathBrowserState.livePreviewEnabled) {
+        const selected = filepathBrowserState.items[filepathBrowserState.selectedIndex];
+        applyLivePreview(filepathBrowserState, selected);
+    }
+
+    setView(VIEWS.FILEPATH_BROWSER);
+
+    if (filepathBrowserState.items.length > 0) {
+        const selected = filepathBrowserState.items[filepathBrowserState.selectedIndex];
+        announceMenuItem(selected.label || "File", "");
+    } else {
+        announce("No files found");
+    }
+
+    return true;
+}
+
+function closeHierarchyFilepathBrowser() {
+    const state = filepathBrowserState;
+    if (state) {
+        const committed = !!state.previewCommitted;
+        if (state.livePreviewEnabled &&
+            !committed &&
+            state.previewParamFullKey &&
+            state.previewCurrentValue !== state.previewOriginalValue) {
+            setSlotParam(
+                hierEditorSlot,
+                state.previewParamFullKey,
+                state.previewOriginalValue || ""
+            );
+        }
+
+        if (committed) {
+            applyFilepathHookActions(state, state.hooksOnCommit, { path: state.previewSelectedPath || state.previewCurrentValue || "" });
+        } else {
+            applyFilepathHookActions(state, state.hooksOnCancel, { path: state.previewOriginalValue || "" });
+        }
+
+        restoreFilepathHookActions(state);
+    }
+
+    filepathBrowserState = null;
+    filepathBrowserParamKey = "";
+    setView(VIEWS.HIERARCHY_EDITOR);
 }
 
 /* Get param metadata from chain_params */
@@ -4670,10 +5591,10 @@ function formatParamForOverlay(val, meta) {
     if (meta && (meta.type === "enum" || meta.type === "bool")) {
         return String(val);
     }
-    /* Float: show as percentage if 0-1 range */
+    /* Float: show as percentage if 0-1 or 0-2 range */
     const min = meta && typeof meta.min === "number" ? meta.min : 0;
     const max = meta && typeof meta.max === "number" ? meta.max : 1;
-    if (min === 0 && max === 1) {
+    if (min === 0 && max >= 1 && max <= 4) {
         return Math.round(val * 100) + "%";
     }
     return val.toFixed(2);
@@ -4768,7 +5689,7 @@ function buildKnobContextForKnob(knobIndex) {
             meta,
             pluginName,
             displayName,
-            title: `${pluginName} ${displayName}`
+            title: `S${hierEditorSlot + 1}: ${pluginName} ${displayName}`
         };
     }
 
@@ -4826,7 +5747,7 @@ function buildKnobContextForKnob(knobIndex) {
                         meta,
                         pluginName,
                         displayName,
-                        title: `${pluginName} ${displayName}`
+                        title: `S${selectedSlot + 1}: ${pluginName} ${displayName}`
                     };
                 }
                 debugLog(`buildKnobContext: no knob mapping for knobIndex=${knobIndex}, levelDef.knobs=${levelDef?.knobs ? JSON.stringify(levelDef.knobs) : 'undefined'}`);
@@ -4849,7 +5770,7 @@ function buildKnobContextForKnob(knobIndex) {
                         meta: param,
                         pluginName,
                         displayName,
-                        title: `${pluginName} ${displayName}`
+                        title: `S${selectedSlot + 1}: ${pluginName} ${displayName}`
                     };
                 }
             }
@@ -5195,6 +6116,12 @@ function formatHierDisplayValue(key, val) {
         return val;
     }
 
+    if (meta && meta.type === "filepath") {
+        if (!val) return "";
+        const slashIdx = val.lastIndexOf('/');
+        return slashIdx >= 0 ? val.slice(slashIdx + 1) : val;
+    }
+
     const num = parseFloat(val);
     if (isNaN(num)) return val;
 
@@ -5211,6 +6138,43 @@ function formatHierDisplayValue(key, val) {
         return Math.round(num).toString();
     }
     return num.toFixed(2);
+}
+
+/* Draw filepath browser for filepath chain params */
+function drawFilepathBrowser() {
+    clear_screen();
+
+    const state = filepathBrowserState;
+    const title = state && state.title ? state.title : "File Browser";
+    drawHeader(truncateText(title, 24));
+
+    if (!state) {
+        print(4, LIST_TOP_Y, "Browser unavailable", 1);
+        drawFooter({ left: "Push: return", right: "Jog: scroll" });
+        return;
+    }
+
+    if (state.error) {
+        print(4, LIST_TOP_Y, truncateText(state.error, 20), 1);
+    }
+
+    if (!state.items || state.items.length === 0) {
+        print(4, LIST_TOP_Y + 10, "No files", 1);
+    } else {
+        drawMenuList({
+            items: state.items,
+            selectedIndex: state.selectedIndex,
+            listArea: { topY: LIST_TOP_Y, bottomY: FOOTER_RULE_Y },
+            getLabel: (item) => item.label,
+            getValue: () => ""
+        });
+    }
+
+    const selected = state.items && state.items.length > 0
+        ? state.items[state.selectedIndex]
+        : null;
+    const actionText = selected && selected.kind === "file" ? "Push: select" : "Push: open";
+    drawFooter({ left: actionText, right: "Jog: scroll" });
 }
 
 /* Draw the hierarchy-based parameter editor */
@@ -5270,14 +6234,15 @@ function drawHierarchyEditor() {
         if (hierEditorPresetCount === 0 && hierEditorLevel && hierEditorHierarchy && hierEditorHierarchy.levels) {
             const levelDef = hierEditorHierarchy.levels[hierEditorLevel];
             if (levelDef && levelDef.count_param) {
-                const countStr = getSlotParam(hierEditorSlot, `${hierEditorComponent}:${levelDef.count_param}`);
+                const retryPrefix = getComponentParamPrefix(hierEditorComponent);
+                const countStr = getSlotParam(hierEditorSlot, `${retryPrefix}:${levelDef.count_param}`);
                 const newCount = countStr ? parseInt(countStr) : 0;
                 if (newCount > 0) {
                     hierEditorPresetCount = newCount;
-                    const presetStr = getSlotParam(hierEditorSlot, `${hierEditorComponent}:${levelDef.list_param}`);
+                    const presetStr = getSlotParam(hierEditorSlot, `${retryPrefix}:${levelDef.list_param}`);
                     hierEditorPresetIndex = presetStr ? parseInt(presetStr) : 0;
                     const nameParam = levelDef.name_param || "preset_name";
-                    hierEditorPresetName = getSlotParam(hierEditorSlot, `${hierEditorComponent}:${nameParam}`) || "";
+                    hierEditorPresetName = getSlotParam(hierEditorSlot, `${retryPrefix}:${nameParam}`) || "";
                 }
             }
         }
@@ -5301,7 +6266,7 @@ function drawHierarchyEditor() {
         }
 
         /* Footer hints - always push to edit (for swap/params) */
-        drawFooter("Jog:browse  Push:edit");
+        drawFooter({left: "Push: edit", right: "Jog: browse"});
     } else {
         /* Draw param list */
         if (hierEditorParams.length === 0) {
@@ -5372,12 +6337,15 @@ function drawHierarchyEditor() {
                 getLabel: (item) => item.label,
                 getValue: (item) => item.value,
                 valueAlignRight: true,
-                editMode: hierEditorEditMode
+                editMode: hierEditorEditMode,
+                scrollSelectedValue: true,
+                prioritizeSelectedValue: true,
+                selectedMinLabelChars: 6
             });
         }
 
         /* Footer hints */
-        const hint = hierEditorEditMode ? "Jog:adjust  Push:done" : "Jog:scroll  Push:edit";
+        const hint = hierEditorEditMode ? {left: "Push: done", right: "Jog: adjust"} : {left: "Push: edit", right: "Jog: scroll"};
         drawFooter(hint);
     }
 }
@@ -5406,54 +6374,7 @@ function changeComponentPreset(delta) {
     announce(`${presetName}, Preset ${editComponentPreset + 1} of ${editComponentPresetCount}`);
 }
 
-/* Get current value for a slot setting */
-function getSlotSettingValue(slot, setting) {
-    if (setting.key === "patch") {
-        return slots[slot]?.name || "Unknown";
-    }
-    const val = getSlotParam(slot, setting.key);
-    if (val === null) return "-";
-
-    if (setting.key === "slot:volume") {
-        const num = parseFloat(val);
-        const pct = isNaN(num) ? 0 : Math.round(num * 100);
-        return pct === 0 ? "Muted" : `${pct}%`;
-    }
-    if (setting.key === "slot:forward_channel") {
-        const ch = parseInt(val);
-        if (ch === -2) return "Thru";
-        if (ch === -1) return "Auto";
-        return `Ch ${ch + 1}`;
-    }
-    if (setting.key === "slot:receive_channel") {
-        const ch = parseInt(val);
-        return ch === 0 ? "All" : `Ch ${val}`;
-    }
-    return val;
-}
-
-/* Adjust a slot setting by delta */
-function adjustSlotSetting(slot, setting, delta) {
-    if (setting.type === "action") return;
-
-    const current = getSlotParam(slot, setting.key);
-    let val;
-
-    if (setting.type === "float") {
-        val = parseFloat(current) || 0;
-        val += delta * setting.step;
-    } else {
-        val = parseInt(current) || 0;
-        val += delta * setting.step;
-    }
-
-    /* Clamp to range */
-    val = Math.max(setting.min, Math.min(setting.max, val));
-
-    /* Format and set */
-    const newVal = setting.type === "float" ? val.toFixed(2) : String(Math.round(val));
-    setSlotParam(slot, setting.key, newVal);
-}
+/* getSlotSettingValue(), adjustSlotSetting() -> shadow_ui_slots.mjs */
 
 /* Get Master FX setting current value for display */
 function getMasterFxSettingValue(setting) {
@@ -5467,6 +6388,10 @@ function getMasterFxSettingValue(setting) {
         const val = shadow_get_param(0, "master_fx:link_audio_routing");
         return (val === "1") ? "On" : "Off";
     }
+    if (setting.key === "link_audio_publish") {
+        const val = shadow_get_param(0, "master_fx:link_audio_publish");
+        return (val === "1") ? "On" : "Off";
+    }
     if (setting.key === "resample_bridge") {
         const modeRaw = shadow_get_param(0, "master_fx:resample_bridge");
         const mode = parseResampleBridgeMode(modeRaw);
@@ -5474,7 +6399,7 @@ function getMasterFxSettingValue(setting) {
     }
     if (setting.key === "overlay_knobs") {
         const mode = typeof overlay_knobs_get_mode === "function" ? overlay_knobs_get_mode() : 0;
-        return ["+Shift", "+Jog Touch", "Off"][mode] || "+Shift";
+        return ["+Shift", "+Jog Touch", "Off", "Native"][mode] || "+Shift";
     }
     if (setting.key === "display_mirror") {
         return (typeof display_mirror_get === "function" && display_mirror_get()) ? "On" : "Off";
@@ -5507,6 +6432,19 @@ function getMasterFxSettingValue(setting) {
         }
         return "70%";
     }
+    if (setting.key === "screen_reader_debounce") {
+        if (typeof tts_get_debounce === "function") {
+            return tts_get_debounce() + "ms";
+        }
+        return "300ms";
+    }
+    if (setting.key === "set_pages_enabled") {
+        return (typeof set_pages_get === "function" && set_pages_get()) ? "On" : "Off";
+    }
+    if (setting.key === "skipback_shortcut") {
+        const val = typeof skipback_shortcut_get === "function" ? (skipback_shortcut_get() ? 1 : 0) : 0;
+        return ["Sh+Cap", "Sh+Vol+Cap"][val] || "Sh+Cap";
+    }
     if (setting.key === "auto_update_check") {
         return autoUpdateCheckEnabled ? "On" : "Off";
     }
@@ -5531,6 +6469,16 @@ function adjustMasterFxSetting(setting, delta) {
         shadow_set_param(0, "master_fx:link_audio_routing", newVal);
         cachedLinkAudioRouting = (newVal === "1");
         saveMasterFxChainConfig();
+        if (newVal === "1") warnIfLinkDisabled("Route thru ME");
+        return;
+    }
+    if (setting.key === "link_audio_publish") {
+        const current = shadow_get_param(0, "master_fx:link_audio_publish");
+        const newVal = (current === "1") ? "0" : "1";
+        shadow_set_param(0, "master_fx:link_audio_publish", newVal);
+        cachedLinkAudioPublish = (newVal === "1");
+        saveMasterFxChainConfig();
+        if (newVal === "1") warnIfLinkDisabled("ME->Link Audio");
         return;
     }
     if (setting.key === "resample_bridge") {
@@ -5544,6 +6492,11 @@ function adjustMasterFxSetting(setting, delta) {
         shadow_set_param(0, "master_fx:resample_bridge", String(values[nextIdx]));
         cachedResampleBridgeMode = values[nextIdx];
         saveMasterFxChainConfig();
+        if (values[nextIdx] === 2) {
+            warningTitle = "ME Mix";
+            warningLines = wrapText("Replaces Mic and Line-in with ME + Move Audio", 18);
+            warningActive = true;
+        }
         return;
     }
 
@@ -5604,6 +6557,31 @@ function adjustMasterFxSetting(setting, delta) {
         return;
     }
 
+    if (setting.key === "screen_reader_debounce" && typeof tts_set_debounce === "function") {
+        let val = typeof tts_get_debounce === "function" ? tts_get_debounce() : 300;
+        val += delta * setting.step;
+        val = Math.max(setting.min, Math.min(setting.max, val));
+        tts_set_debounce(Math.round(val));
+        return;
+    }
+
+    if (setting.key === "set_pages_enabled" && typeof set_pages_set === "function") {
+        const current = typeof set_pages_get === "function" ? set_pages_get() : true;
+        set_pages_set(!current ? 1 : 0);
+        return;
+    }
+
+    if (setting.key === "skipback_shortcut") {
+        if (typeof skipback_shortcut_set !== "function") return;
+        const current = typeof skipback_shortcut_get === "function" ? (skipback_shortcut_get() ? 1 : 0) : 0;
+        const values = setting.values;
+        let idx = values.indexOf(current);
+        if (idx < 0) idx = 0;
+        const nextIdx = (idx + (delta > 0 ? 1 : values.length - 1)) % values.length;
+        skipback_shortcut_set(values[nextIdx]);
+        return;
+    }
+
     if (setting.key === "auto_update_check") {
         autoUpdateCheckEnabled = !autoUpdateCheckEnabled;
         saveAutoUpdateConfig();
@@ -5618,25 +6596,29 @@ function updateFocusedSlot(slot) {
     }
 
     /* Check for synth errors when selecting a chain slot (not Master FX) */
-    if (slot >= 0 && slot < SHADOW_UI_SLOTS && !assetWarningShownForSlots.has(slot)) {
-        const synthModule = getSlotParam(slot, "synth_module");
-        if (synthModule && synthModule.length > 0) {
-            /* Slot has a synth - check for errors */
-            if (checkAndShowSynthError(slot)) {
-                assetWarningShownForSlots.add(slot);
+    if (slot >= 0 && slot < SHADOW_UI_SLOTS) {
+        if (!warningShownForSlots.has(slot)) {
+            const synthModule = getSlotParam(slot, "synth_module");
+            if (synthModule && synthModule.length > 0) {
+                /* Slot has a synth - check for errors */
+                if (checkAndShowSynthError(slot)) {
+                    warningShownForSlots.add(slot);
+                    return;
+                }
             }
         }
+
     }
 
     /* Check for Master FX errors when selecting the Master FX slot (slot 4) */
     if (slot === SHADOW_UI_SLOTS) {  /* Slot 4 = Master FX */
         for (let fx = 0; fx < 4; fx++) {
-            if (assetWarningShownForMasterFx.has(fx)) continue;
+            if (warningShownForMasterFx.has(fx)) continue;
             const fxModule = getMasterFxParam(fx, "module");
             if (fxModule && fxModule.length > 0) {
                 /* FX slot has a module loaded - check for errors */
                 if (checkAndShowMasterFxError(fx)) {
-                    assetWarningShownForMasterFx.add(fx);
+                    warningShownForMasterFx.add(fx);
                     break;  /* Show one warning at a time */
                 }
             }
@@ -5648,16 +6630,13 @@ function handleJog(delta) {
     hideOverlay();
     switch (view) {
         case VIEWS.SLOTS:
-            /* 5 items: 4 slots + Master FX */
-            selectedSlot = Math.max(0, Math.min(slots.length, selectedSlot + delta));
-            /* Update focused slot: 0-3 for chain slots, 4 for Master FX */
-            updateFocusedSlot(selectedSlot);
+            handleSlotsJog(delta);
             break;
         case VIEWS.MASTER_FX:
             if (masterShowingNamePreview) {
                 /* Navigate Edit/OK */
                 masterNamePreviewIndex = masterNamePreviewIndex === 0 ? 1 : 0;
-                announce(masterNamePreviewIndex === 0 ? "Edit" : "OK");
+                announceSavePreview(masterPendingSaveName, masterNamePreviewIndex, false);
             } else if (masterConfirmingOverwrite || masterConfirmingDelete) {
                 /* Navigate No/Yes */
                 masterConfirmIndex = masterConfirmIndex === 0 ? 1 : 0;
@@ -5711,54 +6690,16 @@ function handleJog(delta) {
             }
             break;
         case VIEWS.SLOT_SETTINGS:
-            if (editingSettingValue) {
-                /* Adjust the setting value */
-                const setting = SLOT_SETTINGS[selectedSetting];
-                adjustSlotSetting(selectedSlot, setting, delta);
-                /* Announce new value */
-                const newVal = getSlotSettingValue(selectedSlot, setting);
-                announceParameter(setting.label, newVal);
-            } else {
-                /* Navigate settings list */
-                selectedSetting = Math.max(0, Math.min(SLOT_SETTINGS.length - 1, selectedSetting + delta));
-                /* Announce selected setting */
-                const setting = SLOT_SETTINGS[selectedSetting];
-                const val = getSlotSettingValue(selectedSlot, setting);
-                announceMenuItem(setting.label, val);
-            }
+            handleSlotSettingsJog(delta);
             break;
         case VIEWS.PATCHES:
-            selectedPatch = Math.max(0, Math.min(patches.length - 1, selectedPatch + delta));
-            if (patches.length > 0) {
-                const p = patches[selectedPatch];
-                announceMenuItem("Patch", p.name || p);
-            }
+            handlePatchesJog(delta);
             break;
         case VIEWS.PATCH_DETAIL:
-            const detailItems = getDetailItems();
-            selectedDetailItem = Math.max(0, Math.min(detailItems.length - 1, selectedDetailItem + delta));
-            if (detailItems.length > 0) {
-                const di = detailItems[selectedDetailItem];
-                announceMenuItem(di.label || di.component || "Item", di.value || "");
-            }
+            handlePatchDetailJog(delta);
             break;
         case VIEWS.COMPONENT_PARAMS:
-            if (editingValue && componentParams.length > 0) {
-                /* Adjusting value - modify the current param */
-                const param = componentParams[selectedParam];
-                const newVal = adjustParamValue(param, delta);
-                param.value = newVal;
-                /* Apply immediately */
-                setSlotParam(selectedSlot, param.key, newVal);
-                announceParameter(param.name || param.key, newVal);
-            } else {
-                /* Selecting param */
-                selectedParam = Math.max(0, Math.min(componentParams.length - 1, selectedParam + delta));
-                if (componentParams.length > 0) {
-                    const cp = componentParams[selectedParam];
-                    announceMenuItem(cp.name || cp.key, cp.value || "");
-                }
-            }
+            handleComponentParamsJog(delta);
             break;
         case VIEWS.CHAIN_EDIT:
             /* Navigate horizontally through chain components (-1 = chain/patch selection) */
@@ -5793,7 +6734,7 @@ function handleJog(delta) {
         case VIEWS.CHAIN_SETTINGS:
             if (showingNamePreview) {
                 namePreviewIndex = namePreviewIndex === 0 ? 1 : 0;
-                announce(namePreviewIndex === 0 ? "Edit" : "OK");
+                announceSavePreview(pendingSaveName, namePreviewIndex, false);
             } else if (confirmingOverwrite || confirmingDelete) {
                 confirmIndex = confirmIndex === 0 ? 1 : 0;
                 announce(confirmIndex === 0 ? "No" : "Yes");
@@ -5842,6 +6783,20 @@ function handleJog(delta) {
                     const param = hierEditorParams[hierEditorSelectedIdx];
                     announceMenuItem(param.label || param.key, param.value || "");
                 }
+            }
+            break;
+        case VIEWS.FILEPATH_BROWSER:
+            if (filepathBrowserState) {
+                moveFilepathBrowserSelection(filepathBrowserState, delta);
+                const selected = filepathBrowserState.items[filepathBrowserState.selectedIndex];
+                if (filepathBrowserState.livePreviewEnabled && selected && selected.kind === "file" && selected.path) {
+                    filepathBrowserState.previewPendingPath = selected.path;
+                    filepathBrowserState.previewPendingTime = Date.now();
+                } else if (filepathBrowserState.livePreviewEnabled) {
+                    filepathBrowserState.previewPendingPath = "";
+                    filepathBrowserState.previewPendingTime = 0;
+                }
+                if (selected) announceMenuItem(selected.label || "File", "");
             }
             break;
         case VIEWS.KNOB_EDITOR:
@@ -5900,6 +6855,39 @@ function handleJog(delta) {
                 announceMenuItem("Module", om.name || om.id || "Unknown");
             }
             break;
+        case VIEWS.TOOLS:
+            toolsMenuIndex = Math.max(0, Math.min(toolModules.length - 1, toolsMenuIndex + delta));
+            if (toolModules.length > 0) {
+                announce(toolModules[toolsMenuIndex].name);
+            }
+            break;
+        case VIEWS.TOOL_FILE_BROWSER:
+            toolBrowserNavigate(delta);
+            break;
+        case VIEWS.TOOL_SET_PICKER:
+            toolSetPickerNavigate(delta);
+            break;
+        case VIEWS.TOOL_ENGINE_SELECT:
+            toolEngineNavigate(delta);
+            break;
+        case VIEWS.TOOL_STEM_REVIEW: {
+            const maxIdx = toolStemFiles.length; // 0=Save All, 1..N=stems
+            toolStemReviewIndex = Math.max(0, Math.min(maxIdx, toolStemReviewIndex + delta));
+            if (toolStemReviewIndex === 0) {
+                wavPlayerStop();
+                const kc = toolStemKept.filter(k => k).length;
+                if (kc === 0) announce("Cancel");
+                else if (kc === toolStemFiles.length) announce("Save All");
+                else announce("Save " + kc + " stems");
+            } else {
+                /* Preview the highlighted stem */
+                wavPlayerPlay(toolOutputDir + "/" + toolStemFiles[toolStemReviewIndex - 1]);
+                const name = toolStemFiles[toolStemReviewIndex - 1].replace(/\.wav$/i, "");
+                const kept = toolStemKept[toolStemReviewIndex - 1];
+                announce(name + (kept ? ", selected" : ", deselected"));
+            }
+            break;
+        }
         case VIEWS.OVERTAKE_MODULE:
             /* Overtake module handles its own jog input */
             break;
@@ -5936,16 +6924,11 @@ function handleJog(delta) {
 }
 
 function handleSelect() {
+    debugLog("handleSelect called, view=" + view);
     hideOverlay();
     switch (view) {
         case VIEWS.SLOTS:
-            if (selectedSlot < slots.length) {
-                /* Go directly to chain editor */
-                enterChainEdit(selectedSlot);
-            } else {
-                /* Master FX selected */
-                enterMasterFxSettings();
-            }
+            handleSlotsSelect();
             break;
         case VIEWS.MASTER_FX:
             if (masterShowingNamePreview) {
@@ -5957,14 +6940,17 @@ function handleSelect() {
                     openTextEntry({
                         title: "Save As",
                         initialText: savedName,
+                        onAnnounce: announce,
                         onConfirm: (newName) => {
                             masterPendingSaveName = newName;
                             masterShowingNamePreview = true;
                             masterNamePreviewIndex = 1;
+                            announceSavePreview(masterPendingSaveName, masterNamePreviewIndex);
                             needsRedraw = true;
                         },
                         onCancel: () => {
                             masterShowingNamePreview = true;
+                            announceSavePreview(masterPendingSaveName, masterNamePreviewIndex);
                             needsRedraw = true;
                         }
                     });
@@ -5992,6 +6978,7 @@ function handleSelect() {
                     if (masterOverwriteFromKeyboard) {
                         masterShowingNamePreview = true;
                         masterNamePreviewIndex = 0;
+                        announceSavePreview(masterPendingSaveName, masterNamePreviewIndex);
                     }
                     /* If not from keyboard, just return to settings menu */
                 } else {
@@ -6046,7 +7033,7 @@ function handleSelect() {
                     helpDetailScrollState = createScrollableText({
                         lines: item.lines,
                         actionLabel: "Back",
-                        visibleLines: 3,
+                        visibleLines: 4,
                         onActionSelected: (label) => announce(label)
                     });
                     needsRedraw = true;
@@ -6109,57 +7096,16 @@ function handleSelect() {
             }
             break;
         case VIEWS.SLOT_SETTINGS:
-            const setting = SLOT_SETTINGS[selectedSetting];
-            if (setting.type === "action") {
-                if (setting.key === "patch") {
-                    /* Patch action - go to patch browser */
-                    enterPatchBrowser(selectedSlot);
-                } else if (setting.key === "chain") {
-                    /* Chain action - go to chain editor */
-                    enterChainEdit(selectedSlot);
-                }
-            } else {
-                /* Toggle editing mode for value settings */
-                editingSettingValue = !editingSettingValue;
-            }
+            handleSlotSettingsSelect();
             break;
         case VIEWS.PATCHES:
-            if (patches.length > 0) {
-                /* Load patch and return to chain edit */
-                applyPatchSelection();
-                /* Refresh chain config to show newly loaded synth/FX */
-                loadChainConfigFromSlot(selectedSlot);
-                setView(VIEWS.CHAIN_EDIT);
-                needsRedraw = true;
-            }
+            handlePatchesSelect();
             break;
         case VIEWS.PATCH_DETAIL:
-            const detailItems = getDetailItems();
-            const item = detailItems[selectedDetailItem];
-            if (item.component && item.editable) {
-                /* Enter component param editor */
-                enterComponentParams(selectedSlot, item.component);
-            } else if (selectedDetailItem === detailItems.length - 1) {
-                /* "Load Patch" selected - apply and return to chain edit */
-                applyPatchSelection();
-                /* Refresh chain config to show newly loaded synth/FX */
-                loadChainConfigFromSlot(selectedSlot);
-                setView(VIEWS.CHAIN_EDIT);
-                announce("Patch loaded");
-                needsRedraw = true;
-            }
+            handlePatchDetailSelect();
             break;
         case VIEWS.COMPONENT_PARAMS:
-            if (componentParams.length > 0) {
-                /* Toggle between selecting and editing */
-                editingValue = !editingValue;
-                const cp = componentParams[selectedParam];
-                if (editingValue) {
-                    announceParameter(cp.name || cp.key, cp.value || "");
-                } else {
-                    announce("Done editing");
-                }
-            }
+            handleComponentParamsSelect();
             break;
         case VIEWS.CHAIN_EDIT:
             if (selectedChainComponent === -1) {
@@ -6224,17 +7170,19 @@ function handleSelect() {
                         openTextEntry({
                             title: "Save As",
                             initialText: savedName,
+                            onAnnounce: announce,
                             onConfirm: (newName) => {
                                 pendingSaveName = newName;
                                 /* Return to name preview with edited name */
                                 showingNamePreview = true;
                                 namePreviewIndex = 1;  /* Default to OK */
-                                announce(`Confirm save as: ${pendingSaveName}`);
+                                announceSavePreview(pendingSaveName, namePreviewIndex);
                                 needsRedraw = true;
                             },
                             onCancel: () => {
                                 /* Return to name preview unchanged */
                                 showingNamePreview = true;
+                                announceSavePreview(pendingSaveName, namePreviewIndex);
                                 needsRedraw = true;
                             }
                         });
@@ -6265,6 +7213,7 @@ function handleSelect() {
                             /* Came from Save/Save As flow - return to name preview */
                             showingNamePreview = true;
                             namePreviewIndex = 0;  /* Default to Edit so they can change the name */
+                            announceSavePreview(pendingSaveName, namePreviewIndex);
                         } else {
                             /* Direct Save on existing - just return to settings */
                             pendingSaveName = "";
@@ -6302,6 +7251,7 @@ function handleSelect() {
                             showingNamePreview = true;
                             namePreviewIndex = 1;  /* Default to OK */
                             overwriteFromKeyboard = true;  /* Will use keyboard if Edit is selected */
+                            announceSavePreview(pendingSaveName, namePreviewIndex);
                             needsRedraw = true;
                         } else {
                             /* Existing - confirm overwrite (no keyboard needed) */
@@ -6321,6 +7271,7 @@ function handleSelect() {
                         showingNamePreview = true;
                         namePreviewIndex = 1;  /* Default to OK */
                         overwriteFromKeyboard = true;  /* Will use keyboard if Edit is selected */
+                        announceSavePreview(pendingSaveName, namePreviewIndex);
                         needsRedraw = true;
                     } else if (setting.key === "delete") {
                         if (isExistingPreset(selectedSlot)) {
@@ -6421,7 +7372,7 @@ function handleSelect() {
                 if (selectedParam && typeof selectedParam === "object" && selectedParam.isDynamicItem) {
                     /* Set the select_param to this item's index */
                     if (hierEditorSelectParam) {
-                        const prefix = hierEditorComponent;
+                        const prefix = getComponentParamPrefix(hierEditorComponent);
                         setSlotParam(hierEditorSlot, `${prefix}:${hierEditorSelectParam}`, String(selectedParam.index));
                     }
 
@@ -6474,8 +7425,47 @@ function handleSelect() {
                         }
                     }
                 } else {
-                    /* Normal param - toggle edit mode */
-                    hierEditorEditMode = !hierEditorEditMode;
+                    /* Normal param - open filepath browser or toggle edit mode */
+                    const selectedKey = (selectedParam && typeof selectedParam === "object")
+                        ? (selectedParam.key || selectedParam)
+                        : selectedParam;
+                    const meta = getParamMetadata(selectedKey);
+                    if (!hierEditorEditMode && meta && meta.type === "filepath") {
+                        openHierarchyFilepathBrowser(selectedKey, meta);
+                    } else {
+                        hierEditorEditMode = !hierEditorEditMode;
+                    }
+                }
+            }
+            break;
+        case VIEWS.FILEPATH_BROWSER:
+            if (!filepathBrowserState) {
+                closeHierarchyFilepathBrowser();
+                break;
+            }
+            {
+                const result = activateFilepathBrowserItem(filepathBrowserState);
+                if (result.action === "open") {
+                    refreshFilepathBrowser(filepathBrowserState, FILEPATH_BROWSER_FS);
+                    if (filepathBrowserState.livePreviewEnabled) {
+                        const selected = filepathBrowserState.items[filepathBrowserState.selectedIndex];
+                        filepathBrowserState.previewPendingPath = "";
+                        filepathBrowserState.previewPendingTime = 0;
+                        applyLivePreview(filepathBrowserState, selected);
+                    }
+                } else if (result.action === "select") {
+                    const key = filepathBrowserParamKey || result.key;
+                    const fullKey = buildHierarchyParamKey(key);
+                    if (filepathBrowserState.livePreviewEnabled) {
+                        filepathBrowserState.previewCommitted = true;
+                        filepathBrowserState.previewCurrentValue = result.value || "";
+                        filepathBrowserState.previewPendingPath = "";
+                        filepathBrowserState.previewPendingTime = 0;
+                    }
+                    filepathBrowserState.previewSelectedPath = result.value || "";
+                    setSlotParam(hierEditorSlot, fullKey, result.value || "");
+                    announceParameter(filepathBrowserState.title || key, result.filename || result.value || "");
+                    closeHierarchyFilepathBrowser();
                 }
             }
             break;
@@ -6641,6 +7631,86 @@ function handleSelect() {
                 }
             }
             break;
+        case VIEWS.TOOLS:
+            debugLog("TOOLS SELECT: idx=" + toolsMenuIndex + " count=" + toolModules.length);
+            if (toolsMenuIndex >= 0 && toolsMenuIndex < toolModules.length) {
+                const tool = toolModules[toolsMenuIndex];
+                debugLog("TOOLS SELECT tool: " + tool.id + " config=" + JSON.stringify(tool.tool_config));
+                if (tool.tool_config && tool.tool_config.set_picker) {
+                    debugLog("TOOLS SELECT: entering set picker");
+                    enterToolSetPicker(tool);
+                } else if (tool.tool_config && tool.tool_config.skip_file_browser && tool.tool_config.interactive) {
+                    debugLog("TOOLS SELECT: skip_file_browser, launching interactive directly");
+                    startInteractiveTool(tool, "");
+                } else if (tool.tool_config && (tool.tool_config.command || tool.tool_config.interactive || tool.tool_config.engines)) {
+                    debugLog("TOOLS SELECT: entering file browser");
+                    enterToolFileBrowser(tool);
+                } else {
+                    debugLog("TOOLS SELECT: tool not available");
+                    announce("Tool not available");
+                }
+            }
+            break;
+        case VIEWS.TOOL_FILE_BROWSER:
+            toolBrowserSelect();
+            break;
+        case VIEWS.TOOL_SET_PICKER:
+            toolSetPickerSelect();
+            break;
+        case VIEWS.TOOL_ENGINE_SELECT:
+            toolEngineConfirm();
+            break;
+        case VIEWS.TOOL_CONFIRM:
+            wavPlayerStop();
+            unloadWavPlayerDsp();
+            if (toolActiveTool && toolActiveTool.tool_config && toolActiveTool.tool_config.interactive) {
+                startInteractiveTool(toolActiveTool, toolSelectedFile);
+            } else {
+                startToolProcess();
+            }
+            break;
+        case VIEWS.TOOL_RESULT:
+            enterToolsMenu();
+            break;
+        case VIEWS.TOOL_STEM_REVIEW: {
+            if (toolStemReviewIndex === 0) {
+                /* Action button — save selected or cancel */
+                wavPlayerStop();
+                unloadWavPlayerDsp();
+                const kc = toolStemKept.filter(k => k).length;
+                if (kc === 0) {
+                    /* Cancel — discard all */
+                    for (const f of toolStemFiles) {
+                        try { os.remove(toolOutputDir + "/" + f); } catch (e) {}
+                    }
+                    try { os.remove(toolOutputDir + "/.done"); } catch (e) {}
+                    try { os.remove(toolOutputDir); } catch (e) {}
+                    enterToolsMenu();
+                    announce("Cancelled");
+                } else {
+                    /* Save selected, delete unselected */
+                    for (let i = 0; i < toolStemFiles.length; i++) {
+                        if (!toolStemKept[i]) {
+                            try { os.remove(toolOutputDir + "/" + toolStemFiles[i]); } catch (e) {}
+                        }
+                    }
+                    try { os.remove(toolOutputDir + "/.done"); } catch (e) {}
+                    const baseName = toolOutputDir.substring(toolOutputDir.lastIndexOf("/") + 1);
+                    toolResultMessage = kc + " stem" + (kc > 1 ? "s" : "") + " saved to\nStems/" + baseName + "/";
+                    setView(VIEWS.TOOL_RESULT);
+                    needsRedraw = true;
+                    announce(kc + " stem" + (kc > 1 ? "s" : "") + " saved");
+                }
+            } else {
+                /* Toggle individual stem */
+                const idx = toolStemReviewIndex - 1;
+                toolStemKept[idx] = !toolStemKept[idx];
+                const stemName = toolStemFiles[idx].replace(/\.wav$/i, "");
+                needsRedraw = true;
+                announce(stemName + (toolStemKept[idx] ? " selected" : " deselected"));
+            }
+            break;
+        }
         case VIEWS.OVERTAKE_MODULE:
             /* Overtake module handles its own select input */
             break;
@@ -6663,7 +7733,7 @@ function handleSelect() {
                     helpDetailScrollState = createScrollableText({
                         lines: item.lines,
                         actionLabel: "Back",
-                        visibleLines: 3,
+                        visibleLines: 4,
                         onActionSelected: (label) => announce(label)
                     });
                     needsRedraw = true;
@@ -6696,6 +7766,7 @@ function handleSelect() {
                     const firstItem = section.items[0];
                     const value = firstItem.type === "action" ? "" : getMasterFxSettingValue(firstItem);
                     announce(section.label + ", " + firstItem.label + (value ? ": " + value : ""));
+                    if (section.id === "audio") warnIfLinkDisabled();
                 }
             }
             break;
@@ -6707,48 +7778,19 @@ function handleBack() {
     hideOverlay();
     switch (view) {
         case VIEWS.SLOTS:
-            /* At root level - exit shadow mode and return to Move */
-            if (typeof shadow_request_exit === "function") {
-                shadow_request_exit();
-            }
+            handleSlotsBack();
             break;
         case VIEWS.SLOT_SETTINGS:
-            if (editingSettingValue) {
-                /* Exit value editing mode */
-                editingSettingValue = false;
-                needsRedraw = true;
-                announce("Slot Settings");
-            } else {
-                /* Return to slots list */
-                setView(VIEWS.SLOTS);
-                announce("Slots");
-                needsRedraw = true;
-            }
+            handleSlotSettingsBack();
             break;
         case VIEWS.PATCHES:
-            /* Return to chain editor */
-            setView(VIEWS.CHAIN_EDIT);
-            announce("Chain Editor");
-            needsRedraw = true;
+            handlePatchesBack();
             break;
         case VIEWS.PATCH_DETAIL:
-            setView(VIEWS.PATCHES);
-            announce("Patch Browser");
-            needsRedraw = true;
+            handlePatchDetailBack();
             break;
         case VIEWS.COMPONENT_PARAMS:
-            if (editingValue) {
-                /* Exit value editing mode */
-                editingValue = false;
-                needsRedraw = true;
-                announce("Parameters");
-            } else {
-                /* Return to patch detail, refresh info */
-                fetchPatchDetail(selectedSlot);
-                setView(VIEWS.PATCH_DETAIL);
-                announce("Patch Detail");
-                needsRedraw = true;
-            }
+            handleComponentParamsBack();
             break;
         case VIEWS.MASTER_FX:
             if (masterShowingNamePreview) {
@@ -6855,6 +7897,14 @@ function handleBack() {
             unloadModuleUi();
             setView(VIEWS.CHAIN_EDIT);
             announce("Chain Editor");
+            needsRedraw = true;
+            break;
+        case VIEWS.FILEPATH_BROWSER:
+            closeHierarchyFilepathBrowser();
+            {
+                const ld = getHierarchyLevelDef();
+                announce(ld && ld.label ? ld.label : "Parameters");
+            }
             needsRedraw = true;
             break;
         case VIEWS.HIERARCHY_EDITOR: {
@@ -7028,6 +8078,71 @@ function handleBack() {
             }
             needsRedraw = true;
             break;
+        case VIEWS.TOOLS:
+            /* Exit Tools menu → exit shadow mode */
+            if (typeof shadow_request_exit === "function") {
+                shadow_request_exit();
+            }
+            break;
+        case VIEWS.TOOL_FILE_BROWSER:
+            toolBrowserBack();
+            break;
+        case VIEWS.TOOL_SET_PICKER:
+            enterToolsMenu();
+            break;
+        case VIEWS.TOOL_ENGINE_SELECT:
+            /* Return to file browser */
+            setView(VIEWS.TOOL_FILE_BROWSER);
+            needsRedraw = true;
+            announce("Back to files");
+            break;
+        case VIEWS.TOOL_CONFIRM:
+            wavPlayerStop();
+            unloadWavPlayerDsp();
+            /* Return to set picker, engine selection, or file browser */
+            if (toolActiveTool && toolActiveTool.tool_config && toolActiveTool.tool_config.set_picker) {
+                setView(VIEWS.TOOL_SET_PICKER);
+                needsRedraw = true;
+                announce("Back to sets");
+            } else if (toolActiveTool && toolActiveTool.tool_config &&
+                toolActiveTool.tool_config.engines && toolActiveTool.tool_config.engines.length > 1) {
+                enterToolEngineSelect();
+                announce("Back to engine selection");
+            } else {
+                setView(VIEWS.TOOL_FILE_BROWSER);
+                needsRedraw = true;
+                announce("Cancelled, back to files");
+            }
+            break;
+        case VIEWS.TOOL_PROCESSING:
+            cancelToolProcess();
+            break;
+        case VIEWS.TOOL_RESULT:
+            enterToolsMenu();
+            break;
+        case VIEWS.TOOL_STEM_REVIEW: {
+            wavPlayerStop();
+            if (toolStemReviewIndex === 0) {
+                /* Already at action button — back exits, discards all */
+                unloadWavPlayerDsp();
+                for (const f of toolStemFiles) {
+                    try { os.remove(toolOutputDir + "/" + f); } catch (e) {}
+                }
+                try { os.remove(toolOutputDir + "/.done"); } catch (e) {}
+                try { os.remove(toolOutputDir); } catch (e) {}
+                enterToolsMenu();
+                announce("Cancelled");
+            } else {
+                /* Jump to action button first */
+                toolStemReviewIndex = 0;
+                needsRedraw = true;
+                const keptCount = toolStemKept.filter(k => k).length;
+                if (keptCount === 0) announce("Cancel");
+                else if (keptCount === toolStemFiles.length) announce("Save All");
+                else announce("Save " + keptCount + " stems");
+            }
+            break;
+        }
         case VIEWS.OVERTAKE_MODULE:
             /* Overtake module handles its own back input.
              * Use Shift+Vol+Jog Click to exit overtake mode. */
@@ -7054,7 +8169,7 @@ function handleBack() {
                 const section = GLOBAL_SETTINGS_SECTIONS[globalSettingsSectionIndex];
                 const item = section.items[globalSettingsItemIndex];
                 const val = getMasterFxSettingValue(item);
-                announce(item.label + ", " + val);
+                announce(item.label + (val ? ", " + val : ""));
             } else if (globalSettingsInSection) {
                 /* Return to section list */
                 globalSettingsInSection = false;
@@ -7130,220 +8245,13 @@ function refreshPendingKnobOverlay() {
     pendingKnobIndex = -1;
 }
 
-function drawSlots() {
-    clear_screen();
-    drawHeader("Shadow Chains");
+/* drawSlots() -> shadow_ui_slots.mjs */
 
-    /* Get the track-selected slot (for playback/knobs, set by track buttons) */
-    let trackSelectedSlot = 0;
-    if (typeof shadow_get_selected_slot === "function") {
-        trackSelectedSlot = shadow_get_selected_slot();
-    }
+/* getMasterFxDisplayName() -> shadow_ui_master_fx.mjs */
 
-    /* Create items list: 4 slots + Master FX
-     * Show asterisk (*) before patch name for track-selected slot (playing/knob control)
-     * Use leading space for non-selected to maintain alignment */
-    const items = [
-        ...slots.map((s, i) => ({
-            label: (i === trackSelectedSlot ? "*" : " ") + (slotDirtyCache[i] ? "*" : "") + (s.name || "Unknown Patch"),
-            value: s.channel === 0 ? "All" : `Ch${s.channel}`,
-            isSlot: true
-        })),
-        { label: " Master FX", value: getMasterFxDisplayName(), isSlot: false }
-    ];
+/* drawSlotSettings() -> shadow_ui_slots.mjs */
 
-    drawMenuList({
-        items,
-        selectedIndex: selectedSlot,
-        listArea: { topY: LIST_TOP_Y, bottomY: FOOTER_RULE_Y },
-        getLabel: (item) => item.label,
-        getValue: (item) => item.value,
-        valueAlignRight: true
-    });
-    /* Debug: show flags value in footer */
-    const debugInfo = typeof globalThis._debugFlags !== "undefined"
-        ? `F:${globalThis._debugFlags}` : "";
-    /* Also show current shift/vol state if available */
-    let stateInfo = "";
-    if (typeof shadow_get_debug_state === "function") {
-        stateInfo = shadow_get_debug_state();
-    }
-    drawFooter(`${debugInfo} ${stateInfo}`);
-}
-
-function getMasterFxDisplayName() {
-    const opt = MASTER_FX_OPTIONS.find(o => o.id === currentMasterFxId);
-    return opt ? opt.name : "None";
-}
-
-function drawSlotSettings() {
-    clear_screen();
-    const slotName = slots[selectedSlot]?.name || "Unknown";
-    drawHeader(`Slot ${selectedSlot + 1}`);
-
-    const listY = LIST_TOP_Y;
-    const lineHeight = LIST_LINE_HEIGHT;
-
-    /* Calculate visible items accounting for footer */
-    const maxVisible = Math.max(1, Math.floor((FOOTER_RULE_Y - LIST_TOP_Y) / lineHeight));
-    let startIdx = 0;
-    const maxSelectedRow = maxVisible - 1;
-    if (selectedSetting > maxSelectedRow) {
-        startIdx = selectedSetting - maxSelectedRow;
-    }
-    const endIdx = Math.min(startIdx + maxVisible, SLOT_SETTINGS.length);
-
-    for (let i = startIdx; i < endIdx; i++) {
-        const y = listY + (i - startIdx) * lineHeight;
-        const setting = SLOT_SETTINGS[i];
-        const isSelected = i === selectedSetting;
-
-        if (isSelected) {
-            fill_rect(0, y - 1, SCREEN_WIDTH, LIST_HIGHLIGHT_HEIGHT, 1);
-        }
-
-        const color = isSelected ? 0 : 1;
-        let prefix = "  ";
-        if (isSelected) {
-            prefix = editingSettingValue ? "* " : "> ";
-        }
-
-        const value = getSlotSettingValue(selectedSlot, setting);
-        let valueStr = truncateText(value, 10);
-        if (isSelected && editingSettingValue && setting.type !== "action") {
-            valueStr = `[${valueStr}]`;
-        }
-
-        print(LIST_LABEL_X, y, `${prefix}${setting.label}:`, color);
-        print(LIST_VALUE_X - 8, y, valueStr, color);
-    }
-
-    if (editingSettingValue) {
-        drawFooter("Jog: adjust  Click: done");
-    } else {
-        drawFooter("Click: edit  Back: slots");
-    }
-}
-
-function drawPatches() {
-    clear_screen();
-    const rawCh = slots[selectedSlot]?.channel;
-    const channel = (typeof rawCh === "number") ? rawCh : (DEFAULT_SLOTS[selectedSlot]?.channel ?? 1 + selectedSlot);
-    drawHeader(`${channel === 0 ? "All" : "Ch" + channel} Patch`);
-    if (patches.length === 0) {
-        print(LIST_LABEL_X, LIST_TOP_Y, "No patches found", 1);
-        drawFooter("Back: settings");
-    } else {
-        const loadedName = slots[selectedSlot]?.name;
-        drawMenuList({
-            items: patches,
-            selectedIndex: selectedPatch,
-            listArea: { topY: LIST_TOP_Y, bottomY: FOOTER_RULE_Y },
-            getLabel: (item) => {
-                const isCurrent = loadedName && item.name === loadedName;
-                return isCurrent ? `* ${item.name}` : item.name;
-            }
-        });
-        drawFooter("Click: load  Back: settings");
-    }
-}
-
-function drawPatchDetail() {
-    clear_screen();
-    const patch = patches[selectedPatch];
-    const patchName = patch ? patch.name : "Unknown";
-    drawHeader(truncateText(patchName, 18));
-
-    const items = getDetailItems();
-    const listY = LIST_TOP_Y;
-    const lineHeight = 12;
-
-    for (let i = 0; i < items.length; i++) {
-        const y = listY + i * lineHeight;
-        const item = items[i];
-        const isSelected = i === selectedDetailItem;
-
-        if (isSelected) {
-            fill_rect(0, y - 1, SCREEN_WIDTH, lineHeight, 1);
-        }
-
-        const color = isSelected ? 0 : 1;
-        const prefix = isSelected ? "> " : "  ";
-
-        if (item.value) {
-            /* Label: Value (subvalue) format */
-            print(LIST_LABEL_X, y, `${prefix}${item.label}:`, color);
-            let valueStr = item.value;
-            if (item.subvalue && item.subvalue !== "-") {
-                valueStr = truncateText(valueStr, 8);
-                print(LIST_VALUE_X - 24, y, valueStr, color);
-                print(LIST_VALUE_X + 4, y, `(${item.subvalue})`, color);
-            } else {
-                print(LIST_VALUE_X - 24, y, truncateText(valueStr, 12), color);
-            }
-        } else {
-            /* Just label (for "Load Patch") */
-            print(LIST_LABEL_X, y, `${prefix}${item.label}`, color);
-        }
-    }
-
-    drawFooter("Click: edit  Back: list");
-}
-
-function drawComponentParams() {
-    clear_screen();
-
-    /* Live-refresh read-only param values (e.g. detected_key) from DSP */
-    for (const param of componentParams) {
-        const freshVal = getSlotParam(selectedSlot, param.key);
-        if (freshVal !== null) param.value = freshVal;
-    }
-
-    /* Header shows component name */
-    const componentTitle = editingComponent.charAt(0).toUpperCase() + editingComponent.slice(1);
-    drawHeader(`Edit ${componentTitle}`);
-
-    if (componentParams.length === 0) {
-        print(LIST_LABEL_X, LIST_TOP_Y, "No parameters", 1);
-        drawFooter("Back: return");
-        return;
-    }
-
-    const listY = LIST_TOP_Y;
-    const lineHeight = 12;
-
-    for (let i = 0; i < componentParams.length; i++) {
-        const y = listY + i * lineHeight;
-        const param = componentParams[i];
-        const isSelected = i === selectedParam;
-
-        if (isSelected) {
-            fill_rect(0, y - 1, SCREEN_WIDTH, lineHeight, 1);
-        }
-
-        const color = isSelected ? 0 : 1;
-        let prefix = "  ";
-        if (isSelected) {
-            prefix = editingValue ? "* " : "> ";
-        }
-
-        print(LIST_LABEL_X, y, `${prefix}${param.label}:`, color);
-
-        /* Format value display */
-        let valueStr = formatParamValue(param);
-        if (isSelected && editingValue) {
-            /* Show brackets when editing */
-            valueStr = `[${valueStr}]`;
-        }
-        print(LIST_VALUE_X - 8, y, valueStr, color);
-    }
-
-    if (editingValue) {
-        drawFooter("Jog: adjust  Click: done");
-    } else {
-        drawFooter("Click: edit  Back: detail");
-    }
-}
+/* drawPatches(), drawPatchDetail(), drawComponentParams() -> shadow_ui_patches.mjs */
 
 /* Draw horizontal chain editor with boxed icons */
 function drawChainEdit() {
@@ -7465,98 +8373,11 @@ function drawComponentSelect() {
 
 /* ===== Store Picker Drawing Functions ===== */
 
-/* Draw store category browser */
-function drawStorePickerCategories() {
-    clear_screen();
-    drawHeader('Module Store');
+/* drawStorePickerCategories() -> shadow_ui_store.mjs */
 
-    if (storeCategoryItems.length === 0) {
-        print(2, 28, "No modules available", 1);
-        drawFooter('Back: return');
-        return;
-    }
+/* drawStorePickerList() -> shadow_ui_store.mjs */
 
-    drawMenuList({
-        items: storeCategoryItems,
-        selectedIndex: storeCategoryIndex,
-        listArea: {
-            topY: menuLayoutDefaults.listTopY,
-            bottomY: menuLayoutDefaults.listBottomWithFooter
-        },
-        valueAlignRight: true,
-        getLabel: (item) => item.label,
-        getValue: (item) => item.value || ''
-    });
-
-    drawFooter('Back:return  Jog:browse');
-}
-
-/* Draw store picker module list */
-function drawStorePickerList() {
-    clear_screen();
-
-    /* Find category name */
-    const cat = CATEGORIES.find(c => c.id === storePickerCategory);
-    const catName = cat ? cat.name : 'Modules';
-
-    /* Header shows "Store: <category>" for context */
-    drawHeader('Store: ' + catName);
-
-    if (storePickerModules.length === 0) {
-        print(2, 28, "No modules available", 1);
-        drawFooter('Back: return');
-        return;
-    }
-
-    /* Build items for drawMenuList */
-    const items = storePickerModules.map(mod => {
-        let statusIcon = '';
-        if (mod._isHostUpdate) {
-            /* Core update always shows update available icon */
-            statusIcon = '^';
-        } else {
-            const status = getModuleStatus(mod, storeInstalledModules);
-            if (status.installed) {
-                statusIcon = status.hasUpdate ? '^' : '*';
-            }
-        }
-        return { ...mod, statusIcon };
-    });
-
-    drawMenuList({
-        items,
-        selectedIndex: storePickerSelectedIndex,
-        listArea: {
-            topY: menuLayoutDefaults.listTopY,
-            bottomY: menuLayoutDefaults.listBottomWithFooter
-        },
-        valueAlignRight: true,
-        getLabel: (item) => item.name,
-        getValue: (item) => item.statusIcon
-    });
-
-    drawFooter('Back:return  Jog:browse');
-}
-
-/* Draw store picker loading screen */
-function drawStorePickerLoading() {
-    clear_screen();
-    const title = storePickerLoadingTitle || 'Module Store';
-    const msg = storePickerLoadingMessage || 'Loading...';
-    drawStatusOverlay(title, msg);
-}
-
-/* Draw store picker result screen */
-function drawStorePickerResult() {
-    clear_screen();
-    drawHeader(storePickerResultTitle || 'Module Store');
-
-    /* Message centered vertically */
-    const msg = storePickerMessage || 'Done';
-    print(2, 28, msg, 1);
-
-    drawFooter('Press to continue');
-}
+/* drawStorePickerLoading(), drawStorePickerResult() -> shadow_ui_store.mjs */
 
 /* Draw store picker module detail */
 /* Build scrollable lines from release notes text */
@@ -7579,114 +8400,7 @@ function buildReleaseNoteLines(notesText) {
     return lines;
 }
 
-function drawStorePickerDetail() {
-    clear_screen();
-
-    const mod = storePickerCurrentModule;
-    if (!mod) return;
-
-    /* Special handling for core update */
-    if (mod._isHostUpdate) {
-        const title = 'Core Update';
-        const versionStr = `${storeHostVersion}->${mod.latest_version}`;
-        drawHeader(title, versionStr);
-
-        if (!storeDetailScrollState || storeDetailScrollState.moduleId !== mod.id) {
-            const notes = fetchReleaseNotes('charlesvestal/move-anything');
-            const descLines = [];
-            descLines.push(`${storeHostVersion} -> ${mod.latest_version}`);
-            descLines.push('');
-            if (notes) {
-                descLines.push(...buildReleaseNoteLines(notes));
-            } else {
-                descLines.push('Update Move Anything');
-                descLines.push('core framework.');
-                descLines.push('');
-                descLines.push('Restart required');
-                descLines.push('after update.');
-            }
-            storeDetailScrollState = createScrollableText({
-                lines: descLines,
-                actionLabel: 'Update',
-                visibleLines: 3,
-                onActionSelected: (label) => announce(label)
-            });
-            storeDetailScrollState.moduleId = mod.id;
-        }
-
-        drawScrollableText({
-            state: storeDetailScrollState,
-            topY: 16,
-            bottomY: 40,
-            actionY: 52
-        });
-        return;
-    }
-
-    const status = getModuleStatus(mod, storeInstalledModules);
-
-    /* Header with name and version */
-    let title = mod.name;
-    let versionStr = `v${mod.latest_version}`;
-    if (status.installed && status.hasUpdate) {
-        versionStr = `${status.installedVersion}->${mod.latest_version}`;
-        if (title.length > 8) title = title.substring(0, 7) + '~';
-    } else {
-        if (title.length > 12) title = title.substring(0, 11) + '~';
-    }
-    drawHeader(title, versionStr);
-
-    /* Initialize scroll state if needed */
-    if (!storeDetailScrollState || storeDetailScrollState.moduleId !== mod.id) {
-        const descLines = wrapText(mod.description || 'No description available.', 20);
-
-        /* Add author */
-        descLines.push('');
-        descLines.push(`by ${mod.author || 'Unknown'}`);
-
-        /* Add requires line if present */
-        if (mod.requires) {
-            descLines.push('');
-            descLines.push('Requires:');
-            const reqLines = wrapText(mod.requires, 18);
-            descLines.push(...reqLines);
-        }
-
-        /* Fetch and append release notes */
-        if (mod.github_repo) {
-            const notes = fetchReleaseNotes(mod.github_repo);
-            if (notes) {
-                descLines.push('');
-                descLines.push('What\'s New:');
-                descLines.push(...buildReleaseNoteLines(notes));
-            }
-        }
-
-        /* Determine action label */
-        let actionLabel;
-        if (status.installed) {
-            actionLabel = status.hasUpdate ? 'Update' : 'Reinstall';
-        } else {
-            actionLabel = 'Install';
-        }
-
-        storeDetailScrollState = createScrollableText({
-            lines: descLines,
-            actionLabel,
-            visibleLines: 3,
-            onActionSelected: (label) => announce(label)
-        });
-        storeDetailScrollState.moduleId = mod.id;
-    }
-
-    /* Draw scrollable content */
-    drawScrollableText({
-        state: storeDetailScrollState,
-        topY: 16,
-        bottomY: 40,
-        actionY: 52
-    });
-}
+/* drawStorePickerDetail() -> shadow_ui_store.mjs */
 
 /* Draw update detail view (release notes + install action) */
 function drawUpdateDetail() {
@@ -7807,111 +8521,11 @@ function drawComponentEdit() {
     }
 
     /* Show hint at bottom */
-    const hint = "Jog: preset  Back: done";
-    const hintX = Math.floor((SCREEN_WIDTH - hint.length * 5) / 2);
-    print(hintX, 56, hint, 1);
+    drawFooter({left: "Back: done", right: "Jog: preset"});
 }
 
 /* Draw chain settings view */
-function drawChainSettings() {
-    clear_screen();
-
-    /* Handle name preview view */
-    if (showingNamePreview) {
-        drawHeader("Save As");
-        const name = truncateText(pendingSaveName, 20);
-        print(LIST_LABEL_X, LIST_TOP_Y, '"' + name + '"', 1);
-
-        const listY = LIST_TOP_Y + 16;
-        for (let i = 0; i < 2; i++) {
-            const y = listY + i * LIST_LINE_HEIGHT;
-            const isSelected = i === namePreviewIndex;
-            if (isSelected) {
-                fill_rect(0, y - 1, SCREEN_WIDTH, LIST_HIGHLIGHT_HEIGHT, 1);
-            }
-            print(LIST_LABEL_X, y, i === 0 ? "Edit" : "OK", isSelected ? 0 : 1);
-        }
-        drawFooter("Back: cancel");
-        return;
-    }
-
-    /* Handle confirmation views */
-    if (confirmingOverwrite) {
-        drawHeader("Overwrite?");
-        const name = truncateText(pendingSaveName, 20);
-        print(LIST_LABEL_X, LIST_TOP_Y, '"' + name + '"', 1);
-
-        const listY = LIST_TOP_Y + 16;
-        for (let i = 0; i < 2; i++) {
-            const y = listY + i * LIST_LINE_HEIGHT;
-            const isSelected = i === confirmIndex;
-            if (isSelected) {
-                fill_rect(0, y - 1, SCREEN_WIDTH, LIST_HIGHLIGHT_HEIGHT, 1);
-            }
-            print(LIST_LABEL_X, y, i === 0 ? "No" : "Yes", isSelected ? 0 : 1);
-        }
-        drawFooter("Back: cancel");
-        return;
-    }
-
-    if (confirmingDelete) {
-        drawHeader("Delete?");
-        const name = truncateText(slots[selectedSlot] ? slots[selectedSlot].name : "Unknown", 20);
-        print(LIST_LABEL_X, LIST_TOP_Y, '"' + name + '"', 1);
-
-        const listY = LIST_TOP_Y + 16;
-        for (let i = 0; i < 2; i++) {
-            const y = listY + i * LIST_LINE_HEIGHT;
-            const isSelected = i === confirmIndex;
-            if (isSelected) {
-                fill_rect(0, y - 1, SCREEN_WIDTH, LIST_HIGHLIGHT_HEIGHT, 1);
-            }
-            print(LIST_LABEL_X, y, i === 0 ? "No" : "Yes", isSelected ? 0 : 1);
-        }
-        drawFooter("Back: cancel");
-        return;
-    }
-
-    drawHeader("S" + (selectedSlot + 1) + " Settings");
-
-    const items = getChainSettingsItems(selectedSlot);
-    const listY = LIST_TOP_Y;
-    const lineHeight = 9;
-    const maxVisible = Math.floor((FOOTER_RULE_Y - LIST_TOP_Y) / lineHeight);
-
-    let scrollOffset = 0;
-    if (selectedChainSetting >= maxVisible) {
-        scrollOffset = selectedChainSetting - maxVisible + 1;
-    }
-
-    for (let i = 0; i < maxVisible && (i + scrollOffset) < items.length; i++) {
-        const itemIdx = i + scrollOffset;
-        const y = listY + i * lineHeight;
-        const setting = items[itemIdx];
-        const isSelected = itemIdx === selectedChainSetting;
-
-        if (isSelected) {
-            fill_rect(0, y - 1, SCREEN_WIDTH, LIST_HIGHLIGHT_HEIGHT, 1);
-        }
-
-        const labelColor = isSelected ? 0 : 1;
-        print(LIST_LABEL_X, y, setting.label, labelColor);
-
-        if (setting.type !== "action") {
-            const value = getChainSettingValue(selectedSlot, setting);
-            if (value) {
-                const valueX = SCREEN_WIDTH - value.length * 5 - 4;
-                if (isSelected && editingChainSettingValue) {
-                    print(valueX - 8, y, "<", 0);
-                    print(valueX, y, value, 0);
-                    print(valueX + value.length * 5 + 2, y, ">", 0);
-                } else {
-                    print(valueX, y, value, labelColor);
-                }
-            }
-        }
-    }
-}
+/* drawChainSettings() -> shadow_ui_settings.mjs */
 
 /* Draw knob assignment editor - list of 8 knobs with their assignments */
 function drawKnobEditor() {
@@ -7960,7 +8574,7 @@ function drawKnobEditor() {
         }
     }
 
-    drawFooter("Click: edit  Back: cancel");
+    drawFooter({left: "Back: cancel", right: "Click: edit"});
 }
 
 /* Draw param picker - select target then param for knob assignment */
@@ -7981,7 +8595,7 @@ function drawKnobParamPicker() {
             getValue: () => ""
         });
 
-        drawFooter("Click: select  Back: cancel");
+        drawFooter({left: "Back: cancel", right: "Click: select"});
     } else if (knobParamPickerHierarchy && knobParamPickerLevel) {
         /* Hierarchy mode - show current level */
         const levelDef = knobParamPickerHierarchy.levels[knobParamPickerLevel];
@@ -7997,7 +8611,7 @@ function drawKnobParamPicker() {
         });
 
         const hasNav = knobParamPickerParams.some(p => p.type === "nav");
-        drawFooter(hasNav ? "Click: select  Back: up" : "Click: assign  Back: up");
+        drawFooter(hasNav ? {left: "Back: up", right: "Click: select"} : {left: "Back: up", right: "Click: assign"});
     } else {
         /* Flat mode - show params for selected target */
         drawHeader(`Knob ${knobNum} Param`);
@@ -8015,89 +8629,14 @@ function drawKnobParamPicker() {
             getValue: () => ""
         });
 
-        drawFooter("Click: assign  Back: targets");
+        drawFooter({left: "Back: targets", right: "Click: assign"});
     }
 }
 
 /* ========== Master Preset Draw Functions ========== */
 
-function drawMasterNamePreview() {
-    drawHeader("Save As");
-
-    const name = truncateText(masterPendingSaveName, 20);
-    print(LIST_LABEL_X, LIST_TOP_Y, '"' + name + '"', 1);
-
-    const listY = LIST_TOP_Y + 16;
-    for (let i = 0; i < 2; i++) {
-        const y = listY + i * LIST_LINE_HEIGHT;
-        const isSelected = i === masterNamePreviewIndex;
-        if (isSelected) {
-            fill_rect(0, y - 1, SCREEN_WIDTH, LIST_HIGHLIGHT_HEIGHT, 1);
-        }
-        print(LIST_LABEL_X, y, i === 0 ? "Edit" : "OK", isSelected ? 0 : 1);
-    }
-
-    drawFooter("Back: cancel");
-}
-
-function drawMasterConfirmOverwrite() {
-    drawHeader("Overwrite?");
-
-    const name = truncateText(masterPendingSaveName, 20);
-    print(LIST_LABEL_X, LIST_TOP_Y, '"' + name + '"', 1);
-
-    const listY = LIST_TOP_Y + 16;
-    for (let i = 0; i < 2; i++) {
-        const y = listY + i * LIST_LINE_HEIGHT;
-        const isSelected = i === masterConfirmIndex;
-        if (isSelected) {
-            fill_rect(0, y - 1, SCREEN_WIDTH, LIST_HIGHLIGHT_HEIGHT, 1);
-        }
-        print(LIST_LABEL_X, y, i === 0 ? "No" : "Yes", isSelected ? 0 : 1);
-    }
-
-    drawFooter("Back: cancel");
-}
-
-function drawMasterConfirmDelete() {
-    drawHeader("Delete?");
-
-    const name = truncateText(currentMasterPresetName, 20);
-    print(LIST_LABEL_X, LIST_TOP_Y, '"' + name + '"', 1);
-
-    const listY = LIST_TOP_Y + 16;
-    for (let i = 0; i < 2; i++) {
-        const y = listY + i * LIST_LINE_HEIGHT;
-        const isSelected = i === masterConfirmIndex;
-        if (isSelected) {
-            fill_rect(0, y - 1, SCREEN_WIDTH, LIST_HIGHLIGHT_HEIGHT, 1);
-        }
-        print(LIST_LABEL_X, y, i === 0 ? "No" : "Yes", isSelected ? 0 : 1);
-    }
-
-    drawFooter("Back: cancel");
-}
-
-function drawMasterFxSettingsMenu() {
-    const title = currentMasterPresetName || "Master FX";
-    drawHeader(truncateText(title, 18));
-
-    const items = getMasterFxSettingsItems();
-
-    drawMenuList({
-        items: items,
-        selectedIndex: selectedMasterFxSetting,
-        getLabel: (item) => item.label,
-        getValue: (item) => {
-            if (item.type === "action") return "";
-            return getMasterFxSettingValue(item);
-        },
-        listArea: { topY: LIST_TOP_Y, bottomY: FOOTER_RULE_Y },
-        valueAlignRight: true
-    });
-
-    drawFooter("Back: FX chain");
-}
+/* drawMasterNamePreview, drawMasterConfirmOverwrite, drawMasterConfirmDelete,
+ * drawMasterFxSettingsMenu -> shadow_ui_master_fx.mjs */
 
 /* ========== Help Viewer Draw Functions ========== */
 
@@ -8128,221 +8667,340 @@ function drawHelpDetail() {
     if (helpDetailScrollState) {
         drawScrollableText({
             state: helpDetailScrollState,
-            topY: 16,
-            bottomY: 43,
-            actionY: 52
+            topY: LIST_TOP_Y,
+            bottomY: FOOTER_RULE_Y,
+            actionY: -1
         });
     }
+
+    const backTarget = helpNavStack.length > 1
+        ? helpNavStack[helpNavStack.length - 2].title
+        : "Settings";
+    drawFooter("Back: " + backTarget);
 }
 
 /* ========== End Master Preset Draw Functions ========== */
 
-function drawGlobalSettings() {
-    clear_screen();
+/* drawGlobalSettings() -> shadow_ui_settings.mjs */
 
-    /* Help viewer takes over display */
-    if (helpDetailScrollState) {
-        drawHelpDetail();
-        return;
-    }
-    if (helpNavStack.length > 0) {
-        drawHelpList();
-        return;
-    }
+/* drawMasterFx(), drawMasterFxModuleSelect() -> shadow_ui_master_fx.mjs */
 
-    if (globalSettingsInSection) {
-        /* Show items within selected section */
-        const section = GLOBAL_SETTINGS_SECTIONS[globalSettingsSectionIndex];
-        drawHeader(truncateText(section.label, 18));
-
-        drawMenuList({
-            items: section.items,
-            selectedIndex: globalSettingsItemIndex,
-            getLabel: (item) => {
-                if (globalSettingsEditing && section.items[globalSettingsItemIndex] === item) {
-                    return "[" + item.label + "]";
-                }
-                return item.label;
-            },
-            getValue: (item) => {
-                if (item.type === "action") return "";
-                return getMasterFxSettingValue(item);
-            },
-            listArea: { topY: LIST_TOP_Y, bottomY: FOOTER_RULE_Y },
-            valueAlignRight: true
-        });
-
-        drawFooter("Back: Settings");
-    } else {
-        /* Show section list */
-        drawHeader("Settings");
-
-        drawMenuList({
-            items: GLOBAL_SETTINGS_SECTIONS,
-            selectedIndex: globalSettingsSectionIndex,
-            getLabel: (section) => section.label,
-            getValue: () => "",
-            listArea: { topY: LIST_TOP_Y, bottomY: FOOTER_RULE_Y },
-            valueAlignRight: false
-        });
-
-        drawFooter("Back: return");
-    }
-}
-
-function drawMasterFx() {
-    clear_screen();
-
-    /* Handle text entry (keyboard) */
-    if (isTextEntryActive()) {
-        drawTextEntry();
-        return;
-    }
-
-    /* Check if we're showing name preview */
-    if (masterShowingNamePreview) {
-        drawMasterNamePreview();
-        return;
-    }
-
-    /* Check if we're confirming overwrite */
-    if (masterConfirmingOverwrite) {
-        drawMasterConfirmOverwrite();
-        return;
-    }
-
-    /* Check if we're confirming delete */
-    if (masterConfirmingDelete) {
-        drawMasterConfirmDelete();
-        return;
-    }
-
-    /* Check if we're in help viewer */
-    if (helpDetailScrollState) {
-        drawHelpDetail();
-        return;
-    }
-    if (helpNavStack.length > 0) {
-        drawHelpList();
-        return;
-    }
-
-    /* Check if we're in preset picker mode */
-    if (inMasterPresetPicker) {
-        drawMasterPresetPicker();
-        return;
-    }
-
-    /* Check if we're in settings submenu */
-    if (inMasterFxSettingsMenu) {
-        drawMasterFxSettingsMenu();
-        return;
-    }
-
-    /* Check if we're in module selection mode */
-    if (selectingMasterFxModule) {
-        drawMasterFxModuleSelect();
-        return;
-    }
-
-    drawHeader("Master FX");
-
-    /* Calculate box layout - 5 components (4 FX + settings) across 128px */
-    const BOX_W = 22;
-    const BOX_H = 16;
-    const GAP = 2;
-    const TOTAL_W = 5 * BOX_W + 4 * GAP;  // 118px
-    const START_X = Math.floor((SCREEN_WIDTH - TOTAL_W) / 2);
-    const BOX_Y = 20;
-
-    const presetSelected = selectedMasterFxComponent === -1;
-
-    /* Draw each component box */
-    for (let i = 0; i < MASTER_FX_CHAIN_COMPONENTS.length; i++) {
-        const comp = MASTER_FX_CHAIN_COMPONENTS[i];
-        const x = START_X + i * (BOX_W + GAP);
-        const isSelected = i === selectedMasterFxComponent;
-
-        /* Get abbreviation for this component */
-        let abbrev = "--";
-        if (comp.key === "settings") {
-            abbrev = "*";
-        } else {
-            const moduleData = masterFxConfig[comp.key];
-            abbrev = moduleData ? getModuleAbbrev(moduleData.module) : "--";
-        }
-
-        /* Draw box:
-         * - If preset selected (position -1): all boxes filled (inverted)
-         * - If individual component selected: that box filled
-         * - Otherwise: outlined box */
-        const fillBox = presetSelected || isSelected;
-        if (fillBox) {
-            fill_rect(x, BOX_Y, BOX_W, BOX_H, 1);
-        } else {
-            draw_rect(x, BOX_Y, BOX_W, BOX_H, 1);
-        }
-
-        /* Draw abbreviation centered in box */
-        const textColor = fillBox ? 0 : 1;
-        const textX = x + Math.floor((BOX_W - abbrev.length * 5) / 2) + 1;
-        const textY = BOX_Y + 5;
-        print(textX, textY, abbrev, textColor);
-    }
-
-    /* Draw component label below boxes */
-    const selectedComp = presetSelected ? null : MASTER_FX_CHAIN_COMPONENTS[selectedMasterFxComponent];
-    const labelY = BOX_Y + BOX_H + 4;
-    const label = presetSelected ? "Preset" : (selectedComp ? selectedComp.label : "");
-    const labelX = Math.floor((SCREEN_WIDTH - label.length * 5) / 2);
-    print(labelX, labelY, label, 1);
-
-    /* Draw current module name/preset below label */
-    const infoY = labelY + 12;
-    let infoLine = "";
-    if (presetSelected) {
-        /* Show preset name when preset is selected */
-        infoLine = currentMasterPresetName || "(no preset)";
-    } else if (selectedComp && selectedComp.key !== "settings") {
-        const moduleData = masterFxConfig[selectedComp.key];
-        if (moduleData && moduleData.module) {
-            /* Get display name from MASTER_FX_OPTIONS */
-            const opt = MASTER_FX_OPTIONS.find(o => o.id === moduleData.module);
-            infoLine = opt ? opt.name : moduleData.module;
-        } else {
-            infoLine = "(empty)";
-        }
-    } else if (selectedComp && selectedComp.key === "settings") {
-        infoLine = "Configure master FX";
-    }
-    infoLine = truncateText(infoLine, 24);
-    const infoX = Math.floor((SCREEN_WIDTH - infoLine.length * 5) / 2);
-    print(infoX, infoY, infoLine, 1);
-}
-
-/* Draw module selection list for Master FX */
-function drawMasterFxModuleSelect() {
-    const comp = MASTER_FX_CHAIN_COMPONENTS[selectedMasterFxComponent];
-    drawHeader(`Select ${comp ? comp.label : "FX"}`);
-
-    if (MASTER_FX_OPTIONS.length === 0) {
-        print(LIST_LABEL_X, LIST_TOP_Y, "No FX modules available", 1);
-        return;
-    }
-
-    drawMenuList({
-        items: MASTER_FX_OPTIONS,
-        selectedIndex: selectedMasterFxModuleIndex,
-        listArea: { topY: LIST_TOP_Y, bottomY: FOOTER_RULE_Y },
-        getLabel: (item) => item.name,
-        getValue: (item) => {
-            /* Show * if this is the currently loaded module */
-            const currentModule = masterFxConfig[comp.key]?.module || "";
-            return item.id === currentModule ? "*" : "";
-        }
+/* ============================================================================
+ * Populate shared context for extracted view modules.
+ * Modules access ctx properties *inside function bodies*, not at import time.
+ * ============================================================================ */
+(function populateCtx() {
+    /* Shared state - use defineProperty so modules read/write the live variables */
+    Object.defineProperty(_ctx, 'selectedSlot', {
+        get() { return selectedSlot; }, set(v) { selectedSlot = v; }, enumerable: true
     });
-    drawFooter("Click: apply  Back: cancel");
-}
+    Object.defineProperty(_ctx, 'slots', {
+        get() { return slots; }, set(v) { slots = v; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'needsRedraw', {
+        get() { return needsRedraw; }, set(v) { needsRedraw = v; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'slotDirtyCache', {
+        get() { return slotDirtyCache; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'patches', {
+        get() { return patches; }, set(v) { patches = v; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'selectedPatch', {
+        get() { return selectedPatch; }, set(v) { selectedPatch = v; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'view', {
+        get() { return view; }, set(v) { view = v; }, enumerable: true
+    });
+
+    /* Constants */
+    _ctx.VIEWS = VIEWS;
+    _ctx.DEFAULT_SLOTS = DEFAULT_SLOTS;
+    _ctx.KNOB_BASE_STEP_FLOAT = KNOB_BASE_STEP_FLOAT;
+
+    /* Master FX state (read/write) */
+    Object.defineProperty(_ctx, 'masterFxConfig', {
+        get() { return masterFxConfig; }, set(v) { masterFxConfig = v; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'MASTER_FX_OPTIONS', {
+        get() { return MASTER_FX_OPTIONS; }, set(v) { MASTER_FX_OPTIONS = v; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'selectedMasterFxComponent', {
+        get() { return selectedMasterFxComponent; }, set(v) { selectedMasterFxComponent = v; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'selectingMasterFxModule', {
+        get() { return selectingMasterFxModule; }, set(v) { selectingMasterFxModule = v; }, enumerable: true
+    });
+
+    /* Master FX state (read-only for module) */
+    Object.defineProperty(_ctx, 'masterShowingNamePreview', {
+        get() { return masterShowingNamePreview; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'masterConfirmingOverwrite', {
+        get() { return masterConfirmingOverwrite; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'masterConfirmingDelete', {
+        get() { return masterConfirmingDelete; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'helpDetailScrollState', {
+        get() { return helpDetailScrollState; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'helpNavStack', {
+        get() { return helpNavStack; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'inMasterPresetPicker', {
+        get() { return inMasterPresetPicker; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'inMasterFxSettingsMenu', {
+        get() { return inMasterFxSettingsMenu; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'currentMasterPresetName', {
+        get() { return currentMasterPresetName; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'selectedMasterFxSetting', {
+        get() { return selectedMasterFxSetting; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'selectedMasterFxModuleIndex', {
+        get() { return selectedMasterFxModuleIndex; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'masterPresets', {
+        get() { return masterPresets; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'selectedMasterPresetIndex', {
+        get() { return selectedMasterPresetIndex; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'masterPendingSaveName', {
+        get() { return masterPendingSaveName; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'masterNamePreviewIndex', {
+        get() { return masterNamePreviewIndex; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'masterConfirmIndex', {
+        get() { return masterConfirmIndex; }, enumerable: true
+    });
+
+    _ctx.MASTER_FX_CHAIN_COMPONENTS = MASTER_FX_CHAIN_COMPONENTS;
+
+    /* Utility functions */
+    _ctx.setView = setView;
+    _ctx.getSlotParam = getSlotParam;
+    _ctx.setSlotParam = setSlotParam;
+    _ctx.updateFocusedSlot = updateFocusedSlot;
+    _ctx.getMasterFxDisplayName = () => getMasterFxDisplayName();
+    _ctx.saveSlotsToConfig = (...args) => saveSlotsToConfig(...args);
+    _ctx.fetchKnobMappings = (...args) => fetchKnobMappings(...args);
+    _ctx.invalidateKnobContextCache = (...args) => invalidateKnobContextCache(...args);
+    _ctx.loadChainConfigFromSlot = (...args) => loadChainConfigFromSlot(...args);
+
+    /* Master FX functions */
+    _ctx.scanForAudioFxModules = (...args) => scanForAudioFxModules(...args);
+    _ctx.loadMasterFxChainConfig = (...args) => loadMasterFxChainConfig(...args);
+    _ctx.getMasterFxSlotModule = (...args) => getMasterFxSlotModule(...args);
+    _ctx.getMasterFxParam = (...args) => getMasterFxParam(...args);
+    _ctx.getModuleAbbrev = (...args) => getModuleAbbrev(...args);
+    _ctx.isTextEntryActive = () => isTextEntryActive();
+    _ctx.drawTextEntry = () => drawTextEntry();
+    _ctx.drawHelpDetail = () => drawHelpDetail();
+    _ctx.drawHelpList = () => drawHelpList();
+    _ctx.getMasterFxSettingsItems = () => getMasterFxSettingsItems();
+    _ctx.getMasterFxSettingValue = (...args) => getMasterFxSettingValue(...args);
+
+    /* Tools state */
+    Object.defineProperty(_ctx, 'toolModules', {
+        get() { return toolModules; }, set(v) { toolModules = v; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'toolsMenuIndex', {
+        get() { return toolsMenuIndex; }, set(v) { toolsMenuIndex = v; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'toolBrowserState', {
+        get() { return toolBrowserState; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'toolAvailableEngines', {
+        get() { return toolAvailableEngines; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'toolEngineIndex', {
+        get() { return toolEngineIndex; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'toolActiveTool', {
+        get() { return toolActiveTool; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'toolSelectedFile', {
+        get() { return toolSelectedFile; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'toolSelectedEngine', {
+        get() { return toolSelectedEngine; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'toolProcessStartTime', {
+        get() { return toolProcessStartTime; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'toolFileDurationSec', {
+        get() { return toolFileDurationSec; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'toolStemsFound', {
+        get() { return toolStemsFound; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'toolExpectedStems', {
+        get() { return toolExpectedStems; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'toolProcessingDots', {
+        get() { return toolProcessingDots; }, set(v) { toolProcessingDots = v; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'toolResultSuccess', {
+        get() { return toolResultSuccess; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'toolResultMessage', {
+        get() { return toolResultMessage; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'toolStemFiles', {
+        get() { return toolStemFiles; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'toolStemReviewIndex', {
+        get() { return toolStemReviewIndex; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'toolStemKept', {
+        get() { return toolStemKept; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'toolSetList', {
+        get() { return toolSetList; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'toolSetPickerIndex', {
+        get() { return toolSetPickerIndex; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'toolSelectedSetName', {
+        get() { return toolSelectedSetName; }, enumerable: true
+    });
+    _ctx.menuLayoutDefaults = menuLayoutDefaults;
+    _ctx.debugLog = debugLog;
+
+    /* Store state */
+    Object.defineProperty(_ctx, 'storeCategoryItems', {
+        get() { return storeCategoryItems; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'storeCategoryIndex', {
+        get() { return storeCategoryIndex; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'storePickerCategory', {
+        get() { return storePickerCategory; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'storePickerModules', {
+        get() { return storePickerModules; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'storePickerSelectedIndex', {
+        get() { return storePickerSelectedIndex; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'storePickerCurrentModule', {
+        get() { return storePickerCurrentModule; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'storeInstalledModules', {
+        get() { return storeInstalledModules; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'storeHostVersion', {
+        get() { return storeHostVersion; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'storeDetailScrollState', {
+        get() { return storeDetailScrollState; }, set(v) { storeDetailScrollState = v; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'storePickerLoadingTitle', {
+        get() { return storePickerLoadingTitle; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'storePickerLoadingMessage', {
+        get() { return storePickerLoadingMessage; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'storePickerResultTitle', {
+        get() { return storePickerResultTitle; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'storePickerMessage', {
+        get() { return storePickerMessage; }, enumerable: true
+    });
+    _ctx.getModuleStatus = (...args) => getModuleStatus(...args);
+    _ctx.CATEGORIES = CATEGORIES;
+    _ctx.drawStatusOverlay = (...args) => drawStatusOverlay(...args);
+    _ctx.fetchReleaseNotes = (...args) => fetchReleaseNotes(...args);
+    _ctx.createScrollableText = (...args) => createScrollableText(...args);
+    _ctx.drawScrollableText = (...args) => drawScrollableText(...args);
+    _ctx.wrapText = (...args) => wrapText(...args);
+
+    /* Chain settings state */
+    Object.defineProperty(_ctx, 'showingNamePreview', {
+        get() { return showingNamePreview; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'pendingSaveName', {
+        get() { return pendingSaveName; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'namePreviewIndex', {
+        get() { return namePreviewIndex; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'confirmingOverwrite', {
+        get() { return confirmingOverwrite; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'confirmingDelete', {
+        get() { return confirmingDelete; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'confirmIndex', {
+        get() { return confirmIndex; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'selectedChainSetting', {
+        get() { return selectedChainSetting; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'editingChainSettingValue', {
+        get() { return editingChainSettingValue; }, enumerable: true
+    });
+    _ctx.getChainSettingsItems = (...args) => getChainSettingsItems(...args);
+    _ctx.getChainSettingValue = (...args) => getChainSettingValue(...args);
+
+    /* Global settings state */
+    Object.defineProperty(_ctx, 'globalSettingsInSection', {
+        get() { return globalSettingsInSection; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'globalSettingsSectionIndex', {
+        get() { return globalSettingsSectionIndex; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'globalSettingsItemIndex', {
+        get() { return globalSettingsItemIndex; }, enumerable: true
+    });
+    Object.defineProperty(_ctx, 'globalSettingsEditing', {
+        get() { return globalSettingsEditing; }, enumerable: true
+    });
+    _ctx.GLOBAL_SETTINGS_SECTIONS = GLOBAL_SETTINGS_SECTIONS;
+
+    /* View transitions - bound lazily since some may be defined after this block */
+    _ctx.enterChainEdit = (...args) => enterChainEdit(...args);
+    _ctx.enterPatchBrowser = (...args) => _enterPatchBrowser(...args);
+    _ctx.enterMasterFxSettings = (...args) => enterMasterFxSettings(...args);
+    _ctx.enterSlotSettings = (...args) => _enterSlotSettings(...args);
+})();
+
+/* Delegate draw/enter functions to extracted modules */
+function drawSlots() { _drawSlots(); }
+function drawSlotSettings() { _drawSlotSettings(); }
+function enterSlotSettings(slotIndex) { _enterSlotSettings(slotIndex); }
+function drawPatches() { _drawPatches(); }
+function drawPatchDetail() { _drawPatchDetail(); }
+function drawComponentParams() { _drawComponentParams(); }
+function enterPatchBrowser(slotIndex) { _enterPatchBrowser(slotIndex); }
+function enterPatchDetail(slotIndex, patchIndex) { _enterPatchDetail(slotIndex, patchIndex); }
+function enterComponentParams(slot, component) { _enterComponentParams(slot, component); }
+function applyPatchSelection() { _applyPatchSelection(); }
+function drawMasterFx() { _drawMasterFx(); }
+function getMasterFxDisplayName() { return _getMasterFxDisplayName(); }
+function enterMasterFxSettings() { _enterMasterFxSettings(); }
+function scanForToolModules() { return _scanForToolModules(); }
+function enterToolsMenu() { _enterToolsMenu(); }
+function drawToolsMenu() { _drawToolsMenu(); }
+function drawToolFileBrowser() { _drawToolFileBrowser(); }
+function drawToolEngineSelect() { _drawToolEngineSelect(); }
+function drawToolConfirm() { _drawToolConfirm(); }
+function drawToolProcessing() { _drawToolProcessing(); }
+function drawToolResult() { _drawToolResult(); }
+function drawToolStemReview() { _drawToolStemReview(); }
+function drawToolSetPicker() { _drawToolSetPicker(); }
+function drawStorePickerCategories() { _drawStorePickerCategories(); }
+function drawStorePickerList() { _drawStorePickerList(); }
+function drawStorePickerLoading() { _drawStorePickerLoading(); }
+function drawStorePickerResult() { _drawStorePickerResult(); }
+function drawStorePickerDetail() { _drawStorePickerDetail(); }
+function drawChainSettings() { _drawChainSettings(); }
+function drawGlobalSettings() { _drawGlobalSettings(); }
 
 globalThis.init = function() {
     debugLog("Shadow UI init");
@@ -8370,6 +9028,11 @@ globalThis.init = function() {
     /* Note: Jump-to-slot check moved to first tick() to avoid race condition */
 
     /* Auto-update check is manual only (Settings → Updates → Check Updates) */
+
+    /* Process any HTML left by a prior background download, then kick off
+     * a new background download if the cache is stale. Both are non-blocking. */
+    try { processDownloadedHtml(); } catch (e) { debugLog("Manual process: " + e); }
+    try { refreshManualBackground(); } catch (e) { debugLog("Manual refresh: " + e); }
 
     /* Read active set UUID to point autosave at the correct per-set directory.
      * File format: line 1 = UUID, line 2 = set name */
@@ -8431,7 +9094,7 @@ globalThis.tick = function() {
             /* Let jump flags through so shortcuts still work */
             const navFlags = flags & (SHADOW_UI_FLAG_JUMP_TO_SLOT | SHADOW_UI_FLAG_JUMP_TO_MASTER_FX |
                               SHADOW_UI_FLAG_JUMP_TO_OVERTAKE | SHADOW_UI_FLAG_JUMP_TO_SETTINGS |
-                              SHADOW_UI_FLAG_JUMP_TO_SCREENREADER);
+                              SHADOW_UI_FLAG_JUMP_TO_SCREENREADER | SHADOW_UI_FLAG_JUMP_TO_TOOLS);
             const otherFlags = flags & ~navFlags;
             if (otherFlags && typeof shadow_clear_ui_flags === "function") {
                 shadow_clear_ui_flags(otherFlags);
@@ -8440,7 +9103,13 @@ globalThis.tick = function() {
         }
         {
             /* Settings/Screenreader flags take priority (clear conflicting SLOT flag) */
-            if (flags & SHADOW_UI_FLAG_JUMP_TO_SETTINGS) {
+            if (flags & SHADOW_UI_FLAG_JUMP_TO_TOOLS) {
+                debugLog("TOOLS flag detected, entering Tools menu");
+                enterToolsMenu();
+                if (typeof shadow_clear_ui_flags === "function") {
+                    shadow_clear_ui_flags(SHADOW_UI_FLAG_JUMP_TO_TOOLS | SHADOW_UI_FLAG_JUMP_TO_SLOT);
+                }
+            } else if (flags & SHADOW_UI_FLAG_JUMP_TO_SETTINGS) {
                 debugLog("SETTINGS flag detected, entering Global Settings");
                 enterGlobalSettings();
                 if (typeof shadow_clear_ui_flags === "function") {
@@ -8556,44 +9225,39 @@ globalThis.tick = function() {
             activeSlotStateDir = newDir;
             debugLog("SET_CHANGED: " + oldDir + " -> " + newDir);
 
-            /* 6. Reload all chain slots from new directory.
-             *    IMPORTANT: We use setSlotParam (synchronous) to clear slots,
-             *    NOT shadow_request_patch which is a single-item queue and
-             *    can only process one slot per tick. */
+            /* 6. Two-pass reload: clear ALL old slots first (freeing memory),
+             *    then load new slots. This reduces peak memory when switching
+             *    between sets with heavy synths. */
+
+            /* Pass 1: Clear all slots to free memory before loading anything new */
+            debugLog("SET_CHANGED: pass 1 — clearing all slots");
+            for (let i = 0; i < SHADOW_UI_SLOTS; i++) {
+                setSlotParamWithTimeout(i, "clear", "", 1500);
+            }
+
+            /* Pass 2: Load new state for non-empty slots */
+            debugLog("SET_CHANGED: pass 2 — loading new slot states");
             for (let i = 0; i < SHADOW_UI_SLOTS; i++) {
                 const path = activeSlotStateDir + "/slot_" + i + ".json";
-                let loaded = false;
-                let shouldClear = false;
-                let preserveCurrent = false;
                 if (host_file_exists(path)) {
                     const raw = host_read_file(path);
                     /* Non-empty state: try load_file with extended timeout + retry. */
                     if (raw && raw.length > 10) {
-                        let loadOk = false;
-                        loadOk = setSlotParamWithTimeout(i, "load_file", path, 1500);
+                        let loadOk = setSlotParamWithTimeout(i, "load_file", path, 1500);
                         if (!loadOk) {
                             debugLog("SET_CHANGED: load_file timeout slot " + (i + 1) + " path " + path + " (retry)");
                             loadOk = setSlotParamWithTimeout(i, "load_file", path, 3000);
                         }
-                        loaded = loadOk;
-                        if (!loadOk) {
-                            preserveCurrent = true;
+                        if (loadOk) {
+                            debugLog("SET_CHANGED: slot " + (i + 1) + " loaded");
+                        } else {
+                            debugLog("SET_CHANGED: slot " + (i + 1) + " not restored (load timeout)");
                         }
-                    } else if (raw) {
-                        /* Explicit empty marker ("{}") means this set intentionally has no slot content. */
-                        shouldClear = true;
                     } else {
-                        preserveCurrent = true;
+                        debugLog("SET_CHANGED: slot " + (i + 1) + " empty state (already cleared)");
                     }
                 } else {
-                    /* Missing file is treated as empty slot state. */
-                    shouldClear = true;
-                }
-                if (shouldClear) {
-                    debugLog("SET_CHANGED: clearing slot " + (i + 1) + " from empty set state");
-                    clearSlotForEmptySetState(i);
-                } else if (!loaded && preserveCurrent) {
-                    debugLog("SET_CHANGED: slot " + (i + 1) + " not restored (load timeout), preserving current DSP state");
+                    debugLog("SET_CHANGED: slot " + (i + 1) + " no state file (already cleared)");
                 }
             }
 
@@ -8669,6 +9333,15 @@ globalThis.tick = function() {
             debugLog("SET_CHANGED: reload complete");
         }
         /* SETTINGS and SCREENREADER flags are handled earlier with SLOT/MFX/OVERTAKE */
+    }
+
+    if (filepathBrowserState &&
+        filepathBrowserState.livePreviewEnabled &&
+        filepathBrowserState.previewPendingPath &&
+        Date.now() - filepathBrowserState.previewPendingTime >= 150) {
+        applyLivePreview(filepathBrowserState, { kind: "file", path: filepathBrowserState.previewPendingPath });
+        filepathBrowserState.previewPendingPath = "";
+        filepathBrowserState.previewPendingTime = 0;
     }
 
 
@@ -8815,6 +9488,19 @@ globalThis.tick = function() {
         return;
     }
 
+    /* Set page toast - render to shadow display, request rect overlay on native */
+    if (overlayState && overlayState.type === OVERLAY_SET_PAGE &&
+        overlayState.setPageActive && overlayState.setPageTimeout > 0) {
+        clear_screen();
+        drawSetPageToast(overlayState);
+        if (typeof shadow_set_display_overlay === "function") {
+            shadow_set_display_overlay(1,
+                SET_PAGE_BOX_X, SET_PAGE_BOX_Y,
+                SET_PAGE_BOX_W, SET_PAGE_BOX_H);
+        }
+        return;
+    }
+
     /* Shift+knob overlay - render to shadow display, request rect overlay on native */
     if (overlayState && overlayState.type === OVERLAY_SHIFT_KNOB &&
         overlayState.shiftKnobActive && overlayState.shiftKnobTimeout > 0) {
@@ -8832,6 +9518,9 @@ globalThis.tick = function() {
     if (typeof shadow_set_display_overlay === "function") {
         shadow_set_display_overlay(0, 0, 0, 0, 0);
     }
+
+    /* Flush deferred wav player file_path after DSP load */
+    wavPlayerTick();
 
     switch (view) {
         case VIEWS.SLOTS:
@@ -8873,6 +9562,9 @@ globalThis.tick = function() {
         case VIEWS.HIERARCHY_EDITOR:
             drawHierarchyEditor();
             break;
+        case VIEWS.FILEPATH_BROWSER:
+            drawFilepathBrowser();
+            break;
         case VIEWS.KNOB_EDITOR:
             drawKnobEditor();
             break;
@@ -8912,23 +9604,41 @@ globalThis.tick = function() {
         case VIEWS.GLOBAL_SETTINGS:
             drawGlobalSettings();
             break;
+        case VIEWS.TOOLS:
+            drawToolsMenu();
+            break;
+        case VIEWS.TOOL_FILE_BROWSER:
+            drawToolFileBrowser();
+            break;
+        case VIEWS.TOOL_SET_PICKER:
+            drawToolSetPicker();
+            break;
+        case VIEWS.TOOL_ENGINE_SELECT:
+            drawToolEngineSelect();
+            break;
+        case VIEWS.TOOL_CONFIRM:
+            drawToolConfirm();
+            break;
+        case VIEWS.TOOL_PROCESSING:
+            pollToolProcess();
+            drawToolProcessing();
+            break;
+        case VIEWS.TOOL_RESULT:
+            drawToolResult();
+            break;
+        case VIEWS.TOOL_STEM_REVIEW:
+            drawToolStemReview();
+            break;
         case VIEWS.OVERTAKE_MODULE:
             try {
-                /* Handle exit - progressively clear LEDs then return to Move */
+                /* Handle exit — LED restore is handled by C-side cache.
+                 * When overtake_mode drops to 0, the shim detects the transition
+                 * and progressively replays Move's cached LED state. */
                 if (overtakeExitPending) {
                     debugLog("OVERTAKE tick: exit phase");
-                    /* Show exiting screen while clearing LEDs */
                     clear_screen();
                     print(40, 28, "Exiting...", 1);
-
-                    /* Clear LEDs in batches */
-                    const exitLedsCleared = clearLedBatch();
-
-                    /* After LEDs cleared, complete the exit */
-                    if (exitLedsCleared) {
-                        ledClearIndex = 0;
-                        completeOvertakeExit();
-                    }
+                    completeOvertakeExit();
                 }
                 /* Handle deferred init - progressively clear LEDs then call module init() */
                 else if (overtakeInitPending) {
@@ -8962,6 +9672,44 @@ globalThis.tick = function() {
                         flushLedQueue();  /* Drain any LEDs set during init() */
                     }
                 } else {
+                    /* Flush accumulated encoder deltas as synthetic CC messages
+                     * before calling tick(). This batches rapid knob turns into
+                     * a single message per knob per frame. The accumulated count
+                     * is encoded as: CW = count (1-63), CCW = 128 - abs(count).
+                     * Modules using decodeDelta() will get direction; modules
+                     * reading the raw value get the magnitude for acceleration. */
+                    if (overtakeModuleCallbacks && overtakeModuleCallbacks.onMidiMessageInternal) {
+                        for (let k = 0; k < NUM_KNOBS; k++) {
+                            if (overtakeKnobDelta[k] !== 0) {
+                                const d = overtakeKnobDelta[k];
+                                const ccVal = d > 0 ? Math.min(d, 63) : Math.max(128 + d, 65);
+                                try {
+                                    overtakeModuleCallbacks.onMidiMessageInternal([0xB0, KNOB_CC_START + k, ccVal]);
+                                } catch (e) {
+                                    debugLog("OVERTAKE flush knob exception: " + e);
+                                    exitOvertakeMode();
+                                    break;
+                                }
+                                overtakeKnobDelta[k] = 0;
+                            }
+                        }
+                        if (overtakeJogDelta !== 0) {
+                            const d = overtakeJogDelta;
+                            const ccVal = d > 0 ? Math.min(d, 63) : Math.max(128 + d, 65);
+                            try {
+                                overtakeModuleCallbacks.onMidiMessageInternal([0xB0, MoveMainKnob, ccVal]);
+                            } catch (e) {
+                                debugLog("OVERTAKE flush jog exception: " + e);
+                                exitOvertakeMode();
+                            }
+                            overtakeJogDelta = 0;
+                        }
+                    } else {
+                        /* No MIDI handler, just clear accumulators */
+                        for (let k = 0; k < NUM_KNOBS; k++) overtakeKnobDelta[k] = 0;
+                        overtakeJogDelta = 0;
+                    }
+
                     /* Call the overtake module's tick() function */
                     if (overtakeModuleCallbacks && overtakeModuleCallbacks.tick) {
                         try {
@@ -8989,9 +9737,9 @@ globalThis.tick = function() {
         drawTextEntry();
     }
 
-    /* Draw asset warning overlay if active */
-    if (assetWarningActive) {
-        drawMessageOverlay(assetWarningTitle, assetWarningLines);
+    /* Draw warning overlay if active */
+    if (warningActive) {
+        drawMessageOverlay(warningTitle, warningLines);
     }
 
     /* Draw overlay on top of main view (uses shared overlay system) */
@@ -9010,6 +9758,8 @@ globalThis.onMidiMessageInternal = function(data) {
         debugLog(`MIDI_IN: view=${view} status=${status} d1=${d1} d2=${d2} loaded=${overtakeModuleLoaded} callbacks=${!!overtakeModuleCallbacks}`);
     }
 
+
+
     /* Handle text entry MIDI if active */
     if (isTextEntryActive()) {
         if (handleTextEntryMidi(data)) {
@@ -9018,10 +9768,14 @@ globalThis.onMidiMessageInternal = function(data) {
         }
     }
 
-    /* Dismiss asset warning overlay on any button press */
-    if (assetWarningActive && (status & 0xF0) === 0xB0 && d2 > 0) {
-        dismissAssetWarning();
-        return;  /* Consumed - don't process further */
+    /* Dismiss warning overlay on button presses, but not knob turns. */
+    if (warningActive && (status & 0xF0) === 0xB0 && d2 > 0) {
+        const isMainKnobTurn = d1 === MoveMainKnob;
+        const isParamKnobTurn = d1 >= KNOB_CC_START && d1 <= KNOB_CC_END;
+        if (!isMainKnobTurn && !isParamKnobTurn) {
+            dismissWarning();
+            return;  /* Consumed - don't process further */
+        }
     }
 
     /* Debug: track last CC for display (only for CC messages) */
@@ -9070,12 +9824,32 @@ globalThis.onMidiMessageInternal = function(data) {
             debugLog(`JOG CLICK: hostShift=${hostShiftHeld} volTouch=${hostVolumeKnobTouched}`);
             if (hostShiftHeld && hostVolumeKnobTouched) {
                 debugLog("HOST: Shift+Vol+Jog detected, exiting overtake mode");
-                exitOvertakeMode();
+                if (toolOvertakeActive) {
+                    exitToolOvertake();
+                } else {
+                    exitOvertakeMode();
+                }
                 return;
             }
         }
 
-        /* Route to the overtake module's onMidiMessageInternal if it exists */
+        /* Accumulate encoder/jog CCs instead of forwarding immediately.
+         * Deltas are flushed as synthetic messages before tick(). */
+        if ((status & 0xF0) === 0xB0) {
+            if (d1 >= KNOB_CC_START && d1 <= KNOB_CC_END) {
+                const knobIdx = d1 - KNOB_CC_START;
+                overtakeKnobDelta[knobIdx] += decodeDelta(d2);
+                needsRedraw = true;
+                return;
+            }
+            if (d1 === MoveMainKnob) {
+                overtakeJogDelta += decodeDelta(d2);
+                needsRedraw = true;
+                return;
+            }
+        }
+
+        /* Route non-encoder MIDI to the overtake module immediately */
         if (overtakeModuleCallbacks.onMidiMessageInternal) {
             try {
                 overtakeModuleCallbacks.onMidiMessageInternal(data);
