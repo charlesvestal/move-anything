@@ -9,6 +9,7 @@
 
 #define _GNU_SOURCE
 #include "shadow_sampler.h"
+#include "shadow_rec_source.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -623,6 +624,8 @@ void sampler_capture_audio(void) {
         audio = (int16_t *)(gmmap + SAMPLER_AUDIO_OUT_OFFSET);
     } else if (sampler_source == SAMPLER_SOURCE_MOVE_INPUT && hmmap) {
         audio = (int16_t *)(hmmap + SAMPLER_AUDIO_IN_OFFSET);
+    } else if (sampler_source == SAMPLER_SOURCE_REC_SOURCE) {
+        audio = (int16_t *)rec_source_get_audio();
     }
     if (!audio) return;
 

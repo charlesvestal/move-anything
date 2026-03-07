@@ -42,6 +42,7 @@
 #include "host/tts_engine.h"
 #include "host/link_audio.h"
 #include "host/shadow_sampler.h"
+#include "host/shadow_rec_source.h"
 #include "host/shadow_set_pages.h"
 #include "host/shadow_dbus.h"
 #include "host/shadow_chain_mgmt.h"
@@ -1311,6 +1312,11 @@ static void shadow_inprocess_render_to_buffer(void) {
     /* Preview player: mix file preview audio into the deferred buffer */
     preview_render(shadow_deferred_dsp_buffer, MOVE_FRAMES_PER_BLOCK);
 
+    /* Render rec source if active */
+    if (shadow_rec_source.active && shadow_rec_source.instance) {
+        rec_source_render();
+    }
+
     /* Note: Master FX is applied in mix_from_buffer() AFTER mixing with Move's audio */
 
     shadow_deferred_dsp_valid = 1;
@@ -1543,6 +1549,17 @@ static void shadow_inprocess_mix_from_buffer(void) {
         if (mixed < -32768) mixed = -32768;
         mailbox_audio[i] = (int16_t)mixed;
         me_full[i] += (int32_t)shadow_deferred_dsp_buffer[i];
+    }
+
+    /* Mix rec source audio into output for monitoring */
+    if (shadow_rec_source.active) {
+        const int16_t *src_audio = rec_source_get_audio();
+        for (int i = 0; i < 256; i++) {  /* 128 frames * 2 channels */
+            int32_t mixed = (int32_t)mailbox_audio[i] + (int32_t)src_audio[i];
+            if (mixed > 32767) mixed = 32767;
+            if (mixed < -32768) mixed = -32768;
+            mailbox_audio[i] = (int16_t)mixed;
+        }
     }
 
     /* Save ME full-gain component for bridge split */

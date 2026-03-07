@@ -26,6 +26,7 @@
 #include "host/module_manager.h"
 #include "host/settings.h"
 #include "host/shadow_constants.h"
+#include "host/shadow_rec_source.h"
 
 int global_fd = -1;
 int global_exit_flag = 0;
@@ -60,6 +61,14 @@ int g_js_functions_need_refresh = 0;
 int g_reload_menu_ui = 0;
 char g_menu_script_path[256] = "";
 int g_silence_blocks = 0;
+
+/* Rec source secondary UI context */
+static JSRuntime *rec_source_rt = NULL;
+static JSContext *rec_source_ctx = NULL;
+static JSValue rec_source_tick_fn = JS_UNDEFINED;
+static JSValue rec_source_midi_int_fn = JS_UNDEFINED;
+static JSValue rec_source_midi_ext_fn = JS_UNDEFINED;
+int rec_source_ui_active = 0;
 
 /* Default modules directory */
 #define DEFAULT_MODULES_DIR "/data/UserData/move-anything/modules"
@@ -1223,6 +1232,8 @@ static JSValue js_host_list_modules(JSContext *ctx, JSValueConst this_val,
         JS_SetPropertyStr(ctx, obj, "version", JS_NewString(ctx, info->version));
         JS_SetPropertyStr(ctx, obj, "index", JS_NewInt32(ctx, i));
         JS_SetPropertyStr(ctx, obj, "component_type", JS_NewString(ctx, info->component_type));
+        JS_SetPropertyStr(ctx, obj, "rec_source", JS_NewBool(ctx, info->rec_source));
+        JS_SetPropertyStr(ctx, obj, "abbrev", JS_NewString(ctx, info->abbrev));
         /* Check if ui.js exists */
         int has_ui = (info->ui_script[0] && access(info->ui_script, F_OK) == 0) ? 1 : 0;
         JS_SetPropertyStr(ctx, obj, "has_ui", JS_NewBool(ctx, has_ui));
@@ -2147,6 +2158,350 @@ static JSValue js_host_write_file(JSContext *ctx, JSValueConst this_val,
     return (written == len) ? JS_TRUE : JS_FALSE;
 }
 
+/* Forward declarations for rec source UI functions (defined below) */
+static void rec_source_unload_ui(void);
+int rec_source_load_ui(const char *ui_script_path);
+void rec_source_switch_to_ui(void);
+void rec_source_switch_to_main(void);
+
+/* --- Rec source JS API functions --- */
+
+static JSValue js_host_source_load(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv) {
+    if (argc < 1) return JS_FALSE;
+    const char *module_id = JS_ToCString(ctx, argv[0]);
+    if (!module_id) return JS_FALSE;
+
+    int ret = rec_source_load(module_id);
+    if (ret != 0) {
+        fprintf(stderr, "host_source_load: failed to load DSP for '%s'\n", module_id);
+        JS_FreeCString(ctx, module_id);
+        return JS_FALSE;
+    }
+
+    /* Build UI script path from the module_path set by rec_source_load */
+    char ui_path[512];
+    snprintf(ui_path, sizeof(ui_path), "%s/ui.js", shadow_rec_source.module_path);
+
+    /* Check if ui.js exists */
+    struct stat st;
+    if (stat(ui_path, &st) != 0) {
+        fprintf(stderr, "host_source_load: no ui.js at '%s'\n", ui_path);
+        JS_FreeCString(ctx, module_id);
+        return JS_FALSE;
+    }
+
+    ret = rec_source_load_ui(ui_path);
+    JS_FreeCString(ctx, module_id);
+    return (ret == 0) ? JS_TRUE : JS_FALSE;
+}
+
+static JSValue js_host_source_unload(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv) {
+    rec_source_unload_ui();
+    rec_source_unload();
+    return JS_UNDEFINED;
+}
+
+static JSValue js_host_source_is_active(JSContext *ctx, JSValueConst this_val,
+                                        int argc, JSValueConst *argv) {
+    return JS_NewBool(ctx, rec_source_is_active());
+}
+
+static JSValue js_host_source_get_id(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv) {
+    if (shadow_rec_source.active)
+        return JS_NewString(ctx, shadow_rec_source.module_id);
+    return JS_NULL;
+}
+
+static JSValue js_host_source_get_name(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv) {
+    if (shadow_rec_source.active)
+        return JS_NewString(ctx, shadow_rec_source.module_name);
+    return JS_NULL;
+}
+
+static JSValue js_host_source_get_abbrev(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv) {
+    if (shadow_rec_source.active)
+        return JS_NewString(ctx, shadow_rec_source.module_abbrev);
+    return JS_NULL;
+}
+
+static JSValue js_host_source_get_level(JSContext *ctx, JSValueConst this_val,
+                                        int argc, JSValueConst *argv) {
+    return JS_NewFloat64(ctx, rec_source_get_level());
+}
+
+static JSValue js_host_source_pause(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv) {
+    rec_source_pause();
+    return JS_UNDEFINED;
+}
+
+static JSValue js_host_source_resume(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv) {
+    rec_source_resume();
+    return JS_UNDEFINED;
+}
+
+static JSValue js_host_source_show_ui(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv) {
+    rec_source_switch_to_ui();
+    return JS_UNDEFINED;
+}
+
+static JSValue js_host_source_hide_ui(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv) {
+    rec_source_switch_to_main();
+    return JS_UNDEFINED;
+}
+
+/* Register all host functions on a JS context.
+ * This is called for both the main context and rec source context. */
+static void register_host_functions(JSContext *ctx) {
+    JSValue global_obj = JS_GetGlobalObject(ctx);
+
+    JS_SetPropertyStr(ctx, global_obj, "move_midi_external_send",
+        JS_NewCFunction(ctx, js_move_midi_external_send, "move_midi_external_send", 1));
+    JS_SetPropertyStr(ctx, global_obj, "move_midi_internal_send",
+        JS_NewCFunction(ctx, js_move_midi_internal_send, "move_midi_internal_send", 1));
+    JS_SetPropertyStr(ctx, global_obj, "set_pixel",
+        JS_NewCFunction(ctx, js_set_pixel, "set_pixel", 1));
+    JS_SetPropertyStr(ctx, global_obj, "draw_rect",
+        JS_NewCFunction(ctx, js_draw_rect, "draw_rect", 1));
+    JS_SetPropertyStr(ctx, global_obj, "fill_rect",
+        JS_NewCFunction(ctx, js_fill_rect, "fill_rect", 1));
+    JS_SetPropertyStr(ctx, global_obj, "clear_screen",
+        JS_NewCFunction(ctx, js_clear_screen, "clear_screen", 0));
+    JS_SetPropertyStr(ctx, global_obj, "get_int16",
+        JS_NewCFunction(ctx, js_get_int16, "get_int16", 0));
+    JS_SetPropertyStr(ctx, global_obj, "set_int16",
+        JS_NewCFunction(ctx, js_set_int16, "set_int16", 0));
+    JS_SetPropertyStr(ctx, global_obj, "print",
+        JS_NewCFunction(ctx, js_print, "print", 1));
+    JS_SetPropertyStr(ctx, global_obj, "text_width",
+        JS_NewCFunction(ctx, js_text_width, "text_width", 1));
+    JS_SetPropertyStr(ctx, global_obj, "draw_line",
+        JS_NewCFunction(ctx, js_draw_line, "draw_line", 5));
+    JS_SetPropertyStr(ctx, global_obj, "exit",
+        JS_NewCFunction(ctx, js_exit, "exit", 0));
+
+    /* Module management functions */
+    JS_SetPropertyStr(ctx, global_obj, "host_list_modules",
+        JS_NewCFunction(ctx, js_host_list_modules, "host_list_modules", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_load_module",
+        JS_NewCFunction(ctx, js_host_load_module, "host_load_module", 1));
+    JS_SetPropertyStr(ctx, global_obj, "host_load_ui_module",
+        JS_NewCFunction(ctx, js_host_load_ui_module, "host_load_ui_module", 1));
+    JS_SetPropertyStr(ctx, global_obj, "host_unload_module",
+        JS_NewCFunction(ctx, js_host_unload_module, "host_unload_module", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_return_to_menu",
+        JS_NewCFunction(ctx, js_host_return_to_menu, "host_return_to_menu", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_module_set_param",
+        JS_NewCFunction(ctx, js_host_module_set_param, "host_module_set_param", 2));
+    JS_SetPropertyStr(ctx, global_obj, "host_module_get_param",
+        JS_NewCFunction(ctx, js_host_module_get_param, "host_module_get_param", 1));
+    JS_SetPropertyStr(ctx, global_obj, "host_module_get_error",
+        JS_NewCFunction(ctx, js_host_module_get_error, "host_module_get_error", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_module_send_midi",
+        JS_NewCFunction(ctx, js_host_module_send_midi, "host_module_send_midi", 2));
+    JS_SetPropertyStr(ctx, global_obj, "host_is_module_loaded",
+        JS_NewCFunction(ctx, js_host_is_module_loaded, "host_is_module_loaded", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_get_current_module",
+        JS_NewCFunction(ctx, js_host_get_current_module, "host_get_current_module", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_rescan_modules",
+        JS_NewCFunction(ctx, js_host_rescan_modules, "host_rescan_modules", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_get_volume",
+        JS_NewCFunction(ctx, js_host_get_volume, "host_get_volume", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_set_volume",
+        JS_NewCFunction(ctx, js_host_set_volume, "host_set_volume", 1));
+    JS_SetPropertyStr(ctx, global_obj, "host_get_setting",
+        JS_NewCFunction(ctx, js_host_get_setting, "host_get_setting", 1));
+    JS_SetPropertyStr(ctx, global_obj, "host_set_setting",
+        JS_NewCFunction(ctx, js_host_set_setting, "host_set_setting", 2));
+    JS_SetPropertyStr(ctx, global_obj, "host_save_settings",
+        JS_NewCFunction(ctx, js_host_save_settings, "host_save_settings", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_reload_settings",
+        JS_NewCFunction(ctx, js_host_reload_settings, "host_reload_settings", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_set_refresh_rate",
+        JS_NewCFunction(ctx, js_host_set_refresh_rate, "host_set_refresh_rate", 1));
+    JS_SetPropertyStr(ctx, global_obj, "host_get_refresh_rate",
+        JS_NewCFunction(ctx, js_host_get_refresh_rate, "host_get_refresh_rate", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_flush_display",
+        JS_NewCFunction(ctx, js_host_flush_display, "host_flush_display", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_announce_screenreader",
+        JS_NewCFunction(ctx, js_host_announce_screenreader, "host_announce_screenreader", 1));
+
+    /* Store module functions */
+    JS_SetPropertyStr(ctx, global_obj, "host_file_exists",
+        JS_NewCFunction(ctx, js_host_file_exists, "host_file_exists", 1));
+    JS_SetPropertyStr(ctx, global_obj, "host_http_download",
+        JS_NewCFunction(ctx, js_host_http_download, "host_http_download", 2));
+    JS_SetPropertyStr(ctx, global_obj, "host_extract_tar",
+        JS_NewCFunction(ctx, js_host_extract_tar, "host_extract_tar", 2));
+    JS_SetPropertyStr(ctx, global_obj, "host_extract_tar_strip",
+        JS_NewCFunction(ctx, js_host_extract_tar_strip, "host_extract_tar_strip", 3));
+    JS_SetPropertyStr(ctx, global_obj, "host_ensure_dir",
+        JS_NewCFunction(ctx, js_host_ensure_dir, "host_ensure_dir", 1));
+    JS_SetPropertyStr(ctx, global_obj, "host_remove_dir",
+        JS_NewCFunction(ctx, js_host_remove_dir, "host_remove_dir", 1));
+    JS_SetPropertyStr(ctx, global_obj, "host_read_file",
+        JS_NewCFunction(ctx, js_host_read_file, "host_read_file", 1));
+    JS_SetPropertyStr(ctx, global_obj, "host_write_file",
+        JS_NewCFunction(ctx, js_host_write_file, "host_write_file", 2));
+
+    /* Rec source functions */
+    JS_SetPropertyStr(ctx, global_obj, "host_source_load",
+        JS_NewCFunction(ctx, js_host_source_load, "host_source_load", 1));
+    JS_SetPropertyStr(ctx, global_obj, "host_source_unload",
+        JS_NewCFunction(ctx, js_host_source_unload, "host_source_unload", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_source_is_active",
+        JS_NewCFunction(ctx, js_host_source_is_active, "host_source_is_active", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_source_get_id",
+        JS_NewCFunction(ctx, js_host_source_get_id, "host_source_get_id", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_source_get_name",
+        JS_NewCFunction(ctx, js_host_source_get_name, "host_source_get_name", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_source_get_abbrev",
+        JS_NewCFunction(ctx, js_host_source_get_abbrev, "host_source_get_abbrev", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_source_get_level",
+        JS_NewCFunction(ctx, js_host_source_get_level, "host_source_get_level", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_source_pause",
+        JS_NewCFunction(ctx, js_host_source_pause, "host_source_pause", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_source_resume",
+        JS_NewCFunction(ctx, js_host_source_resume, "host_source_resume", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_source_show_ui",
+        JS_NewCFunction(ctx, js_host_source_show_ui, "host_source_show_ui", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_source_hide_ui",
+        JS_NewCFunction(ctx, js_host_source_hide_ui, "host_source_hide_ui", 0));
+
+    /* Create 'display' object so modules can use display.clear(), display.drawText(), etc. */
+    JSValue display_obj = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, display_obj, "clear",
+        JS_NewCFunction(ctx, js_clear_screen, "clear", 0));
+    JS_SetPropertyStr(ctx, display_obj, "drawText",
+        JS_NewCFunction(ctx, js_print, "drawText", 4));
+    JS_SetPropertyStr(ctx, display_obj, "fillRect",
+        JS_NewCFunction(ctx, js_fill_rect, "fillRect", 5));
+    JS_SetPropertyStr(ctx, display_obj, "drawRect",
+        JS_NewCFunction(ctx, js_draw_rect, "drawRect", 5));
+    JS_SetPropertyStr(ctx, display_obj, "drawLine",
+        JS_NewCFunction(ctx, js_draw_line, "drawLine", 5));
+    JS_SetPropertyStr(ctx, display_obj, "flush",
+        JS_NewCFunction(ctx, js_host_flush_display, "flush", 0));
+    JS_SetPropertyStr(ctx, global_obj, "display", display_obj);
+
+    JS_FreeValue(ctx, global_obj);
+}
+
+/* --- Rec source UI context management --- */
+
+static void rec_source_unload_ui(void) {
+    if (!rec_source_ctx) return;
+    printf("Rec source: unloading UI context\n");
+    JS_FreeValue(rec_source_ctx, rec_source_tick_fn);
+    JS_FreeValue(rec_source_ctx, rec_source_midi_int_fn);
+    JS_FreeValue(rec_source_ctx, rec_source_midi_ext_fn);
+    rec_source_tick_fn = JS_UNDEFINED;
+    rec_source_midi_int_fn = JS_UNDEFINED;
+    rec_source_midi_ext_fn = JS_UNDEFINED;
+    JS_FreeContext(rec_source_ctx);
+    JS_FreeRuntime(rec_source_rt);
+    rec_source_ctx = NULL;
+    rec_source_rt = NULL;
+    rec_source_ui_active = 0;
+}
+
+int rec_source_load_ui(const char *ui_script_path) {
+    if (rec_source_ctx) rec_source_unload_ui();
+
+    printf("Rec source: loading UI from %s\n", ui_script_path);
+
+    rec_source_rt = JS_NewRuntime();
+    if (!rec_source_rt) {
+        fprintf(stderr, "Rec source: cannot allocate JS runtime\n");
+        return -1;
+    }
+
+    js_std_set_worker_new_context_func(JS_NewCustomContext);
+    js_std_init_handlers(rec_source_rt);
+
+    rec_source_ctx = JS_NewCustomContext(rec_source_rt);
+    if (!rec_source_ctx) {
+        fprintf(stderr, "Rec source: cannot allocate JS context\n");
+        JS_FreeRuntime(rec_source_rt);
+        rec_source_rt = NULL;
+        return -1;
+    }
+
+    js_std_add_helpers(rec_source_ctx, -1, 0);
+    register_host_functions(rec_source_ctx);
+    JS_SetModuleLoaderFunc(rec_source_rt, NULL, js_module_loader, NULL);
+
+    /* Load and eval the UI script */
+    uint8_t *buf;
+    size_t buf_len;
+    buf = js_load_file(rec_source_ctx, &buf_len, ui_script_path);
+    if (!buf) {
+        printf("Rec source: failed to load %s\n", ui_script_path);
+        JS_FreeContext(rec_source_ctx);
+        JS_FreeRuntime(rec_source_rt);
+        rec_source_ctx = NULL;
+        rec_source_rt = NULL;
+        return -1;
+    }
+
+    int eval_flags = JS_EVAL_FLAG_STRICT | JS_EVAL_TYPE_GLOBAL;
+    int ret = eval_buf(rec_source_ctx, buf, buf_len, ui_script_path, eval_flags);
+    js_free(rec_source_ctx, buf);
+
+    if (ret != 0) {
+        printf("Rec source: failed to eval %s\n", ui_script_path);
+        JS_FreeContext(rec_source_ctx);
+        JS_FreeRuntime(rec_source_rt);
+        rec_source_ctx = NULL;
+        rec_source_rt = NULL;
+        return -1;
+    }
+
+    /* Cache tick and MIDI handler functions */
+    JSValue global = JS_GetGlobalObject(rec_source_ctx);
+    rec_source_tick_fn = JS_GetPropertyStr(rec_source_ctx, global, "tick");
+    rec_source_midi_int_fn = JS_GetPropertyStr(rec_source_ctx, global, "onMidiMessageInternal");
+    rec_source_midi_ext_fn = JS_GetPropertyStr(rec_source_ctx, global, "onMidiMessageExternal");
+
+    /* Call init() if defined */
+    JSValue init_fn = JS_GetPropertyStr(rec_source_ctx, global, "init");
+    if (JS_IsFunction(rec_source_ctx, init_fn)) {
+        JSValue result = JS_Call(rec_source_ctx, init_fn, JS_UNDEFINED, 0, NULL);
+        if (JS_IsException(result)) {
+            js_std_dump_error(rec_source_ctx);
+        }
+        JS_FreeValue(rec_source_ctx, result);
+    }
+    JS_FreeValue(rec_source_ctx, init_fn);
+    JS_FreeValue(rec_source_ctx, global);
+
+    rec_source_ui_active = 0;
+    printf("Rec source: UI loaded successfully\n");
+    return 0;
+}
+
+void rec_source_switch_to_ui(void) {
+    if (!rec_source_ctx) {
+        printf("Rec source: no UI context loaded, cannot switch\n");
+        return;
+    }
+    rec_source_ui_active = 1;
+    printf("Rec source: switched to rec source UI\n");
+}
+
+void rec_source_switch_to_main(void) {
+    rec_source_ui_active = 0;
+    printf("Rec source: switched to main UI\n");
+}
+
 void init_javascript(JSRuntime **prt, JSContext **pctx)
 {
 
@@ -2172,154 +2527,7 @@ void init_javascript(JSRuntime **prt, JSContext **pctx)
     }
 
     js_std_add_helpers(ctx, -1, 0);
-    JSValue global_obj = JS_GetGlobalObject(ctx);
-
-    JSValue move_midi_external_send_func = JS_NewCFunction(ctx, js_move_midi_external_send, "move_midi_external_send", 1);
-    JS_SetPropertyStr(ctx, global_obj, "move_midi_external_send", move_midi_external_send_func);
-
-    JSValue move_midi_internal_send_func = JS_NewCFunction(ctx, js_move_midi_internal_send, "move_midi_internal_send", 1);
-    JS_SetPropertyStr(ctx, global_obj, "move_midi_internal_send", move_midi_internal_send_func);
-
-    JSValue set_pixel_func = JS_NewCFunction(ctx, js_set_pixel, "set_pixel", 1);
-    JS_SetPropertyStr(ctx, global_obj, "set_pixel", set_pixel_func);
-
-    JSValue draw_rect_func = JS_NewCFunction(ctx, js_draw_rect, "draw_rect", 1);
-    JS_SetPropertyStr(ctx, global_obj, "draw_rect", draw_rect_func);
-
-    JSValue fill_rect_func = JS_NewCFunction(ctx, js_fill_rect, "fill_rect", 1);
-    JS_SetPropertyStr(ctx, global_obj, "fill_rect", fill_rect_func);
-
-    JSValue clear_screen_func = JS_NewCFunction(ctx, js_clear_screen, "clear_screen", 0);
-    JS_SetPropertyStr(ctx, global_obj, "clear_screen", clear_screen_func);
-
-    JSValue get_int16_func = JS_NewCFunction(ctx, js_get_int16, "get_int16", 0);
-    JS_SetPropertyStr(ctx, global_obj, "get_int16", get_int16_func);
-
-    JSValue set_int16_func = JS_NewCFunction(ctx, js_set_int16, "set_int16", 0);
-    JS_SetPropertyStr(ctx, global_obj, "set_int16", set_int16_func);
-
-    JSValue print_func = JS_NewCFunction(ctx, js_print, "print", 1);
-    JS_SetPropertyStr(ctx, global_obj, "print", print_func);
-
-    JS_SetPropertyStr(ctx, global_obj, "text_width",
-        JS_NewCFunction(ctx, js_text_width, "text_width", 1));
-
-    JSValue draw_line_func = JS_NewCFunction(ctx, js_draw_line, "draw_line", 5);
-    JS_SetPropertyStr(ctx, global_obj, "draw_line", draw_line_func);
-
-    JSValue exit_func = JS_NewCFunction(ctx, js_exit, "exit", 0);
-    JS_SetPropertyStr(ctx, global_obj, "exit", exit_func);
-
-    /* Module management functions */
-    JSValue host_list_modules_func = JS_NewCFunction(ctx, js_host_list_modules, "host_list_modules", 0);
-    JS_SetPropertyStr(ctx, global_obj, "host_list_modules", host_list_modules_func);
-
-    JSValue host_load_module_func = JS_NewCFunction(ctx, js_host_load_module, "host_load_module", 1);
-    JS_SetPropertyStr(ctx, global_obj, "host_load_module", host_load_module_func);
-
-    JSValue host_load_ui_module_func = JS_NewCFunction(ctx, js_host_load_ui_module, "host_load_ui_module", 1);
-    JS_SetPropertyStr(ctx, global_obj, "host_load_ui_module", host_load_ui_module_func);
-
-    JSValue host_unload_module_func = JS_NewCFunction(ctx, js_host_unload_module, "host_unload_module", 0);
-    JS_SetPropertyStr(ctx, global_obj, "host_unload_module", host_unload_module_func);
-
-    JSValue host_return_to_menu_func = JS_NewCFunction(ctx, js_host_return_to_menu, "host_return_to_menu", 0);
-    JS_SetPropertyStr(ctx, global_obj, "host_return_to_menu", host_return_to_menu_func);
-
-    JSValue host_module_set_param_func = JS_NewCFunction(ctx, js_host_module_set_param, "host_module_set_param", 2);
-    JS_SetPropertyStr(ctx, global_obj, "host_module_set_param", host_module_set_param_func);
-
-    JSValue host_module_get_param_func = JS_NewCFunction(ctx, js_host_module_get_param, "host_module_get_param", 1);
-    JS_SetPropertyStr(ctx, global_obj, "host_module_get_param", host_module_get_param_func);
-
-    JSValue host_module_get_error_func = JS_NewCFunction(ctx, js_host_module_get_error, "host_module_get_error", 0);
-    JS_SetPropertyStr(ctx, global_obj, "host_module_get_error", host_module_get_error_func);
-
-    JSValue host_module_send_midi_func = JS_NewCFunction(ctx, js_host_module_send_midi, "host_module_send_midi", 2);
-    JS_SetPropertyStr(ctx, global_obj, "host_module_send_midi", host_module_send_midi_func);
-
-    JSValue host_is_module_loaded_func = JS_NewCFunction(ctx, js_host_is_module_loaded, "host_is_module_loaded", 0);
-    JS_SetPropertyStr(ctx, global_obj, "host_is_module_loaded", host_is_module_loaded_func);
-
-    JSValue host_get_current_module_func = JS_NewCFunction(ctx, js_host_get_current_module, "host_get_current_module", 0);
-    JS_SetPropertyStr(ctx, global_obj, "host_get_current_module", host_get_current_module_func);
-
-    JSValue host_rescan_modules_func = JS_NewCFunction(ctx, js_host_rescan_modules, "host_rescan_modules", 0);
-    JS_SetPropertyStr(ctx, global_obj, "host_rescan_modules", host_rescan_modules_func);
-
-    JSValue host_get_volume_func = JS_NewCFunction(ctx, js_host_get_volume, "host_get_volume", 0);
-    JS_SetPropertyStr(ctx, global_obj, "host_get_volume", host_get_volume_func);
-
-    JSValue host_set_volume_func = JS_NewCFunction(ctx, js_host_set_volume, "host_set_volume", 1);
-    JS_SetPropertyStr(ctx, global_obj, "host_set_volume", host_set_volume_func);
-
-    JSValue host_get_setting_func = JS_NewCFunction(ctx, js_host_get_setting, "host_get_setting", 1);
-    JS_SetPropertyStr(ctx, global_obj, "host_get_setting", host_get_setting_func);
-
-    JSValue host_set_setting_func = JS_NewCFunction(ctx, js_host_set_setting, "host_set_setting", 2);
-    JS_SetPropertyStr(ctx, global_obj, "host_set_setting", host_set_setting_func);
-
-    JSValue host_save_settings_func = JS_NewCFunction(ctx, js_host_save_settings, "host_save_settings", 0);
-    JS_SetPropertyStr(ctx, global_obj, "host_save_settings", host_save_settings_func);
-
-    JSValue host_reload_settings_func = JS_NewCFunction(ctx, js_host_reload_settings, "host_reload_settings", 0);
-    JS_SetPropertyStr(ctx, global_obj, "host_reload_settings", host_reload_settings_func);
-
-    JSValue host_set_refresh_rate_func = JS_NewCFunction(ctx, js_host_set_refresh_rate, "host_set_refresh_rate", 1);
-    JS_SetPropertyStr(ctx, global_obj, "host_set_refresh_rate", host_set_refresh_rate_func);
-
-    JSValue host_get_refresh_rate_func = JS_NewCFunction(ctx, js_host_get_refresh_rate, "host_get_refresh_rate", 0);
-    JS_SetPropertyStr(ctx, global_obj, "host_get_refresh_rate", host_get_refresh_rate_func);
-
-    JSValue host_flush_display_func = JS_NewCFunction(ctx, js_host_flush_display, "host_flush_display", 0);
-    JS_SetPropertyStr(ctx, global_obj, "host_flush_display", host_flush_display_func);
-
-    JSValue host_announce_screenreader_func = JS_NewCFunction(ctx, js_host_announce_screenreader, "host_announce_screenreader", 1);
-    JS_SetPropertyStr(ctx, global_obj, "host_announce_screenreader", host_announce_screenreader_func);
-
-    /* Store module functions */
-    JSValue host_file_exists_func = JS_NewCFunction(ctx, js_host_file_exists, "host_file_exists", 1);
-    JS_SetPropertyStr(ctx, global_obj, "host_file_exists", host_file_exists_func);
-
-    JSValue host_http_download_func = JS_NewCFunction(ctx, js_host_http_download, "host_http_download", 2);
-    JS_SetPropertyStr(ctx, global_obj, "host_http_download", host_http_download_func);
-
-    JSValue host_extract_tar_func = JS_NewCFunction(ctx, js_host_extract_tar, "host_extract_tar", 2);
-    JS_SetPropertyStr(ctx, global_obj, "host_extract_tar", host_extract_tar_func);
-
-    JSValue host_extract_tar_strip_func = JS_NewCFunction(ctx, js_host_extract_tar_strip, "host_extract_tar_strip", 3);
-    JS_SetPropertyStr(ctx, global_obj, "host_extract_tar_strip", host_extract_tar_strip_func);
-
-    JSValue host_ensure_dir_func = JS_NewCFunction(ctx, js_host_ensure_dir, "host_ensure_dir", 1);
-    JS_SetPropertyStr(ctx, global_obj, "host_ensure_dir", host_ensure_dir_func);
-
-    JSValue host_remove_dir_func = JS_NewCFunction(ctx, js_host_remove_dir, "host_remove_dir", 1);
-    JS_SetPropertyStr(ctx, global_obj, "host_remove_dir", host_remove_dir_func);
-
-    JSValue host_read_file_func = JS_NewCFunction(ctx, js_host_read_file, "host_read_file", 1);
-    JS_SetPropertyStr(ctx, global_obj, "host_read_file", host_read_file_func);
-
-    JSValue host_write_file_func = JS_NewCFunction(ctx, js_host_write_file, "host_write_file", 2);
-    JS_SetPropertyStr(ctx, global_obj, "host_write_file", host_write_file_func);
-
-    /* Create 'display' object so modules can use display.clear(), display.drawText(), etc. */
-    JSValue display_obj = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, display_obj, "clear",
-        JS_NewCFunction(ctx, js_clear_screen, "clear", 0));
-    JS_SetPropertyStr(ctx, display_obj, "drawText",
-        JS_NewCFunction(ctx, js_print, "drawText", 4));
-    JS_SetPropertyStr(ctx, display_obj, "fillRect",
-        JS_NewCFunction(ctx, js_fill_rect, "fillRect", 5));
-    JS_SetPropertyStr(ctx, display_obj, "drawRect",
-        JS_NewCFunction(ctx, js_draw_rect, "drawRect", 5));
-    JS_SetPropertyStr(ctx, display_obj, "drawLine",
-        JS_NewCFunction(ctx, js_draw_line, "drawLine", 5));
-    JS_SetPropertyStr(ctx, display_obj, "flush",
-        JS_NewCFunction(ctx, js_host_flush_display, "flush", 0));
-    JS_SetPropertyStr(ctx, global_obj, "display", display_obj);
-
-    JS_FreeValue(ctx, global_obj);
-
+    register_host_functions(ctx);
     JS_SetModuleLoaderFunc(rt, NULL, js_module_loader, NULL);
 
     *prt = rt;
@@ -2662,7 +2870,17 @@ int main(int argc, char *argv[])
             printf("JS function references refreshed\n");
         }
 
-        if (jsTickIsDefined)
+        if (rec_source_ui_active && rec_source_ctx) {
+            /* Tick the rec source UI context */
+            if (JS_IsFunction(rec_source_ctx, rec_source_tick_fn)) {
+                JSValue ret = JS_Call(rec_source_ctx, rec_source_tick_fn, JS_UNDEFINED, 0, NULL);
+                if (JS_IsException(ret)) {
+                    printf("JS:rec_source tick failed\n");
+                    js_std_dump_error(rec_source_ctx);
+                }
+                JS_FreeValue(rec_source_ctx, ret);
+            }
+        } else if (jsTickIsDefined)
         {
             if(callGlobalFunction(&ctx, &JSTick, 0)) {
               printf("JS:tick failed\n");
@@ -2738,9 +2956,15 @@ int main(int argc, char *argv[])
             if (cable == 2)
             {
                 /* External MIDI: no transforms - route to both JS and DSP */
-                /* Route to JS handler */
-                if (callGlobalFunction(&ctx, &JSonMidiMessageExternal, &byte[1])) {
-                    printf("JS:onMidiMessageExternal failed\n");
+                /* Route to JS handler (active context) */
+                if (rec_source_ui_active && rec_source_ctx) {
+                    if (JS_IsFunction(rec_source_ctx, rec_source_midi_ext_fn)) {
+                        callGlobalFunction(&rec_source_ctx, &rec_source_midi_ext_fn, &byte[1]);
+                    }
+                } else {
+                    if (callGlobalFunction(&ctx, &JSonMidiMessageExternal, &byte[1])) {
+                        printf("JS:onMidiMessageExternal failed\n");
+                    }
                 }
                 /* Route to DSP plugin */
                 mm_on_midi(&g_module_manager, &byte[1], 3, MOVE_MIDI_SOURCE_EXTERNAL);
@@ -2768,9 +2992,21 @@ int main(int argc, char *argv[])
                     consumed = process_host_midi(&byte[1], apply_transforms);
                 }
 
+                /* Intercept Back button when rec source UI is active to return to Wave Edit */
+                if (!consumed && rec_source_ui_active && status == 0xB0 && byte[2] == 51 && byte[3] > 0) {
+                    rec_source_switch_to_main();
+                    consumed = 1;
+                }
+
                 /* Route to JS handler (unless consumed by host) - UI receives capacitive touch */
-                if (!consumed && callGlobalFunction(&ctx, &JSonMidiMessageInternal, &byte[1])) {
-                  printf("JS:onMidiMessageInternal failed\n");
+                if (!consumed) {
+                    if (rec_source_ui_active && rec_source_ctx) {
+                        if (JS_IsFunction(rec_source_ctx, rec_source_midi_int_fn)) {
+                            callGlobalFunction(&rec_source_ctx, &rec_source_midi_int_fn, &byte[1]);
+                        }
+                    } else if (callGlobalFunction(&ctx, &JSonMidiMessageInternal, &byte[1])) {
+                        printf("JS:onMidiMessageInternal failed\n");
+                    }
                 }
                 /* Route to DSP plugin (unless consumed OR internal control note) */
                 if (!consumed && !is_internal_control) {
@@ -2803,6 +3039,9 @@ int main(int argc, char *argv[])
     }
 
     close(fd);
+
+    /* Cleanup rec source UI context */
+    rec_source_unload_ui();
 
     /* Cleanup module manager */
     printf("Cleaning up module manager\n");

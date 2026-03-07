@@ -1369,6 +1369,26 @@ static int read_json_string(const char *filepath, const char *key, char *out, si
     return 1;
 }
 
+/* Helper: read a simple JSON bool value from a file (returns 0 or 1) */
+static int read_json_bool(const char *filepath, const char *key) {
+    FILE *f = fopen(filepath, "r");
+    if (!f) return 0;
+
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+
+    char search[128];
+    snprintf(search, sizeof(search), "\"%s\"", key);
+    char *pos = strstr(buf, search);
+    if (!pos) return 0;
+
+    pos += strlen(search);
+    while (*pos && (*pos == ' ' || *pos == ':' || *pos == '\t')) pos++;
+    return (strncmp(pos, "true", 4) == 0) ? 1 : 0;
+}
+
 /* host_list_modules() -> [{id, name, version}, ...] */
 static JSValue js_host_list_modules(JSContext *ctx, JSValueConst this_val,
                                     int argc, JSValueConst *argv) {
@@ -1378,7 +1398,7 @@ static JSValue js_host_list_modules(JSContext *ctx, JSValueConst this_val,
     int idx = 0;
 
     /* Subdirectories to scan */
-    const char *subdirs[] = { "", "sound_generators", "audio_fx", "midi_fx", "utilities", "overtake", "other", NULL };
+    const char *subdirs[] = { "", "sound_generators", "audio_fx", "midi_fx", "utilities", "overtake", "other", "tools", NULL };
 
     for (int s = 0; subdirs[s] != NULL; s++) {
         char dir_path[512];
@@ -1405,9 +1425,13 @@ static JSValue js_host_list_modules(JSContext *ctx, JSValueConst this_val,
 
             /* Read module.json */
             char id[128] = "", name[256] = "", version[64] = "";
+            char abbrev[8] = "", component_type[32] = "";
             read_json_string(module_json_path, "id", id, sizeof(id));
             read_json_string(module_json_path, "name", name, sizeof(name));
             read_json_string(module_json_path, "version", version, sizeof(version));
+            read_json_string(module_json_path, "abbrev", abbrev, sizeof(abbrev));
+            read_json_string(module_json_path, "component_type", component_type, sizeof(component_type));
+            int rec_source = read_json_bool(module_json_path, "rec_source");
 
             if (id[0] == '\0') continue;  /* Skip if no id */
 
@@ -1415,6 +1439,9 @@ static JSValue js_host_list_modules(JSContext *ctx, JSValueConst this_val,
             JS_SetPropertyStr(ctx, obj, "id", JS_NewString(ctx, id));
             JS_SetPropertyStr(ctx, obj, "name", JS_NewString(ctx, name[0] ? name : id));
             JS_SetPropertyStr(ctx, obj, "version", JS_NewString(ctx, version[0] ? version : "0.0.0"));
+            JS_SetPropertyStr(ctx, obj, "component_type", JS_NewString(ctx, component_type));
+            JS_SetPropertyStr(ctx, obj, "rec_source", JS_NewBool(ctx, rec_source));
+            JS_SetPropertyStr(ctx, obj, "abbrev", JS_NewString(ctx, abbrev));
             JS_SetPropertyUint32(ctx, arr, idx++, obj);
         }
         closedir(dir);
