@@ -27,6 +27,8 @@
 #include "host/js_display.h"
 #include "host/shadow_constants.h"
 #include "../host/unified_log.h"
+#include "../host/shadow_rec_source.h"
+#include "../host/shadow_sampler.h"
 
 #define SAMPLER_CMD_PATH "/data/UserData/move-anything/sampler_cmd_path.txt"
 
@@ -2048,6 +2050,84 @@ static JSValue js_host_wake_all_slots(JSContext *ctx, JSValueConst this_val,
     return JS_TRUE;
 }
 
+/* === Rec source host functions === */
+
+static JSValue js_host_source_load(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_FALSE;
+    const char *module_id = JS_ToCString(ctx, argv[0]);
+    if (!module_id) return JS_FALSE;
+    int ret = rec_source_load(module_id);
+    JS_FreeCString(ctx, module_id);
+    if (ret == 0) {
+        sampler_source = SAMPLER_SOURCE_REC_SOURCE;
+        return JS_TRUE;
+    }
+    return JS_FALSE;
+}
+
+static JSValue js_host_source_unload(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv) {
+    (void)ctx; (void)this_val; (void)argc; (void)argv;
+    rec_source_unload();
+    sampler_source = SAMPLER_SOURCE_RESAMPLE;
+    return JS_TRUE;
+}
+
+static JSValue js_host_source_is_active(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv) {
+    (void)ctx; (void)this_val; (void)argc; (void)argv;
+    return rec_source_is_active() ? JS_TRUE : JS_FALSE;
+}
+
+static JSValue js_host_source_get_id(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    if (!shadow_rec_source.active) return JS_NULL;
+    return JS_NewString(ctx, shadow_rec_source.module_id);
+}
+
+static JSValue js_host_source_get_name(JSContext *ctx, JSValueConst this_val,
+                                        int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    if (!shadow_rec_source.active) return JS_NULL;
+    return JS_NewString(ctx, shadow_rec_source.module_name);
+}
+
+static JSValue js_host_source_get_abbrev(JSContext *ctx, JSValueConst this_val,
+                                          int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    if (!shadow_rec_source.active) return JS_NULL;
+    return JS_NewString(ctx, shadow_rec_source.module_abbrev);
+}
+
+static JSValue js_host_source_get_level(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    return JS_NewFloat64(ctx, (double)rec_source_get_level());
+}
+
+static JSValue js_host_source_pause(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv) {
+    (void)ctx; (void)this_val; (void)argc; (void)argv;
+    rec_source_pause();
+    return JS_TRUE;
+}
+
+static JSValue js_host_source_resume(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv) {
+    (void)ctx; (void)this_val; (void)argc; (void)argv;
+    rec_source_resume();
+    return JS_TRUE;
+}
+
+static JSValue js_host_source_is_loaded(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv) {
+    (void)ctx; (void)this_val; (void)argc; (void)argv;
+    return shadow_rec_source.active ? JS_TRUE : JS_FALSE;
+}
+
 /* === End host functions === */
 
 static JSValue js_exit(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
@@ -2170,6 +2250,18 @@ static void init_javascript(JSRuntime **prt, JSContext **pctx) {
     JS_SetPropertyStr(ctx, global_obj, "host_sampler_is_recording", JS_NewCFunction(ctx, js_host_sampler_is_recording, "host_sampler_is_recording", 0));
     JS_SetPropertyStr(ctx, global_obj, "host_sampler_set_external_stop", JS_NewCFunction(ctx, js_host_sampler_set_external_stop, "host_sampler_set_external_stop", 1));
     JS_SetPropertyStr(ctx, global_obj, "host_wake_all_slots", JS_NewCFunction(ctx, js_host_wake_all_slots, "host_wake_all_slots", 0));
+
+    /* Register rec source control functions */
+    JS_SetPropertyStr(ctx, global_obj, "host_source_load", JS_NewCFunction(ctx, js_host_source_load, "host_source_load", 1));
+    JS_SetPropertyStr(ctx, global_obj, "host_source_unload", JS_NewCFunction(ctx, js_host_source_unload, "host_source_unload", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_source_is_active", JS_NewCFunction(ctx, js_host_source_is_active, "host_source_is_active", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_source_is_loaded", JS_NewCFunction(ctx, js_host_source_is_loaded, "host_source_is_loaded", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_source_get_id", JS_NewCFunction(ctx, js_host_source_get_id, "host_source_get_id", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_source_get_name", JS_NewCFunction(ctx, js_host_source_get_name, "host_source_get_name", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_source_get_abbrev", JS_NewCFunction(ctx, js_host_source_get_abbrev, "host_source_get_abbrev", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_source_get_level", JS_NewCFunction(ctx, js_host_source_get_level, "host_source_get_level", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_source_pause", JS_NewCFunction(ctx, js_host_source_pause, "host_source_pause", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_source_resume", JS_NewCFunction(ctx, js_host_source_resume, "host_source_resume", 0));
 
     JS_SetPropertyStr(ctx, global_obj, "exit", JS_NewCFunction(ctx, js_exit, "exit", 0));
 
