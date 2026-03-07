@@ -33,6 +33,8 @@ typedef struct module_info {
     int cap_raw_midi;            /* If true, skip host MIDI transforms */
     int cap_raw_ui;              /* If true, module owns UI input handling */
     char component_type[32];     /* Category: sound_generator, audio_fx, midi_fx, utility, etc. */
+    int rec_source;              /* 1 if module can be a rec source */
+    char abbrev[8];              /* Short abbreviation (e.g. "WS") */
 
     /* Defaults JSON string (for passing to plugin) */
     char defaults_json[1024];
@@ -59,6 +61,9 @@ typedef struct module_manager {
 
     /* Host-level volume (0-100, default 100) */
     int host_volume;
+
+    /* Rec source secondary UI - path to loaded rec source ui.js (if any) */
+    char rec_source_ui_script[256];
 
 } module_manager_t;
 
@@ -125,5 +130,13 @@ int mm_module_wants_raw_ui(module_manager_t *mm);
 
 /* Cleanup */
 void mm_destroy(module_manager_t *mm);
+
+/* Rec source UI context management (implemented in move_anything.c) */
+int rec_source_load_ui(const char *ui_script_path);
+void rec_source_switch_to_ui(void);
+void rec_source_switch_to_main(void);
+
+/* Rec source UI active flag (defined in move_anything.c) */
+extern int rec_source_ui_active;
 
 #endif /* MODULE_MANAGER_H */

@@ -177,6 +177,10 @@ static int parse_module_json(const char *module_dir, module_info_t *info) {
     /* Component type for categorization (sound_generator, audio_fx, midi_fx, utility, etc.) */
     json_get_string(json, "component_type", info->component_type, sizeof(info->component_type));
 
+    /* Rec source flag and abbreviation */
+    json_get_bool(json, "rec_source", &info->rec_source);
+    json_get_string(json, "abbrev", info->abbrev, sizeof(info->abbrev));
+
     /* Defaults */
     json_get_defaults(json, info->defaults_json, sizeof(info->defaults_json));
 

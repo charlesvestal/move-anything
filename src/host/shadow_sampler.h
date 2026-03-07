@@ -36,7 +36,8 @@ typedef enum {
 
 typedef enum {
     SAMPLER_SOURCE_RESAMPLE = 0,
-    SAMPLER_SOURCE_MOVE_INPUT
+    SAMPLER_SOURCE_MOVE_INPUT,
+    SAMPLER_SOURCE_REC_SOURCE
 } sampler_source_t;
 
 typedef enum {
