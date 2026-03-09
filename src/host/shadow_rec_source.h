@@ -42,4 +42,11 @@ float rec_source_get_level(void);
 /* Returns pointer to the raw audio buffer (for sampler tap). */
 const int16_t *rec_source_get_audio(void);
 
+/* Set a parameter on the rec source plugin instance. Returns 0 on success. */
+int rec_source_set_param(const char *key, const char *value);
+
+/* Get a parameter from the rec source plugin instance.
+ * Writes result to buf. Returns number of bytes written, or -1 on error. */
+int rec_source_get_param(const char *key, char *buf, int buf_len);
+
 #endif /* SHADOW_REC_SOURCE_H */
