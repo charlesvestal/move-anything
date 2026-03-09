@@ -117,6 +117,19 @@ void sampler_init(const sampler_host_t *host, float *sampler_set_tempo_ptr) {
     s_set_tempo_ptr = sampler_set_tempo_ptr;
 }
 
+/* Chown a path to ableton:users so Move's UI can see the files.
+ * The shim runs as root (setuid), so files we create are owned by root.
+ * Move's UI runs as ableton and won't find root-owned files. */
+static void chown_to_ableton(const char *path) {
+    const char *argv[] = { "chown", "ableton:users", path, NULL };
+    s_host.run_command(argv);
+}
+
+static void chown_to_ableton_recursive(const char *path) {
+    const char *argv[] = { "chown", "-R", "ableton:users", path, NULL };
+    s_host.run_command(argv);
+}
+
 /* ============================================================================
  * WAV, ring buffer, recording, audio capture, MIDI clock
  * ============================================================================ */
@@ -377,6 +390,7 @@ void sampler_start_recording_to(const char *output_path) {
         if (stat(dir_buf, &st) != 0) {
             const char *mkdir_argv[] = { "mkdir", "-p", dir_buf, NULL };
             s_host.run_command(mkdir_argv);
+            chown_to_ableton_recursive(dir_buf);
         }
     }
 
@@ -466,6 +480,7 @@ void sampler_start_recording(void) {
         if (stat(recording_dir, &st) != 0) {
             const char *mkdir_argv[] = { "mkdir", "-p", recording_dir, NULL };
             s_host.run_command(mkdir_argv);
+            chown_to_ableton_recursive(recording_dir);
         }
     }
 
@@ -587,6 +602,7 @@ void sampler_stop_recording(void) {
         sampler_write_wav_header(sampler_wav_file, data_size);
         fclose(sampler_wav_file);
         sampler_wav_file = NULL;
+        chown_to_ableton(sampler_current_recording);
     }
 
     /* Free ring buffer */
@@ -809,6 +825,7 @@ static void *skipback_writer_func(void *arg) {
         if (stat(skipback_dir, &st) != 0) {
             const char *mkdir_argv[] = { "mkdir", "-p", skipback_dir, NULL };
             s_host.run_command(mkdir_argv);
+            chown_to_ableton_recursive(skipback_dir);
         }
     }
 
@@ -880,6 +897,7 @@ static void *skipback_writer_func(void *arg) {
     }
 
     fclose(f);
+    chown_to_ableton(path);
 
     uint32_t frames = (uint32_t)(data_samples / SAMPLER_NUM_CHANNELS);
     char msg[256];

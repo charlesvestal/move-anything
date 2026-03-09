@@ -20,6 +20,158 @@
 
 import { decodeDelta } from './input_filter.mjs';
 import { drawRect } from './menu_layout.mjs';
+import { announce as defaultAnnounce } from './screen_reader.mjs';
+
+/* Pad LED constants */
+const PAD_NOTE_START = 68;
+const PAD_NOTE_END = 99;
+const PAD_COLOR_WHITE = 120;
+const PAD_COLOR_HIGHLIGHT = 8;   /* BrightGreen */
+const PAD_COLOR_OFF = 0;
+const PAD_COLOR_PURPLE = 48;
+const PAD_COLOR_BLUE = 44;
+const PAD_COLOR_RED = 4;
+const PAD_COLOR_GREEN = 16;
+const MIDI_NOTE_ON = 0x90;
+/* Global pad select setting — toggled via Settings > Display > Pad Typing */
+export let padSelectGlobal = false;
+export function setPadSelectGlobal(enabled) { padSelectGlobal = !!enabled; }
+
+/* Tunable pad entry parameters */
+export let padConfig = {
+    velocityThreshold: 31,
+    aftertouchThreshold: 2,
+    aftertouchRearm: 1,
+    slideGuardMs: 200
+};
+
+/* LED state for pad select mode */
+let currentHighlightPad = -1;    /* Currently highlighted pad note */
+let pressureFired = false;       /* True after aftertouch triggered entry, rearms below REARM */
+let padLedSnapshot = {};         /* note -> original color, for restore */
+let lastPadNote = -1;            /* Note of last pad touch */
+let pendingEntryNote = -1;       /* Pad note awaiting deferred velocity entry */
+let pendingEntryTime = 0;        /* Date.now() when deferred entry was queued */
+
+function sendPadLED(note, color) {
+    if (typeof move_midi_internal_send === 'function') {
+        move_midi_internal_send([0x09, MIDI_NOTE_ON, note, color]);
+    }
+}
+
+function snapshotPadLEDs() {
+    padLedSnapshot = {};
+    if (typeof shadow_get_pad_led_snapshot === 'function') {
+        const snap = shadow_get_pad_led_snapshot();
+        if (snap) {
+            for (let note = PAD_NOTE_START; note <= PAD_NOTE_END; note++) {
+                const color = snap[String(note)];
+                if (color !== undefined) padLedSnapshot[note] = color;
+            }
+        }
+    }
+}
+
+/* Special keys always occupy cols 3-7 of the BOTTOM pad row (row 3).
+ * Layout: [chars...] [blank] [page/purple] [space/blue] [space/blue] [del/red] [ok/green]
+ * They never move regardless of how many characters the current page has. */
+const SPECIAL_COL_START = 3;  /* First special at col 3 (after gap at col 2) */
+const SPECIAL_ROW = 3;       /* Always bottom pad row */
+
+/* Get the default LED color for a pad in the current grid layout */
+function getPadDefaultColor(padNote) {
+    const padIndex = padNote - PAD_NOTE_START;
+    const padCol = padIndex % 8;
+    const padRow = 3 - Math.floor(padIndex / 8);
+    const chars = getCurrentPageChars();
+    const charCount = chars.length;
+    const gridIndex = padRow * CHARS_PER_ROW + padCol;
+
+    /* Bottom row: remaining chars on left, specials on right */
+    if (padRow === SPECIAL_ROW) {
+        if (padCol >= SPECIAL_COL_START) {
+            const sk = padCol - SPECIAL_COL_START;
+            if (sk === 0) return PAD_COLOR_PURPLE;  /* page cycle */
+            if (sk === 1 || sk === 2) return PAD_COLOR_BLUE;  /* space */
+            if (sk === 3) return PAD_COLOR_RED;     /* delete */
+            if (sk === 4) return PAD_COLOR_GREEN;   /* ok */
+        }
+        /* Chars that fall on the bottom row */
+        if (gridIndex < charCount) return PAD_COLOR_WHITE;
+        return PAD_COLOR_OFF;
+    }
+    /* Character rows above the bottom row */
+    if (gridIndex < charCount) {
+        return PAD_COLOR_WHITE;
+    }
+    return PAD_COLOR_OFF;
+}
+
+/* Map a pad column to a special index, or -1 if not a special */
+function padColToSpecial(padCol) {
+    const sk = padCol - SPECIAL_COL_START;
+    if (sk === 0) return SPECIAL_PAGE;
+    if (sk === 1 || sk === 2) return SPECIAL_SPACE;
+    if (sk === 3) return SPECIAL_BACKSPACE;
+    if (sk === 4) return SPECIAL_CONFIRM;
+    return -1;
+}
+
+function setupPadLEDs() {
+    currentHighlightPad = -1;
+    for (let padNote = PAD_NOTE_START; padNote <= PAD_NOTE_END; padNote++) {
+        sendPadLED(padNote, getPadDefaultColor(padNote));
+    }
+}
+
+function restorePadLEDs() {
+    /* Restore snapshot colors */
+    for (let padNote = PAD_NOTE_START; padNote <= PAD_NOTE_END; padNote++) {
+        const color = padLedSnapshot[padNote] || 0;
+        sendPadLED(padNote, color);
+    }
+    currentHighlightPad = -1;
+}
+
+/* Map a pad note to the correct selectedIndex */
+function selectPadItem(padNote) {
+    const padIndex = padNote - PAD_NOTE_START;
+    const padCol = padIndex % 8;
+    const padRow = 3 - Math.floor(padIndex / 8);
+    const chars = getCurrentPageChars();
+    const charCount = chars.length;
+    const gridIndex = padRow * CHARS_PER_ROW + padCol;
+
+    /* Bottom row: specials always here */
+    if (padRow === SPECIAL_ROW) {
+        if (padCol >= SPECIAL_COL_START) {
+            const sp = padColToSpecial(padCol);
+            if (sp >= 0) state.selectedIndex = charCount + sp;
+            return;
+        }
+        if (gridIndex < charCount) {
+            state.selectedIndex = gridIndex;
+        }
+        return;
+    }
+    /* Character rows above the bottom row */
+    if (gridIndex < charCount) {
+        state.selectedIndex = gridIndex;
+    }
+}
+
+function highlightPad(padNote) {
+    if (currentHighlightPad === padNote) return;
+    /* Restore previous highlight to its default color */
+    if (currentHighlightPad >= PAD_NOTE_START) {
+        sendPadLED(currentHighlightPad, getPadDefaultColor(currentHighlightPad));
+    }
+    /* Highlight new pad */
+    if (padNote >= PAD_NOTE_START && padNote <= PAD_NOTE_END) {
+        sendPadLED(padNote, PAD_COLOR_HIGHLIGHT);
+    }
+    currentHighlightPad = padNote;
+}
 
 /* Pad LED constants */
 const PAD_NOTE_START = 68;
@@ -414,7 +566,8 @@ function handleSelection(fromPad) {
         appendToBuffer(char);
         state.lastAction = 'char';
         state.lastChar = char;
-        announceTextEntry(`${char} entered, text ${getAnnounceBuffer()}`);
+        const charLabel = SYMBOL_NAMES[char] || char;
+        announceTextEntry(`${charLabel} entered, text ${getAnnounceBuffer()}`);
         showPreview(fromPad);
     } else {
         /* Special button selected */
@@ -461,7 +614,8 @@ function repeatLastAction() {
     switch (state.lastAction) {
         case 'char':
             appendToBuffer(state.lastChar);
-            announceTextEntry(`${state.lastChar} entered, text ${getAnnounceBuffer()}`);
+            const repeatLabel = SYMBOL_NAMES[state.lastChar] || state.lastChar;
+            announceTextEntry(`${repeatLabel} entered, text ${getAnnounceBuffer()}`);
             break;
         case 'space':
             appendToBuffer(' ');
@@ -503,17 +657,34 @@ function getCurrentPageChars() {
 }
 
 function announceTextEntry(text) {
-    if (!state.onAnnounce || !text) return;
+    if (!text) return;
+    const fn = state.onAnnounce || defaultAnnounce;
     try {
-        state.onAnnounce(text);
+        fn(text);
     } catch (e) {
         /* Never let screen reader callback errors break UI input flow. */
     }
 }
 
+/* Readable names for symbols that TTS engines skip or mangle */
+const SYMBOL_NAMES = {
+    '.': 'period', '-': 'dash', '!': 'exclamation', '@': 'at',
+    '#': 'hash', '$': 'dollar', '%': 'percent', '^': 'caret',
+    '&': 'ampersand', '*': 'asterisk', "'": 'apostrophe', '"': 'quote',
+    ';': 'semicolon', ':': 'colon', '?': 'question mark', '/': 'slash',
+    '\\': 'backslash', '<': 'less than', '>': 'greater than',
+    '(': 'open paren', ')': 'close paren', '[': 'open bracket',
+    ']': 'close bracket', '{': 'open brace', '}': 'close brace',
+    '=': 'equals', '+': 'plus', ',': 'comma', '_': 'underscore',
+    '~': 'tilde', '`': 'backtick', '|': 'pipe'
+};
+
 function getSelectedLabel() {
     const chars = getCurrentPageChars();
-    if (state.selectedIndex < chars.length) return chars[state.selectedIndex];
+    if (state.selectedIndex < chars.length) {
+        const ch = chars[state.selectedIndex];
+        return SYMBOL_NAMES[ch] || ch;
+    }
 
     const specialIndex = state.selectedIndex - chars.length;
     switch (specialIndex) {
