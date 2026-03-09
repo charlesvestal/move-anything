@@ -232,6 +232,7 @@ const VIEWS = {
     FILEPATH_BROWSER: "filepathbrowser", // Generic filepath picker for filepath params
     KNOB_EDITOR: "knobedit",  // Edit knob assignments for a slot
     KNOB_PARAM_PICKER: "knobpick", // Pick parameter for a knob assignment
+    DYNAMIC_PARAM_PICKER: "dynamicpick", // Dedicated picker UI for module_picker/parameter_picker
     STORE_PICKER_CATEGORIES: "storepickercats", // Store: browse categories
     STORE_PICKER_LIST: "storepickerlist",     // Store: browse modules for category
     STORE_PICKER_DETAIL: "storepickerdetail", // Store: module info and actions
@@ -322,6 +323,7 @@ const VIEW_NAMES = {
     [VIEWS.FILEPATH_BROWSER]: "File Browser",
     [VIEWS.KNOB_EDITOR]: "Knob Editor",
     [VIEWS.KNOB_PARAM_PICKER]: "Parameter Picker",
+    [VIEWS.DYNAMIC_PARAM_PICKER]: "Parameter Picker",
     [VIEWS.STORE_PICKER_CATEGORIES]: "Module Store",
     [VIEWS.STORE_PICKER_LIST]: "Module Store",
     [VIEWS.STORE_PICKER_DETAIL]: "Module Details",
@@ -637,6 +639,14 @@ let knobParamPickerParams = [];  // Available params in current folder
 let knobParamPickerHierarchy = null; // Parsed ui_hierarchy for current target
 let knobParamPickerLevel = null;     // Current level name in hierarchy (null = flat mode)
 let knobParamPickerPath = [];        // Navigation path for back in hierarchy
+let dynamicPickerMeta = null;
+let dynamicPickerKey = "";
+let dynamicPickerTargetKey = "";
+let dynamicPickerMode = "target";  // target or param
+let dynamicPickerIndex = 0;
+let dynamicPickerTargets = [];
+let dynamicPickerParams = [];
+let dynamicPickerSelectedTarget = "";
 let lastSlotModuleSignatures = [];  // Track per-slot module changes for knob cache refresh
 
 /* Master FX state */
@@ -1275,6 +1285,8 @@ let hierEditorParams = [];        // current level's params
 let hierEditorKnobs = [];         // current level's knob-mapped params
 let hierEditorSelectedIdx = 0;
 let hierEditorEditMode = false;   // true when editing a param value
+let hierEditorEditKey = "";       // full key currently being edited
+let hierEditorEditValue = null;   // stable value during edit mode
 let hierEditorChainParams = [];   // metadata from chain_params
 
 /* Master FX flag - when true, exit returns to MASTER_FX view instead of CHAIN_EDIT */
@@ -3064,6 +3076,10 @@ function handleMasterFxSettingsAction(key) {
                 const raw = host_read_file("/data/UserData/move-anything/shared/help_content.json");
                 if (raw) {
                     helpContent = JSON.parse(raw);
+                    /* Append core version to Move Everything title */
+                    const coreVersion = getHostVersion();
+                    const meSection = helpContent.sections && helpContent.sections.find(s => s.title === "Move Everything");
+                    if (meSection) meSection.title = `Move Everything v${coreVersion}`;
                 }
             } catch (e) {
                 debugLog("Failed to load help content: " + e);
@@ -3090,51 +3106,60 @@ function handleMasterFxSettingsAction(key) {
                 debugLog("Move Manual not available: " + e);
             }
         }
-        /* Scan installed modules for help.json files (rescan each time to pick up new installs) */
+        /* Build Modules section from all installed modules with versions */
         if (helpContent && helpContent.sections) {
             try {
                 /* Remove previous Modules section if present */
                 const oldIdx = helpContent.sections.findIndex(s => s.title === "Modules");
                 if (oldIdx >= 0) helpContent.sections.splice(oldIdx, 1);
 
+                /* Build a map of help.json content keyed by module directory */
                 const MODULES_DIR = "/data/UserData/move-anything/modules";
-                const moduleHelpChildren = [];
+                const helpMap = {};
                 const entries = os.readdir(MODULES_DIR) || [];
                 const dirList = entries[0];
                 if (Array.isArray(dirList)) {
                     for (const entry of dirList) {
                         if (entry === "." || entry === "..") continue;
                         const entryPath = `${MODULES_DIR}/${entry}`;
-                        /* Check top-level module dirs and category subdirs */
-                        const checkHelp = function(dirPath) {
+                        const loadHelp = function(dirPath, id) {
                             try {
                                 const helpRaw = std.loadFile(`${dirPath}/help.json`);
                                 if (!helpRaw) return;
                                 const helpData = JSON.parse(helpRaw);
-                                if (helpData.title && helpData.children) {
-                                    moduleHelpChildren.push(helpData);
-                                }
+                                if (helpData.children) helpMap[id] = helpData.children;
                             } catch (e) { /* skip */ }
                         };
-                        checkHelp(entryPath);
-                        /* Scan subdirectories (sound_generators/, audio_fx/, etc.) */
+                        loadHelp(entryPath, entry);
+                        /* Scan category subdirectories */
                         try {
                             const subEntries = os.readdir(entryPath) || [];
                             const subDirList = subEntries[0];
                             if (Array.isArray(subDirList)) {
                                 for (const subEntry of subDirList) {
                                     if (subEntry === "." || subEntry === "..") continue;
-                                    checkHelp(`${entryPath}/${subEntry}`);
+                                    loadHelp(`${entryPath}/${subEntry}`, subEntry);
                                 }
                             }
                         } catch (e) { /* not a directory */ }
                     }
                 }
+
+                /* List all installed modules with versions, merging help content */
+                const allModules = host_list_modules();
+                const moduleHelpChildren = [];
+                for (const mod of allModules) {
+                    const title = `${mod.name} v${mod.version || '?'}`;
+                    const children = helpMap[mod.id] || [
+                        { title: "Info", lines: ["No help content", "available for this", "module."] }
+                    ];
+                    moduleHelpChildren.push({ title, children });
+                }
+
                 if (moduleHelpChildren.length > 0) {
                     moduleHelpChildren.sort((a, b) => a.title.localeCompare(b.title));
                     const modulesSection = { title: "Modules", children: moduleHelpChildren };
-                    /* Insert after "Move Everything" (index 0) */
-                    const meIdx = helpContent.sections.findIndex(s => s.title === "Move Everything");
+                    const meIdx = helpContent.sections.findIndex(s => s.title.startsWith("Move Everything"));
                     helpContent.sections.splice(meIdx >= 0 ? meIdx + 1 : 1, 0, modulesSection);
                     debugLog("Loaded module help: " + moduleHelpChildren.length + " modules");
                 }
@@ -5168,6 +5193,353 @@ function getKnobParamsForTarget(slot, target) {
     return params;
 }
 
+function getNumericParamsForTarget(slot, target, numericOnly = true) {
+    const params = [];
+    const seen = new Set();
+    const chainMetaByKey = new Map();
+    const chainParamsJson = getSlotParam(slot, `${target}:chain_params`);
+    if (!chainParamsJson) return params;
+
+    try {
+        const chainParams = JSON.parse(chainParamsJson);
+        if (!Array.isArray(chainParams)) return params;
+        for (const p of chainParams) {
+            if (!p || !p.key) continue;
+            chainMetaByKey.set(p.key, p);
+        }
+
+        const hierarchyJson = getSlotParam(slot, `${target}:ui_hierarchy`);
+        if (hierarchyJson) {
+            try {
+                const hierarchy = JSON.parse(hierarchyJson);
+                const levels = hierarchy && hierarchy.levels && typeof hierarchy.levels === "object"
+                    ? hierarchy.levels : null;
+                if (levels) {
+                    for (const levelName of Object.keys(levels)) {
+                        const level = levels[levelName];
+                        if (!level || !Array.isArray(level.params)) continue;
+
+                        const childPrefix = (typeof level.child_prefix === "string") ? level.child_prefix : "";
+                        const rawChildCount = parseInt(level.child_count, 10);
+                        const childCount = Number.isFinite(rawChildCount) ? Math.max(0, rawChildCount) : 0;
+                        const childLabel = (typeof level.child_label === "string" && level.child_label)
+                            ? level.child_label : "Item";
+
+                        for (const entry of level.params) {
+                            const key = (typeof entry === "string") ? entry : (entry && entry.key ? entry.key : "");
+                            if (!key) continue;
+
+                            const meta = chainMetaByKey.get(key);
+                            if (!meta) continue;
+                            const type = (meta.type || "").toLowerCase();
+                            const isNumeric = type === "float" || type === "int" ||
+                                (!type && (meta.min !== undefined || meta.max !== undefined));
+                            if (numericOnly && !isNumeric) continue;
+
+                            if (childPrefix && childCount > 0) {
+                                for (let i = 0; i < childCount; i++) {
+                                    const fullKey = `${childPrefix}${i}_${key}`;
+                                    if (seen.has(fullKey)) continue;
+                                    const baseLabel = meta.name || meta.label || key;
+                                    params.push({ key: fullKey, label: `${childLabel} ${i + 1} ${baseLabel}` });
+                                    seen.add(fullKey);
+                                }
+                            } else {
+                                if (seen.has(key)) continue;
+                                params.push({ key, label: meta.name || meta.label || key });
+                                seen.add(key);
+                            }
+                        }
+                    }
+                }
+            } catch (e) {
+                /* Ignore ui_hierarchy parse errors and fall back to chain_params list. */
+            }
+        }
+
+        if (params.length > 0) return params;
+
+        for (const p of chainParams) {
+            if (!p || !p.key) continue;
+            const type = (p.type || "").toLowerCase();
+            const isNumeric = type === "float" || type === "int" ||
+                (!type && (p.min !== undefined || p.max !== undefined));
+            if (numericOnly && !isNumeric) continue;
+            if (!seen.has(p.key)) {
+                params.push({ key: p.key, label: p.name || p.label || p.key });
+                seen.add(p.key);
+            }
+        }
+    } catch (e) {
+        /* Ignore parse errors and return empty numeric set. */
+    }
+
+    return params;
+}
+
+function inferLinkedTargetComponentKey(paramKey, meta) {
+    if (meta && typeof meta.target_key === "string" && meta.target_key.trim()) {
+        return meta.target_key.trim();
+    }
+    return "";
+}
+
+function inferLinkedTargetParamKey(componentKey, meta) {
+    if (meta && typeof meta.param_key === "string" && meta.param_key.trim()) {
+        return meta.param_key.trim();
+    }
+    return "";
+}
+
+function parseMetaStringList(value) {
+    if (Array.isArray(value)) {
+        return value
+            .map(v => String(v).trim())
+            .filter(Boolean);
+    }
+    if (typeof value === "string") {
+        return value
+            .split(",")
+            .map(v => v.trim())
+            .filter(Boolean);
+    }
+    return [];
+}
+
+function buildModulePickerOptions(meta) {
+    if (hierEditorSlot < 0 || !hierEditorComponent || hierEditorIsMasterFx) {
+        return [];
+    }
+
+    const opts = [];
+    const seen = new Set();
+    const allowNone = meta && meta.allow_none !== undefined ? parseMetaBool(meta.allow_none) : true;
+    const allowSelf = meta && meta.allow_self !== undefined ? parseMetaBool(meta.allow_self) : false;
+    const allowedTargets = new Set(parseMetaStringList(meta && meta.allowed_targets));
+    const selfTarget = getComponentParamPrefix(hierEditorComponent);
+
+    if (allowNone) {
+        opts.push("");
+        seen.add("");
+    }
+
+    const targets = getKnobTargets(hierEditorSlot);
+    for (const target of targets) {
+        if (!target || !target.id) continue;
+        if (!allowSelf && selfTarget && target.id === selfTarget) continue;
+        if (allowedTargets.size > 0 && !allowedTargets.has(target.id)) continue;
+        if (seen.has(target.id)) continue;
+        opts.push(target.id);
+        seen.add(target.id);
+    }
+
+    return opts;
+}
+
+function buildParameterPickerOptions(paramKey, meta) {
+    if (hierEditorSlot < 0 || !hierEditorComponent || hierEditorIsMasterFx) {
+        return [];
+    }
+
+    const opts = [];
+    const seen = new Set();
+    const allowNone = meta && meta.allow_none !== undefined ? parseMetaBool(meta.allow_none) : true;
+    if (allowNone) {
+        opts.push("");
+        seen.add("");
+    }
+
+    const prefix = getComponentParamPrefix(hierEditorComponent);
+    if (!prefix) return opts;
+
+    const targetKey = inferLinkedTargetComponentKey(paramKey, meta);
+    if (!targetKey) return opts;
+
+    const selectedTarget = getSlotParam(hierEditorSlot, `${prefix}:${targetKey}`) || "";
+    if (!selectedTarget) return opts;
+
+    const numericOnly = meta && meta.numeric_only !== undefined ? parseMetaBool(meta.numeric_only) : true;
+    const params = getNumericParamsForTarget(hierEditorSlot, selectedTarget, numericOnly);
+    for (const param of params) {
+        if (!param || !param.key || seen.has(param.key)) continue;
+        opts.push(param.key);
+        seen.add(param.key);
+    }
+
+    return opts;
+}
+
+function getDynamicPickerMeta(key, meta) {
+    if (!meta || typeof meta !== "object") return meta;
+    const rawType = String(meta.type || "").toLowerCase();
+    if (rawType !== "module_picker" && rawType !== "parameter_picker") return meta;
+
+    const dynamicOptions = rawType === "module_picker"
+        ? buildModulePickerOptions(meta)
+        : buildParameterPickerOptions(key, meta);
+
+    return {
+        ...meta,
+        type: "enum",
+        options: dynamicOptions,
+        picker_type: rawType,
+        none_label: meta.none_label || "(none)"
+    };
+}
+
+function buildDynamicPickerTargetItems(meta) {
+    const optionIds = buildModulePickerOptions(meta);
+    const sourceTargets = getKnobTargets(hierEditorSlot);
+    const nameById = new Map();
+    for (const target of sourceTargets) {
+        if (!target || !target.id) continue;
+        nameById.set(target.id, target.name || target.label || target.id);
+    }
+    return optionIds.map(id => ({
+        id,
+        label: id ? (nameById.get(id) || id) : (meta.none_label || "(none)")
+    }));
+}
+
+function buildDynamicPickerParamItemsForTarget(meta, targetId) {
+    if (!targetId) return [];
+    const numericOnly = meta && meta.numeric_only !== undefined ? parseMetaBool(meta.numeric_only) : true;
+    const params = getNumericParamsForTarget(hierEditorSlot, targetId, numericOnly);
+    return params.map(p => ({ key: p.key, label: p.label || p.key }));
+}
+
+function resetDynamicParamPickerState() {
+    dynamicPickerMeta = null;
+    dynamicPickerKey = "";
+    dynamicPickerTargetKey = "";
+    dynamicPickerMode = "target";
+    dynamicPickerIndex = 0;
+    dynamicPickerTargets = [];
+    dynamicPickerParams = [];
+    dynamicPickerSelectedTarget = "";
+}
+
+function closeDynamicParamPicker(announcement) {
+    resetDynamicParamPickerState();
+    setView(VIEWS.HIERARCHY_EDITOR);
+    needsRedraw = true;
+    if (announcement) {
+        announce(announcement);
+    }
+}
+
+function openDynamicParamPicker(key, meta) {
+    if (!meta || !meta.picker_type) return false;
+    if (hierEditorSlot < 0 || !hierEditorComponent || hierEditorIsMasterFx) return false;
+
+    const prefix = getComponentParamPrefix(hierEditorComponent);
+    if (!prefix) return false;
+
+    resetDynamicParamPickerState();
+    dynamicPickerMeta = meta;
+    dynamicPickerKey = key;
+    dynamicPickerTargetKey = inferLinkedTargetComponentKey(key, meta);
+    dynamicPickerTargets = buildDynamicPickerTargetItems(meta);
+
+    const currentValue = getSlotParam(hierEditorSlot, `${prefix}:${key}`) || "";
+    if (meta.picker_type === "module_picker") {
+        const idx = dynamicPickerTargets.findIndex(t => t.id === currentValue);
+        dynamicPickerIndex = idx >= 0 ? idx : 0;
+        dynamicPickerMode = "target";
+        dynamicPickerSelectedTarget = currentValue;
+    } else {
+        const currentTarget = dynamicPickerTargetKey
+            ? (getSlotParam(hierEditorSlot, `${prefix}:${dynamicPickerTargetKey}`) || "")
+            : "";
+        dynamicPickerSelectedTarget = currentTarget;
+        dynamicPickerParams = buildDynamicPickerParamItemsForTarget(meta, currentTarget);
+
+        if (currentTarget && dynamicPickerParams.length > 0) {
+            dynamicPickerMode = "param";
+            const idx = dynamicPickerParams.findIndex(p => p.key === currentValue);
+            dynamicPickerIndex = idx >= 0 ? idx : 0;
+        } else {
+            dynamicPickerMode = "target";
+            const idx = dynamicPickerTargets.findIndex(t => t.id === currentTarget);
+            dynamicPickerIndex = idx >= 0 ? idx : 0;
+        }
+    }
+
+    setView(VIEWS.DYNAMIC_PARAM_PICKER);
+    needsRedraw = true;
+    if (meta.picker_type === "parameter_picker" && dynamicPickerMode === "param") {
+        announce("Select target parameter");
+    } else {
+        announce("Select target component");
+    }
+    return true;
+}
+
+function handleDynamicParamPickerSelect() {
+    if (!dynamicPickerMeta || !dynamicPickerKey) {
+        closeDynamicParamPicker("Hierarchy Editor");
+        return;
+    }
+
+    const prefix = getComponentParamPrefix(hierEditorComponent);
+    if (!prefix) {
+        closeDynamicParamPicker("Hierarchy Editor");
+        return;
+    }
+
+    if (dynamicPickerMode === "target") {
+        const selectedTarget = dynamicPickerTargets[dynamicPickerIndex];
+        if (!selectedTarget) return;
+
+        if (dynamicPickerMeta.picker_type === "module_picker") {
+            setSlotParam(hierEditorSlot, `${prefix}:${dynamicPickerKey}`, selectedTarget.id || "");
+            const linkedParamKey = inferLinkedTargetParamKey(dynamicPickerKey, dynamicPickerMeta);
+            if (linkedParamKey) {
+                setSlotParam(hierEditorSlot, `${prefix}:${linkedParamKey}`, "");
+            }
+            closeDynamicParamPicker(`Target component ${selectedTarget.label || "(none)"}`);
+            return;
+        }
+
+        /* parameter_picker target stage */
+        if (!dynamicPickerTargetKey) {
+            closeDynamicParamPicker("No target key");
+            return;
+        }
+
+        setSlotParam(hierEditorSlot, `${prefix}:${dynamicPickerTargetKey}`, selectedTarget.id || "");
+        dynamicPickerSelectedTarget = selectedTarget.id || "";
+
+        if (!dynamicPickerSelectedTarget) {
+            setSlotParam(hierEditorSlot, `${prefix}:${dynamicPickerKey}`, "");
+            closeDynamicParamPicker("Target cleared");
+            return;
+        }
+
+        dynamicPickerParams = buildDynamicPickerParamItemsForTarget(dynamicPickerMeta, dynamicPickerSelectedTarget);
+        if (dynamicPickerParams.length === 0) {
+            setSlotParam(hierEditorSlot, `${prefix}:${dynamicPickerKey}`, "");
+            closeDynamicParamPicker("No matching params");
+            return;
+        }
+
+        dynamicPickerMode = "param";
+        dynamicPickerIndex = 0;
+        announceMenuItem("Param", dynamicPickerParams[0].label || dynamicPickerParams[0].key || "");
+        needsRedraw = true;
+        return;
+    }
+
+    const selectedParam = dynamicPickerParams[dynamicPickerIndex];
+    if (!selectedParam) return;
+
+    if (dynamicPickerTargetKey) {
+        setSlotParam(hierEditorSlot, `${prefix}:${dynamicPickerTargetKey}`, dynamicPickerSelectedTarget || "");
+    }
+    setSlotParam(hierEditorSlot, `${prefix}:${dynamicPickerKey}`, selectedParam.key || "");
+    closeDynamicParamPicker(`Target ${dynamicPickerSelectedTarget}:${selectedParam.key}`);
+}
+
 /* Get display label for a knob assignment */
 function getKnobAssignmentLabel(assignment) {
     if (!assignment || !assignment.target || !assignment.param) {
@@ -5369,6 +5741,7 @@ function enterHierarchyEditor(slotIndex, componentKey) {
 
     /* Dismiss any active overlay and clear pending knob state */
     hideOverlay();
+    invalidateKnobContextCache();
     pendingHierKnobIndex = -1;
     pendingHierKnobDelta = 0;
 
@@ -5382,10 +5755,12 @@ function enterHierarchyEditor(slotIndex, componentKey) {
     hierEditorChildLabel = "";
     hierEditorSelectedIdx = 0;
     hierEditorEditMode = false;
+    resetHierarchyEditState();
     hierEditorIsMasterFx = false;
     hierEditorMasterFxSlot = -1;
     filepathBrowserState = null;
     filepathBrowserParamKey = "";
+    resetDynamicParamPickerState();
 
     /* Fetch chain_params metadata for this component */
     hierEditorChainParams = getComponentChainParams(slotIndex, componentKey);
@@ -5434,6 +5809,7 @@ function enterMasterFxHierarchyEditor(fxSlot) {
 
     /* Dismiss any active overlay and clear pending knob state */
     hideOverlay();
+    invalidateKnobContextCache();
     pendingHierKnobIndex = -1;
     pendingHierKnobDelta = 0;
 
@@ -5451,8 +5827,10 @@ function enterMasterFxHierarchyEditor(fxSlot) {
     hierEditorChildLabel = "";
     hierEditorSelectedIdx = 0;
     hierEditorEditMode = false;
+    resetHierarchyEditState();
     hierEditorIsMasterFx = true;
     hierEditorMasterFxSlot = fxSlot;
+    resetDynamicParamPickerState();
 
     /* Fetch chain_params metadata for this Master FX slot */
     hierEditorChainParams = getMasterFxChainParams(fxSlot);
@@ -5642,10 +6020,12 @@ function exitHierarchyEditor() {
     hierEditorChildLabel = "";
     hierEditorIsPresetLevel = false;
     hierEditorPresetEditMode = false;
+    resetHierarchyEditState();
     hierEditorIsMasterFx = false;
     hierEditorMasterFxSlot = -1;
     filepathBrowserState = null;
     filepathBrowserParamKey = "";
+    resetDynamicParamPickerState();
 
     view = returnToMasterFx ? VIEWS.MASTER_FX : VIEWS.CHAIN_EDIT;
     needsRedraw = true;
@@ -5738,13 +6118,15 @@ function closeHierarchyFilepathBrowser() {
 
     filepathBrowserState = null;
     filepathBrowserParamKey = "";
+    resetDynamicParamPickerState();
     setView(VIEWS.HIERARCHY_EDITOR);
 }
 
 /* Get param metadata from chain_params */
 function getParamMetadata(key) {
     if (!hierEditorChainParams) return null;
-    return hierEditorChainParams.find(p => p.key === key);
+    const rawMeta = hierEditorChainParams.find(p => p.key === key);
+    return getDynamicPickerMeta(key, rawMeta);
 }
 
 /* Format a param value for setting (respects type) */
@@ -5762,6 +6144,9 @@ function formatParamForOverlay(val, meta) {
     }
     /* Enum/bool: show value as-is (string) */
     if (meta && (meta.type === "enum" || meta.type === "bool")) {
+        if (meta.picker_type && (val === "" || val === null || val === undefined)) {
+            return meta.none_label || "(none)";
+        }
         return String(val);
     }
     /* Float: show as percentage if 0-1 or 0-2 range */
@@ -5787,6 +6172,26 @@ function buildHierarchyParamKey(key) {
     return `${prefix}:${key}`;
 }
 
+function resetHierarchyEditState() {
+    hierEditorEditKey = "";
+    hierEditorEditValue = null;
+}
+
+function beginHierarchyParamEdit(key) {
+    const fullKey = buildHierarchyParamKey(key);
+    const baseVal = getSlotParam(hierEditorSlot, `${fullKey}:base`);
+    const liveVal = getSlotParam(hierEditorSlot, fullKey);
+    if (baseVal === null && liveVal === null) return false;
+
+    hierEditorEditKey = fullKey;
+    hierEditorEditValue = (baseVal !== null) ? baseVal : liveVal;
+    return true;
+}
+
+function shouldRefreshDynamicRateMeta(key) {
+    return typeof key === "string" && /_rate_mode$/.test(key);
+}
+
 /* Adjust selected param value via jog */
 function adjustHierSelectedParam(delta) {
     if (hierEditorSelectedIdx >= hierEditorParams.length) return;
@@ -5799,7 +6204,10 @@ function adjustHierSelectedParam(delta) {
     if (key === SWAP_MODULE_ACTION) return;
     const fullKey = buildHierarchyParamKey(key);
 
-    const currentVal = getSlotParam(hierEditorSlot, fullKey);
+    const usingStableEditVal = hierEditorEditMode &&
+                               hierEditorEditKey === fullKey &&
+                               hierEditorEditValue !== null;
+    const currentVal = usingStableEditVal ? String(hierEditorEditValue) : getSlotParam(hierEditorSlot, fullKey);
     if (currentVal === null) return;
 
     const meta = getParamMetadata(key);
@@ -5813,7 +6221,15 @@ function adjustHierSelectedParam(delta) {
         let newIndex = currentIndex + delta;
         if (newIndex < 0) newIndex = meta.options.length - 1;
         if (newIndex >= meta.options.length) newIndex = 0;
-        setSlotParam(hierEditorSlot, fullKey, meta.options[newIndex]);
+        const newVal = meta.options[newIndex];
+        setSlotParam(hierEditorSlot, fullKey, newVal);
+        if (usingStableEditVal) {
+            hierEditorEditValue = newVal;
+        }
+        if (shouldRefreshDynamicRateMeta(key)) {
+            refreshHierarchyChainParams();
+            invalidateKnobContextCache();
+        }
         return;
     }
 
@@ -5828,7 +6244,11 @@ function adjustHierSelectedParam(delta) {
     const max = meta && typeof meta.max === "number" ? meta.max : 1;
 
     const newVal = Math.max(min, Math.min(max, num + delta * step));
-    setSlotParam(hierEditorSlot, fullKey, formatParamForSet(newVal, meta));
+    const formatted = formatParamForSet(newVal, meta);
+    setSlotParam(hierEditorSlot, fullKey, formatted);
+    if (usingStableEditVal) {
+        hierEditorEditValue = formatted;
+    }
 }
 
 /*
@@ -6064,7 +6484,7 @@ function rebuildKnobContextCache() {
     }
     cachedKnobContextsView = view;
     cachedKnobContextsSlot = (view === VIEWS.HIERARCHY_EDITOR) ? hierEditorSlot : selectedSlot;
-    cachedKnobContextsComp = (view === VIEWS.HIERARCHY_EDITOR) ? -1 : selectedChainComponent;
+    cachedKnobContextsComp = (view === VIEWS.HIERARCHY_EDITOR) ? hierEditorComponent : selectedChainComponent;
     cachedKnobContextsLevel = (view === VIEWS.HIERARCHY_EDITOR) ? hierEditorLevel : "";
     cachedKnobContextsChildIndex = (view === VIEWS.HIERARCHY_EDITOR) ? hierEditorChildIndex : -1;
 }
@@ -6079,7 +6499,7 @@ let cachedKnobContextsMasterFxComp = -1;  /* Track Master FX component for cache
 function getKnobContext(knobIndex) {
     /* Check if cache is valid */
     const currentSlot = (view === VIEWS.HIERARCHY_EDITOR) ? hierEditorSlot : selectedSlot;
-    const currentComp = (view === VIEWS.HIERARCHY_EDITOR) ? -1 : selectedChainComponent;
+    const currentComp = (view === VIEWS.HIERARCHY_EDITOR) ? hierEditorComponent : selectedChainComponent;
     const currentLevel = (view === VIEWS.HIERARCHY_EDITOR) ? hierEditorLevel : "";
     const currentChildIndex = (view === VIEWS.HIERARCHY_EDITOR) ? hierEditorChildIndex : -1;
     const currentMasterFxComp = (view === VIEWS.MASTER_FX) ? selectedMasterFxComponent : -1;
@@ -6252,6 +6672,10 @@ function processPendingHierKnob() {
         if (newIndex >= ctx.meta.options.length) newIndex = ctx.meta.options.length - 1;
         const newVal = ctx.meta.options[newIndex];
         setSlotParam(ctx.slot, ctx.fullKey, newVal);
+        if (shouldRefreshDynamicRateMeta(ctx.key)) {
+            refreshHierarchyChainParams();
+            invalidateKnobContextCache();
+        }
         showOverlay(ctx.title, newVal);
         return;
     }
@@ -6286,6 +6710,9 @@ function formatHierDisplayValue(key, val) {
 
     /* For enums, always return the raw string value */
     if (meta && meta.type === "enum") {
+        if (meta.picker_type && (val === "" || val === null || val === undefined)) {
+            return meta.none_label || "(none)";
+        }
         return val;
     }
 
@@ -6497,7 +6924,10 @@ function drawHierarchyEditor() {
                 /* Only fetch param value if this item is visible on screen */
                 let displayVal = "";
                 if (idx >= visibleStart && idx < visibleEnd) {
-                    const val = getSlotParam(hierEditorSlot, buildHierarchyParamKey(key));
+                    const fullKey = buildHierarchyParamKey(key);
+                    const usingStableEditVal = hierEditorEditMode &&
+                                               hierEditorEditKey === fullKey && hierEditorEditValue !== null;
+                    const val = usingStableEditVal ? String(hierEditorEditValue) : getSlotParam(hierEditorSlot, fullKey);
                     displayVal = val !== null ? formatHierDisplayValue(key, val) : "";
                 }
                 return { label, value: displayVal, key };
@@ -6963,7 +7393,9 @@ function handleJog(delta) {
                     const param = hierEditorParams[hierEditorSelectedIdx];
                     const key = typeof param === "string" ? param : param.key || param;
                     const fullKey = buildHierarchyParamKey(key);
-                    const freshVal = getSlotParam(hierEditorSlot, fullKey);
+                    const freshVal = (hierEditorEditKey === fullKey && hierEditorEditValue !== null)
+                        ? String(hierEditorEditValue)
+                        : getSlotParam(hierEditorSlot, fullKey);
                     const displayVal = freshVal !== null ? formatHierDisplayValue(key, freshVal) : "";
                     announceParameter(param.label || key, displayVal);
                 }
@@ -7015,6 +7447,21 @@ function handleJog(delta) {
                 if (knobParamPickerParams.length > 0) {
                     const kp = knobParamPickerParams[knobParamPickerIndex];
                     announceMenuItem("Param", kp.label || kp.key || "Unknown");
+                }
+            }
+            break;
+        case VIEWS.DYNAMIC_PARAM_PICKER:
+            if (dynamicPickerMode === "param") {
+                dynamicPickerIndex = Math.max(0, Math.min(dynamicPickerParams.length - 1, dynamicPickerIndex + delta));
+                if (dynamicPickerParams.length > 0) {
+                    const paramItem = dynamicPickerParams[dynamicPickerIndex];
+                    announceMenuItem("Param", paramItem.label || paramItem.key || "");
+                }
+            } else {
+                dynamicPickerIndex = Math.max(0, Math.min(dynamicPickerTargets.length - 1, dynamicPickerIndex + delta));
+                if (dynamicPickerTargets.length > 0) {
+                    const targetItem = dynamicPickerTargets[dynamicPickerIndex];
+                    announceMenuItem("Target", targetItem.label || targetItem.id || "");
                 }
             }
             break;
@@ -7622,10 +8069,19 @@ function handleSelect() {
                         ? (selectedParam.key || selectedParam)
                         : selectedParam;
                     const meta = getParamMetadata(selectedKey);
-                    if (!hierEditorEditMode && meta && meta.type === "filepath") {
+                    if (!hierEditorEditMode && meta && meta.picker_type) {
+                        openDynamicParamPicker(selectedKey, meta);
+                    } else if (!hierEditorEditMode && meta && meta.type === "filepath") {
                         openHierarchyFilepathBrowser(selectedKey, meta);
                     } else {
-                        hierEditorEditMode = !hierEditorEditMode;
+                        if (!hierEditorEditMode) {
+                            if (beginHierarchyParamEdit(selectedKey)) {
+                                hierEditorEditMode = true;
+                            }
+                        } else {
+                            hierEditorEditMode = false;
+                            resetHierarchyEditState();
+                        }
                     }
                 }
             }
@@ -7724,6 +8180,9 @@ function handleSelect() {
                     applyKnobAssignment(knobParamPickerFolder, selected.key);
                 }
             }
+            break;
+        case VIEWS.DYNAMIC_PARAM_PICKER:
+            handleDynamicParamPickerSelect();
             break;
         case VIEWS.UPDATE_PROMPT:
             if (pendingUpdateIndex === pendingUpdates.length) {
@@ -8108,6 +8567,7 @@ function handleBack() {
             if (hierEditorEditMode) {
                 /* Exit param edit mode first */
                 hierEditorEditMode = false;
+                resetHierarchyEditState();
                 needsRedraw = true;
                 announceHierLevel();
             } else if (hierEditorPresetEditMode) {
@@ -8216,6 +8676,17 @@ function handleBack() {
                 setView(VIEWS.KNOB_EDITOR);
                 announce("Knob Editor");
                 needsRedraw = true;
+            }
+            break;
+        case VIEWS.DYNAMIC_PARAM_PICKER:
+            if (dynamicPickerMode === "param" && dynamicPickerMeta && dynamicPickerMeta.picker_type === "parameter_picker") {
+                dynamicPickerMode = "target";
+                const targetIdx = dynamicPickerTargets.findIndex(t => t.id === dynamicPickerSelectedTarget);
+                dynamicPickerIndex = targetIdx >= 0 ? targetIdx : 0;
+                needsRedraw = true;
+                announce("Select target component");
+            } else {
+                closeDynamicParamPicker("Hierarchy Editor");
             }
             break;
         case VIEWS.UPDATE_PROMPT:
@@ -8822,6 +9293,32 @@ function drawKnobParamPicker() {
         });
 
         drawFooter({left: "Back: targets", right: "Click: assign"});
+    }
+}
+
+function drawDynamicParamPicker() {
+    clear_screen();
+
+    if (dynamicPickerMode === "param") {
+        drawHeader("Select Param");
+        drawMenuList({
+            items: dynamicPickerParams,
+            selectedIndex: dynamicPickerIndex,
+            listArea: { topY: LIST_TOP_Y, bottomY: FOOTER_RULE_Y },
+            getLabel: (item) => item.label || item.key || "",
+            getValue: () => ""
+        });
+        drawFooter({left: "Back: targets", right: "Click: select"});
+    } else {
+        drawHeader("Select Target");
+        drawMenuList({
+            items: dynamicPickerTargets,
+            selectedIndex: dynamicPickerIndex,
+            listArea: { topY: LIST_TOP_Y, bottomY: FOOTER_RULE_Y },
+            getLabel: (item) => item.label || item.id || "",
+            getValue: () => ""
+        });
+        drawFooter({left: "Back: cancel", right: "Click: select"});
     }
 }
 
@@ -9766,6 +10263,9 @@ globalThis.tick = function() {
             break;
         case VIEWS.KNOB_PARAM_PICKER:
             drawKnobParamPicker();
+            break;
+        case VIEWS.DYNAMIC_PARAM_PICKER:
+            drawDynamicParamPicker();
             break;
         case VIEWS.STORE_PICKER_CATEGORIES:
             drawStorePickerCategories();
