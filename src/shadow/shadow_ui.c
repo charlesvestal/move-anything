@@ -306,6 +306,27 @@ static JSValue js_shadow_clear_ui_flags(JSContext *ctx, JSValueConst this_val, i
     return JS_UNDEFINED;
 }
 
+/* shadow_get_ui_flags2() -> int
+ * Returns the extended UI flags from shared memory.
+ */
+static JSValue js_shadow_get_ui_flags2(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    if (!shadow_control) return JS_NewInt32(ctx, 0);
+    return JS_NewInt32(ctx, shadow_control->ui_flags2);
+}
+
+/* shadow_clear_ui_flags2(mask) -> void
+ * Clears the specified flags from ui_flags2.
+ */
+static JSValue js_shadow_clear_ui_flags2(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (!shadow_control || argc < 1) return JS_UNDEFINED;
+    int mask = 0;
+    if (JS_ToInt32(ctx, &mask, argv[0])) return JS_UNDEFINED;
+    shadow_control->ui_flags2 &= ~(uint8_t)mask;
+    return JS_UNDEFINED;
+}
+
 /* shadow_get_selected_slot() -> int
  * Returns the track-selected slot (0-3) for playback/knobs.
  */
@@ -2128,6 +2149,35 @@ static JSValue js_host_source_is_loaded(JSContext *ctx, JSValueConst this_val,
     return shadow_rec_source.active ? JS_TRUE : JS_FALSE;
 }
 
+/* host_source_set_param(key, value) -> bool */
+static JSValue js_host_source_set_param(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 2) return JS_FALSE;
+    const char *key = JS_ToCString(ctx, argv[0]);
+    if (!key) return JS_FALSE;
+    const char *value = JS_ToCString(ctx, argv[1]);
+    if (!value) { JS_FreeCString(ctx, key); return JS_FALSE; }
+    int ret = rec_source_set_param(key, value);
+    JS_FreeCString(ctx, key);
+    JS_FreeCString(ctx, value);
+    return (ret == 0) ? JS_TRUE : JS_FALSE;
+}
+
+/* host_source_get_param(key) -> string or null */
+static JSValue js_host_source_get_param(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_NULL;
+    const char *key = JS_ToCString(ctx, argv[0]);
+    if (!key) return JS_NULL;
+    char buf[4096];
+    int n = rec_source_get_param(key, buf, (int)sizeof(buf));
+    JS_FreeCString(ctx, key);
+    if (n < 0) return JS_NULL;
+    return JS_NewString(ctx, buf);
+}
+
 /* === End host functions === */
 
 static JSValue js_exit(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
@@ -2159,6 +2209,8 @@ static void init_javascript(JSRuntime **prt, JSContext **pctx) {
     JS_SetPropertyStr(ctx, global_obj, "shadow_set_focused_slot", JS_NewCFunction(ctx, js_shadow_set_focused_slot, "shadow_set_focused_slot", 1));
     JS_SetPropertyStr(ctx, global_obj, "shadow_get_ui_flags", JS_NewCFunction(ctx, js_shadow_get_ui_flags, "shadow_get_ui_flags", 0));
     JS_SetPropertyStr(ctx, global_obj, "shadow_clear_ui_flags", JS_NewCFunction(ctx, js_shadow_clear_ui_flags, "shadow_clear_ui_flags", 1));
+    JS_SetPropertyStr(ctx, global_obj, "shadow_get_ui_flags2", JS_NewCFunction(ctx, js_shadow_get_ui_flags2, "shadow_get_ui_flags2", 0));
+    JS_SetPropertyStr(ctx, global_obj, "shadow_clear_ui_flags2", JS_NewCFunction(ctx, js_shadow_clear_ui_flags2, "shadow_clear_ui_flags2", 1));
     JS_SetPropertyStr(ctx, global_obj, "shadow_get_selected_slot", JS_NewCFunction(ctx, js_shadow_get_selected_slot, "shadow_get_selected_slot", 0));
     JS_SetPropertyStr(ctx, global_obj, "shadow_get_ui_slot", JS_NewCFunction(ctx, js_shadow_get_ui_slot, "shadow_get_ui_slot", 0));
     JS_SetPropertyStr(ctx, global_obj, "shadow_get_shift_held", JS_NewCFunction(ctx, js_shadow_get_shift_held, "shadow_get_shift_held", 0));
@@ -2262,6 +2314,10 @@ static void init_javascript(JSRuntime **prt, JSContext **pctx) {
     JS_SetPropertyStr(ctx, global_obj, "host_source_get_level", JS_NewCFunction(ctx, js_host_source_get_level, "host_source_get_level", 0));
     JS_SetPropertyStr(ctx, global_obj, "host_source_pause", JS_NewCFunction(ctx, js_host_source_pause, "host_source_pause", 0));
     JS_SetPropertyStr(ctx, global_obj, "host_source_resume", JS_NewCFunction(ctx, js_host_source_resume, "host_source_resume", 0));
+    JS_SetPropertyStr(ctx, global_obj, "host_source_set_param",
+        JS_NewCFunction(ctx, js_host_source_set_param, "host_source_set_param", 2));
+    JS_SetPropertyStr(ctx, global_obj, "host_source_get_param",
+        JS_NewCFunction(ctx, js_host_source_get_param, "host_source_get_param", 1));
 
     JS_SetPropertyStr(ctx, global_obj, "exit", JS_NewCFunction(ctx, js_exit, "exit", 0));
 
