@@ -352,3 +352,25 @@ float rec_source_get_level(void) {
 const int16_t *rec_source_get_audio(void) {
     return shadow_rec_source.audio_buffer;
 }
+
+/* ============================================================================
+ * Parameter bridge (for UI communication)
+ * ============================================================================ */
+
+int rec_source_set_param(const char *key, const char *value) {
+    if (!shadow_rec_source.active || !shadow_rec_source.instance ||
+        !shadow_rec_source.api || !shadow_rec_source.api->set_param) {
+        return -1;
+    }
+    shadow_rec_source.api->set_param(shadow_rec_source.instance, key, value);
+    return 0;
+}
+
+int rec_source_get_param(const char *key, char *buf, int buf_len) {
+    if (!shadow_rec_source.active || !shadow_rec_source.instance ||
+        !shadow_rec_source.api || !shadow_rec_source.api->get_param) {
+        return -1;
+    }
+    return shadow_rec_source.api->get_param(shadow_rec_source.instance,
+                                             key, buf, buf_len);
+}
