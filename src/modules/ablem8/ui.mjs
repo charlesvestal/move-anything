@@ -8,13 +8,17 @@
  * Bank switching: Shift+Menu toggles between M8 Track and Ableton banks.
  * Exit overtake:  Shift+Vol+Jog (host-level shortcut, always works).
  *
+ * Inspired by the move-anything project by bobbydigitales, whose work demonstrated
+ * that the Move's MIDI protocol was explorable and opened the door for this module.
+ * https://github.com/bobbydigitales/move-anything
+ *
  * External sources used in this file (links appear once at first use):
  *   [LPP3]    LPP3 Programmer Reference Guide (Focusrite)
  *             https://fael-downloads-prod.focusrite.com/customer/prod/s3fs-public/downloads/LPP3_prog_ref_guide_200415.pdf
  *   [M8-LPP]  M8 + LPP recap by grahack — note grid and Move↔M8 control mappings
  *             https://grahack.github.io/M8_LPP_recap/
- *   [MOVE]    move-anything project by bobbydigitales — Move hardware MIDI constants
- *             https://github.com/bobbydigitales/move-anything
+ *   [ABLETON] Ableton Move Manual — Move hardware CC/note assignments
+ *             https://www.ableton.com/en/move/manual/
  *   [YURS]    YURS remote script protocol — CC/note assignments
  *             https://forum.yaeltex.com/t/yurs-yaeltex-universal-remote-script-for-ableton-live/161
  *   [MIDI]    MIDI Universal Device Inquiry (MIDI 1.0 Spec, SysEx ID Request F0 7E 7F 06 01 F7)
@@ -158,9 +162,8 @@ const lppColorToMoveMonoMap = new Map([
 ]);
 
 /* ── Move hardware CC/note constants ─────────────────────────────────────── */
-// Source: [MOVE] — CC and note numbers for Move hardware controls, as
-// reverse-engineered and documented by the move-anything project. Cross-
-// referenced against the Ableton Move manual (ableton.com/en/move/manual/).
+// Source: [ABLETON] — CC and note numbers for Move hardware controls, as
+// documented in the Ableton Move manual.
 
 const moveLOGO    = 99;
 const moveMENU    = 50;

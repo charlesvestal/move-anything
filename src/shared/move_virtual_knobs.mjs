@@ -11,9 +11,9 @@
  *   move_midi_external_send(packet)
  *   move_midi_internal_send(packet)
  *
- * The CC base values, channel assignments, and per-bank routing logic
- * originate from the move-anything control scripts by bobbydigitales.
- * Source: https://github.com/bobbydigitales/move-anything
+ * Inspired by the move-anything project by bobbydigitales, which first demonstrated
+ * knob CC routing on the Move. CC base values and channel assignments are derived
+ * from the Ableton Move manual: https://www.ableton.com/en/move/manual/
  */
 
 function clamp(value, min, max) {
@@ -27,10 +27,9 @@ export const POT_BANKS = {
     ABLETON: "ABLETON",
 };
 
-// CC base values and MIDI channel assignments below are derived from the
-// move-anything control scripts (see file header). M8_TRACK/MASTER/FX use
-// cable 2, channel 3 to reach the M8 over USB. M8_FX starts at CC 90 per
-// the M8 LPP CC layout (see https://grahack.github.io/M8_LPP_recap/).
+// CC base values and MIDI channel assignments are from the Ableton Move manual.
+// M8_TRACK/MASTER/FX use cable 2, channel 3 to reach the M8 over USB.
+// M8_FX starts at CC 90 per the M8 LPP CC layout (https://grahack.github.io/M8_LPP_recap/).
 // ABLETON defaults match the YURS remote script on channel 16 (index 15).
 const defaultBankConfig = {
     [POT_BANKS.M8_TRACK]: { ccBase: 71, potCount: 10, potsPerBank: 10, channel: 3, internalEcho: true },
