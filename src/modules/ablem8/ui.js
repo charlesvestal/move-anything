@@ -8,8 +8,16 @@
  * Bank switching: Shift+Menu toggles between M8 Track and Ableton banks.
  * Exit overtake:  Shift+Vol+Jog (host-level shortcut, always works).
  *
- * YURS reference: https://forum.yaeltex.com/t/yurs-yaeltex-universal-remote-script-for-ableton-live/161
- * LPP3 reference: https://fael-downloads-prod.focusrite.com/customer/prod/s3fs-public/downloads/LPP3_prog_ref_guide_200415.pdf
+ * External sources used in this file (links appear once at first use):
+ *   [LPP3]    LPP3 Programmer Reference Guide (Focusrite)
+ *             https://fael-downloads-prod.focusrite.com/customer/prod/s3fs-public/downloads/LPP3_prog_ref_guide_200415.pdf
+ *   [M8-LPP]  M8 + LPP recap by grahack — note grid and Move↔M8 control mappings
+ *             https://grahack.github.io/M8_LPP_recap/
+ *   [MOVE]    move-anything project by bobbydigitales — Move hardware MIDI constants
+ *             https://github.com/bobbydigitales/move-anything
+ *   [YURS]    YURS remote script protocol — CC/note assignments
+ *             https://forum.yaeltex.com/t/yurs-yaeltex-universal-remote-script-for-ableton-live/161
+ *   [MIDI]    MIDI Universal Device Inquiry (MIDI 1.0 Spec, SysEx ID Request F0 7E 7F 06 01 F7)
  */
 
 import {
@@ -42,6 +50,9 @@ function aftertouchToModwheel(data, channel = 3) {
 }
 
 /* ── LPP note grid ───────────────────────────────────────────────────────── */
+// Source: [LPP3] §4 — standard 10×10 Launchpad Pro note layout.
+// The M8 uses this layout to address its display cells over USB MIDI.
+// See also [M8-LPP] for the M8-specific mapping on top of this grid.
 
 const lppNotes = [
     90, 91, 92, 93, 94, 95, 96, 97, 98, 99,
@@ -60,6 +71,9 @@ const lppNotes = [
 const lppNoteValueMap = new Map([...lppNotes.map((a) => [a, [0, 0, 0]])]);
 
 /* ── Move ↔ LPP control mappings ────────────────────────────────────────── */
+// Source: [M8-LPP] — maps Move hardware button/encoder CCs to LPP note numbers
+// as expected by the M8's control surface mode. Two layouts exist because Move
+// has 4 pad rows while LPP has 8; top and bottom halves cover different octaves.
 
 const moveControlToLppNoteMapTop = new Map([
     [55, 80], [54, 70], [62, 91], [63, 92], [85, 20],
@@ -86,6 +100,9 @@ const lppNoteToMoveControlMapBottom = new Map(
 );
 
 /* ── Move ↔ LPP pad mappings ─────────────────────────────────────────────── */
+// Source: [M8-LPP] — maps LPP pad note numbers to Move pad note numbers.
+// Steps row (notes 101–108) maps to Move's step buttons (notes 16–30 even).
+// Two layouts (top/bottom) cover the full LPP 8×8 pad grid across Move's 4×8.
 
 const lppPadToMovePadMapTop = new Map([
     [81, 92], [82, 93], [83, 94], [84, 95], [85, 96], [86, 97], [87, 98], [88, 99],
@@ -112,6 +129,9 @@ const moveToLppPadMapBottom = new Map(
 );
 
 /* ── LED color palette ───────────────────────────────────────────────────── */
+// Move LED color values (right-hand side) are Move-specific constants derived
+// from [MOVE]. LPP color index keys used in lppColorToMoveColorMap below are
+// from [LPP3] §7 (Colour Palette), translated to the nearest Move LED value.
 
 const light_grey = 0x7c;
 const dim_grey   = 0x10;
@@ -138,6 +158,9 @@ const lppColorToMoveMonoMap = new Map([
 ]);
 
 /* ── Move hardware CC/note constants ─────────────────────────────────────── */
+// Source: [MOVE] — CC and note numbers for Move hardware controls, as
+// reverse-engineered and documented by the move-anything project. Cross-
+// referenced against the Ableton Move manual (ableton.com/en/move/manual/).
 
 const moveLOGO    = 99;
 const moveMENU    = 50;
@@ -397,6 +420,10 @@ function updateAbletonEncoderIndicators() {
 
 function initLPP() {
     const out_cable = 2;
+    // Source: [LPP3] §2.1 — Universal Device Inquiry SysEx (F0 7E 7F 06 01 F7),
+    // packed into USB-MIDI cable 2 using 4-byte packet format per USB-MIDI spec.
+    // The M8 listens for this to confirm Launchpad Pro presence before entering
+    // LPP control surface mode.
     const LPPInitSysex = [
         out_cable << 4 | 0x4, 0xF0, 126, 0,
         out_cable << 4 | 0x4, 6, 2, 0,
@@ -512,6 +539,9 @@ function updateMovePadsToMatchLpp() {
 
 /* ── External message handlers ───────────────────────────────────────────── */
 
+// Source: [MIDI] — standard Universal Device Inquiry identity request.
+// The M8 sends this on connect; AbleM8 watches for it to re-send the LPP
+// handshake if the M8 was plugged in after the module loaded.
 const m8InitSysex = [0xf0, 0x7e, 0x7f, 0x06, 0x01, 0xf7];
 
 function handleM8ExternalMessage(data) {
