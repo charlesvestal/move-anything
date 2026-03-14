@@ -220,7 +220,6 @@ const bankIndicatorNote = 31; // rightmost step LED
 let showingTop        = true;
 let activeBank        = BANK_M8_TRACK;
 let abletonDeviceMode = false;
-let abletonMixBank    = 0;
 let selectedTrackIndex = 0;
 let shiftHeld         = false;
 let liveMode          = false;
@@ -247,24 +246,20 @@ function drainLedQueue() {
 function buildClearQueue() {
     ledQueue = [];
     for (let note = 16; note <= 31; note++) {
-        const n = note;
-        ledQueue.push(() => sendMovePad(n, 0));
+        ledQueue.push(() => sendMovePad(note, 0));
     }
     for (const row of moveGridRows) {
         for (const note of row) {
-            const n = note;
-            ledQueue.push(() => sendMovePad(n, 0));
+            ledQueue.push(() => sendMovePad(note, 0));
         }
     }
     const controls = [moveSHIFT, moveMENU, moveBACK, moveCAP, movePLAY, moveREC,
                       moveLOOP, moveMUTE, moveUNDO, moveSAMPLE, moveLOGO];
-    for (const c of controls) {
-        const cc = c;
+    for (const cc of controls) {
         ledQueue.push(() => sendMoveControl(cc, 0));
     }
     for (const cc of moveKnobCcs) {
-        const c = cc;
-        ledQueue.push(() => sendMoveControl(c, 0));
+        ledQueue.push(() => sendMoveControl(cc, 0));
     }
 }
 
@@ -337,7 +332,7 @@ function drawAbletonMacroDisplay() {
     if (!abletonDeviceMode) return;
     if (typeof clear_screen !== "function" || typeof print !== "function") return;
     clear_screen();
-    print(0, 0, `Ableton Dev T${abletonMixBank * 8 + 1 + selectedTrackIndex}`, 1);
+    print(0, 0, `Ableton Dev T${selectedTrackIndex + 1}`, 1);
     for (let i = 0; i < 8; i++) {
         const line = Math.floor(i / 4);
         const col  = i % 4;
@@ -395,7 +390,7 @@ function updateAbletonEncoderIndicators() {
     const values = shiftHeld ? abletonState.sendsA : abletonState.volumes;
     for (let i = 0; i < 8; i++) sendMoveControl(moveKnobCcs[i], values[i]);
     const masterValue = shiftHeld ? abletonState.returnVolume : abletonState.masterVolume;
-    if (moveKnobCcs[8] !== undefined) sendMoveControl(moveKnobCcs[8], masterValue);
+    if (moveKnobCcs[9] !== undefined) sendMoveControl(moveKnobCcs[9], masterValue);
 }
 
 /* ── LPP init ────────────────────────────────────────────────────────────── */
@@ -575,6 +570,7 @@ function handleM8ExternalMessage(data) {
     if (moveControlNumber === moveLOGO) {
         liveMode = moveVelocity > 0;
         updatePLAYLed();
+        return;
     }
     if (moveControlNumber === movePLAY) {
         isPlaying = moveVelocity === green;
@@ -626,13 +622,13 @@ function handleAbletonExternalMessage(data) {
 
         if (cc === yursProfile.ccs.masterVolume) {
             abletonState.masterVolume = value;
-            if (!shiftHeld && moveKnobCcs[8] !== undefined) sendMoveControl(moveKnobCcs[8], value);
+            if (!shiftHeld && moveKnobCcs[9] !== undefined) sendMoveControl(moveKnobCcs[9], value);
             return;
         }
 
         if (cc === yursProfile.ccs.returnVolume) {
             abletonState.returnVolume = value;
-            if (shiftHeld && moveKnobCcs[8] !== undefined) sendMoveControl(moveKnobCcs[8], value);
+            if (shiftHeld && moveKnobCcs[9] !== undefined) sendMoveControl(moveKnobCcs[9], value);
             return;
         }
 
@@ -696,9 +692,8 @@ function handleM8InternalMessage(data) {
 
     if (!(isNote || isCC)) return;
 
-    const activeMoveToLppPadMap = showingTop ? moveToLppPadMapTop : moveToLppPadMapBottom;
-
     if (isNote) {
+        const activeMoveToLppPadMap = showingTop ? moveToLppPadMapTop : moveToLppPadMapBottom;
         const moveNoteNumber = data[1];
 
         // Track selection via step buttons (notes 16–31, every other note = track)

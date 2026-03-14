@@ -87,7 +87,9 @@ export function configurePotBank(bank, overrides = {}) {
         return;
     }
     potConfig[bank] = { ...potConfig[bank], ...overrides };
-    potValues = makePotStateArrays();
+    // Rebuild only the affected bank's state to avoid clobbering other banks
+    const fresh = makePotStateArrays();
+    potValues[bank] = fresh[bank];
 }
 
 function decodeDelta(value) {
