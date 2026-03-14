@@ -146,9 +146,50 @@ The Ableton Live integration uses the YURS (Yaeltex Universal Remote Script) pro
 Focusrite's Launchpad Pro Mk3 programming reference guided the SysEx handshake and LED color encoding:
 [LPP3 Programmer Reference Guide](https://fael-downloads-prod.focusrite.com/customer/prod/s3fs-public/downloads/LPP3_prog_ref_guide_200415.pdf)
 
-## AI Assistance Disclaimer
+## Phylactery
 
-This module is part of Move Everything and was developed with AI assistance, including Claude and other AI tools.
+*A SPELWork phylactery is a provenance statement with a release: an honest account of where the work came from, how it was made, and the terms under which it is given back.*
 
-All architecture, implementation, and release decisions are reviewed by human maintainers.
-AI-assisted content may still contain errors — please validate functionality, security, and license compatibility before production use.
+### Design philosophy
+
+I build projects like this with one guiding constraint: **maximum attribution, minimum erasure**. Every piece of borrowed logic gets a named source. Every mapping table that came from someone else's research gets a link. The goal is that anyone reading this code can trace every non-trivial decision back to its origin — whether that's a hardware spec, a community forum post, a fellow developer's reverse-engineering work, or an AI session.
+
+I do use AI, and I don't hide it. Claude helped port this from a single-file control script into a module, wrote the test harness, caught several bugs in the master knob indexing, cleaned up closure captures, and authored most of this documentation. That's real work and it would be dishonest to omit it. But the architecture decisions, the hardware knowledge, the M8 workflow, and the final review are mine. AI is a tool in this shop, not a ghost author.
+
+The test harness exists precisely because of AI-assisted development: when you're moving fast with an LLM, you need a safety net that doesn't require flashing firmware to find out you broke something.
+
+### Provenance
+
+This module is approximately **~1,500 lines** across all files. Rough breakdown:
+
+**Externally derived (~200 lines, ~13%)** — mapped from community sources with attribution:
+- LPP note grid and pad/control mappings → LPP3 Programmer Reference + grahack's M8 LPP recap
+- LPP colour palette index values → LPP3 §7
+- Move hardware CC/note constants → move-anything (bobbydigitales)
+- LPP init SysEx → LPP3 §2.1
+- YURS CC/note default assignments → YURS remote script
+- M8 identity SysEx bytes → MIDI 1.0 Universal Device Inquiry spec
+
+**Novel / authored (~1,300 lines, ~87%):**
+- Multi-bank virtual knobs architecture: `configurePotBank`, track-scoped routing, per-bank isolated state
+- Progressive LED queue: bank transition animations within Move's 64-packet buffer constraint
+- Ableton mixer state machine: mute/solo/arm toggles, volume/send/master LED feedback from Live
+- YURS integration: CC and note routing in both directions, clip warning threshold
+- Device macro mode: knob-to-macro CC bridging with display
+- SysEx accumulator: reassembling QuickJS's 3-byte sysex slices into complete messages
+- Full JS unit test harness: host mock, assert library, 43 tests, pre-deploy install gate
+- Module lifecycle, shift-modifier handling, bank switching with clean LED transitions
+
+**Token economics (honest ballpark):**
+
+This session — porting the control script, architecture review, 7 bug fixes, README, and attribution comments — ran approximately 300–500K input tokens and 60–100K output tokens on Claude Sonnet. Rough cost: $15–40.
+
+The Toilville system made this materially cheaper and faster. The `CLAUDE.md` project context file (Move hardware API surface, deployment constraints, module architecture conventions) avoided re-explaining the same scaffolding on every turn — estimated savings of 30–50% of context overhead per session. The inline attribution comments we added to the source code will compound those savings in future sessions by embedding provenance directly where the code lives, so no future Claude session needs to rediscover what the LPP color palette index keys mean. And the test harness replaces manual hardware verification cycles whose real cost — SSH, firmware flash, physical device, debug log tailing — is orders of magnitude higher than any token cost.
+
+### Release
+
+This module is released under the same terms as the move-everything repository. See the project root for the license.
+
+The spirit of that release is straightforward: I have benefited enormously from the open work of others — bobbydigitales mapping the Move's hardware, grahack documenting the M8's LPP layout, the YURS authors building a scriptable Live bridge, the Focusrite team publishing their programmer reference. None of that work was owed to me and all of it made this possible. Releasing this back under the same terms is the only appropriate response.
+
+If this module saves you time, helps you understand the protocol, or gives you something to fork — that's the point. Attribution is appreciated but not required. Improvement is welcomed. Pay it forward when you can.
