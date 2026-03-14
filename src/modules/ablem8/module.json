@@ -4,7 +4,7 @@
     "version": "1.0.0",
     "description": "M8 tracker + Ableton Live dual-mode control surface via YURS",
     "author": "peterswimm",
-    "ui": "ui.js",
+    "ui": "ui.mjs",
     "api_version": 1,
     "component_type": "overtake",
     "capabilities": {

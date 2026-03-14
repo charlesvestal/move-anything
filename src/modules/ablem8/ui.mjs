@@ -28,7 +28,7 @@ import {
     setPotShiftHeld,
     configurePotBank,
     POT_BANKS,
-} from '/data/UserData/move-anything/shared/move_virtual_knobs.mjs';
+} from '../../shared/move_virtual_knobs.mjs';
 
 import { ablem8Config } from './config/ablem8_config.mjs';
 
