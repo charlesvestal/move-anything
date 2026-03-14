@@ -1,0 +1,13 @@
+{
+    "id": "ablem8",
+    "name": "AbleM8",
+    "version": "1.0.0",
+    "description": "M8 tracker + Ableton Live dual-mode control surface via YURS",
+    "author": "peterswimm",
+    "ui": "ui.js",
+    "api_version": 1,
+    "component_type": "overtake",
+    "capabilities": {
+        "default_forward_channel": -2
+    }
+}
