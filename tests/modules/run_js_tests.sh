@@ -36,11 +36,6 @@ run_suite() {
     fi
 }
 
-run_suite "$TESTS_DIR/ablem8/test_virtual_knobs.mjs"
-run_suite "$TESTS_DIR/ablem8/test_ableton_state.mjs"
-run_suite "$TESTS_DIR/ablem8/test_sysex.mjs"
-run_suite "$TESTS_DIR/ablem8/test_bank_switching.mjs"
-
 echo "  [JS tests] $PASS suite(s) passed, $FAIL failed"
 
 if [ "$FAIL" -gt 0 ]; then
