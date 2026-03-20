@@ -772,10 +772,13 @@ if [ "$use_reenable" = true ]; then
   # Clean stale ld.so.preload entries
   ssh_root_with_retry "if [ -f /etc/ld.so.preload ] && grep -q 'move-anything-shim.so' /etc/ld.so.preload; then ts=\$(date +%Y%m%d-%H%M%S); cp /etc/ld.so.preload /etc/ld.so.preload.bak-move-anything-\$ts; grep -v 'move-anything-shim.so' /etc/ld.so.preload > /tmp/ld.so.preload.new || true; if [ -s /tmp/ld.so.preload.new ]; then cat /tmp/ld.so.preload.new > /etc/ld.so.preload; else rm -f /etc/ld.so.preload; fi; rm -f /tmp/ld.so.preload.new; fi" || true
 
-  # Symlink shim to /usr/lib/ + setuid
-  ssh_root_with_retry "rm -f /usr/lib/move-anything-shim.so && ln -s /data/UserData/move-anything/move-anything-shim.so /usr/lib/move-anything-shim.so" || fail "Failed to install shim"
-  ssh_root_with_retry "chmod u+s /data/UserData/move-anything/move-anything-shim.so" || fail "Failed to set shim permissions"
-  ssh_root_with_retry "test -u /data/UserData/move-anything/move-anything-shim.so" || fail "Shim setuid bit missing"
+  # Copy shim to /usr/lib/ + setuid
+  # NOTE: must be a real copy, not a symlink — glibc 2.35+ follows symlinks under
+  # AT_SECURE (triggered by MoveOriginal's file capabilities) and rejects libraries
+  # whose real path is on an untrusted filesystem like /data/UserData/
+  ssh_root_with_retry "rm -f /usr/lib/move-anything-shim.so && cp /data/UserData/move-anything/move-anything-shim.so /usr/lib/move-anything-shim.so" || fail "Failed to install shim"
+  ssh_root_with_retry "chmod u+s /usr/lib/move-anything-shim.so" || fail "Failed to set shim permissions"
+  ssh_root_with_retry "test -u /usr/lib/move-anything-shim.so" || fail "Shim setuid bit missing"
 
   # Web shim symlink if present
   if $ssh_ableton "test -f /data/UserData/move-anything/move-anything-web-shim.so" 2>/dev/null; then
@@ -1007,10 +1010,13 @@ fi
 # Ensure shim isn't globally preloaded (breaks XMOS firmware check and causes communication error)
 ssh_root_with_retry "if [ -f /etc/ld.so.preload ] && grep -q 'move-anything-shim.so' /etc/ld.so.preload; then ts=\$(date +%Y%m%d-%H%M%S); cp /etc/ld.so.preload /etc/ld.so.preload.bak-move-anything-\$ts; grep -v 'move-anything-shim.so' /etc/ld.so.preload > /tmp/ld.so.preload.new || true; if [ -s /tmp/ld.so.preload.new ]; then cat /tmp/ld.so.preload.new > /etc/ld.so.preload; else rm -f /etc/ld.so.preload; fi; rm -f /tmp/ld.so.preload.new; fi" || true
 
-# Symlink shim to /usr/lib/ (root partition has no free space for copies)
-ssh_root_with_retry "rm -f /usr/lib/move-anything-shim.so && ln -s /data/UserData/move-anything/move-anything-shim.so /usr/lib/move-anything-shim.so" || fail "Failed to install shim after retries"
-ssh_root_with_retry "chmod u+s /data/UserData/move-anything/move-anything-shim.so" || fail "Failed to set shim permissions"
-ssh_root_with_retry "test -u /data/UserData/move-anything/move-anything-shim.so" || fail "Shim setuid bit missing after install"
+# Copy shim to /usr/lib/ (~868KB, fits within root partition free space)
+# NOTE: must be a real copy, not a symlink — glibc 2.35+ follows symlinks under
+# AT_SECURE (triggered by MoveOriginal's file capabilities) and rejects libraries
+# whose real path is on an untrusted filesystem like /data/UserData/
+ssh_root_with_retry "rm -f /usr/lib/move-anything-shim.so && cp /data/UserData/move-anything/move-anything-shim.so /usr/lib/move-anything-shim.so" || fail "Failed to install shim after retries"
+ssh_root_with_retry "chmod u+s /usr/lib/move-anything-shim.so" || fail "Failed to set shim permissions"
+ssh_root_with_retry "test -u /usr/lib/move-anything-shim.so" || fail "Shim setuid bit missing after install"
 
 # Symlink web shim to /usr/lib/ (for MoveWebService PIN challenge detection)
 if $ssh_ableton "test -f /data/UserData/move-anything/move-anything-web-shim.so" 2>/dev/null; then
