@@ -405,6 +405,7 @@ for arg in "$@"; do
     reenable) use_reenable=true ;;
     -skip-modules|--skip-modules) skip_modules=true ;;
     -skip-confirmation|--skip-confirmation) skip_confirmation=true ;;
+    -skip-js-tests|--skip-js-tests) skip_js_tests=true ;;
     --enable-screen-reader) enable_screen_reader=true ;;
     --disable-shadow-ui) disable_shadow_ui=true ;;
     uninstall-module) module_action="uninstall" ;;
@@ -418,6 +419,7 @@ for arg in "$@"; do
       echo "  reenable                 Re-enable after firmware update (root partition only)"
       echo "  --skip-modules           Skip module installation prompt"
       echo "  --skip-confirmation      Skip unsupported/liability confirmation prompt"
+      echo "  --skip-js-tests          Skip JS module unit tests (not recommended)"
       echo "  --enable-screen-reader   Enable screen reader (TTS) by default"
       echo "  --disable-shadow-ui      Disable shadow UI (slot configuration interface)"
       echo ""
@@ -469,6 +471,12 @@ fi
 if [ -n "$module_action" ]; then
   # Module management subcommands skip the host install confirmation and download
   skip_confirmation=true
+fi
+
+skip_js_tests="${skip_js_tests:-false}"
+if [ "$skip_js_tests" = false ] && [ -z "$module_action" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+  bash "$SCRIPT_DIR/../tests/modules/run_js_tests.sh" || fail "JS module tests failed — fix before deploying to hardware (or pass --skip-js-tests)"
 fi
 
 if [ "$skip_confirmation" = false ]; then

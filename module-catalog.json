@@ -601,6 +601,18 @@
       "default_branch": "master",
       "asset_name": "weird-dreams-module.tar.gz",
       "min_host_version": "0.3.0"
+    },
+    {
+      "id": "movemap",
+      "name": "MoveMap",
+      "description": "Dual-mode overtake: Dirtywave M8 tracker control + Ableton Live mixer/device via YURS",
+      "author": "peterswimm",
+      "component_type": "overtake",
+      "github_repo": "peterswimm/movemap",
+      "default_branch": "main",
+      "asset_name": "movemap-module.tar.gz",
+      "min_host_version": "0.3.0",
+      "requires": "Dirtywave M8 (for M8 mode) and/or YURS remote script for Ableton Live"
     }
   ]
 }
